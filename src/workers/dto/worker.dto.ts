@@ -31,8 +31,9 @@ export class PairMachineDto {
 }
 
 export class HeartbeatDto {
-  @IsEnum(WorkerStatus)
-  status: WorkerStatus;
+  @IsString()
+  @IsNotEmpty()
+  status: string;
 
   @IsOptional()
   @IsString()

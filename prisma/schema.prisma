@@ -138,6 +138,7 @@ enum WorkerStatus {
   ERROR
   MAINTENANCE
   UPDATING
+  STOPPED
 }
 
 enum TransactionType {
@@ -397,6 +398,7 @@ model WorkerMachine {
   pairingCode    String?        @unique
   machineToken   String?        @unique
   status         WorkerStatus   @default(UNPAIRED)
+  desiredState   String         @default("STOPPED") // STOPPED | RUNNING | STOPPING | STARTING
   version        String         @default("1.0.0")
   ipAddress      String?
   lastHeartbeat  DateTime?

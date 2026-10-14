@@ -59,6 +59,36 @@ export class WorkersController {
   }
 
   /**
+   * Super Admin starts / pushes worker execution
+   */
+  @Post(':id/start')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN)
+  async startWorker(@Param('id') id: string, @CurrentUser() admin: any) {
+    return this.workersService.startWorker(id, admin);
+  }
+
+  /**
+   * Super Admin stops worker execution immediately
+   */
+  @Post(':id/stop')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN)
+  async stopWorker(@Param('id') id: string, @CurrentUser() admin: any) {
+    return this.workersService.stopWorker(id, admin);
+  }
+
+  /**
+   * Super Admin resumes worker execution
+   */
+  @Post(':id/resume')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN)
+  async resumeWorker(@Param('id') id: string, @CurrentUser() admin: any) {
+    return this.workersService.resumeWorker(id, admin);
+  }
+
+  /**
    * Admin manually triggers stale lease recovery
    */
   @Post('recover-stale')

@@ -24,9 +24,9 @@ describe('WorkersService Concurrency & Financial Quarantine Invariants', () => {
 
   beforeEach(async () => {
     mockWorkerMachines = [
-      { id: 'w-1', machineCode: 'PC-001', status: WorkerStatus.IDLE, active: true, machineToken: 'tok-1' },
-      { id: 'w-2', machineCode: 'PC-002', status: WorkerStatus.IDLE, active: true, machineToken: 'tok-2' },
-      { id: 'w-3', machineCode: 'PC-003', status: WorkerStatus.IDLE, active: true, machineToken: 'tok-3' },
+      { id: 'w-1', machineCode: 'PC-001', status: WorkerStatus.IDLE, active: true, desiredState: 'RUNNING', machineToken: 'tok-1' },
+      { id: 'w-2', machineCode: 'PC-002', status: WorkerStatus.IDLE, active: true, desiredState: 'RUNNING', machineToken: 'tok-2' },
+      { id: 'w-3', machineCode: 'PC-003', status: WorkerStatus.IDLE, active: true, desiredState: 'RUNNING', machineToken: 'tok-3' },
     ];
     mockAccounts = [
       { id: 'acc-1', username: 'devotee1@example.com', encryptedPassword: 'enc', encryptionIv: 'iv', encryptionTag: 'tag', status: 'VERIFIED' }
@@ -123,6 +123,12 @@ describe('WorkersService Concurrency & Financial Quarantine Invariants', () => {
         }),
       },
       workerMachine: {
+        findUnique: jest.fn().mockImplementation(({ where }) => {
+          return mockWorkerMachines.find(w => (where.id && w.id === where.id) || (where.machineCode && w.machineCode === where.machineCode) || (where.machineToken && w.machineToken === where.machineToken)) || null;
+        }),
+        findMany: jest.fn().mockImplementation(() => {
+          return mockWorkerMachines.map(w => ({ ...w }));
+        }),
         update: jest.fn().mockImplementation(({ where, data }) => {
           const wm = mockWorkerMachines.find(w => w.id === where.id);
           if (wm) Object.assign(wm, data);
@@ -223,7 +229,7 @@ describe('WorkersService Concurrency & Financial Quarantine Invariants', () => {
 
       // Verify the winning job is marked EXECUTING with winning worker ID
       const winner = successfulClaims[0];
-      expect(winner.job.id).toBe('job-1');
+      expect((winner as any).job.id).toBe('job-1');
       expect(mockBookingJobs[0].status).toBe(BookingStatus.EXECUTING);
     });
   });
@@ -311,6 +317,164 @@ describe('WorkersService Concurrency & Financial Quarantine Invariants', () => {
       const res = await workersService.completeJob('job-1', 'w-1', validDto);
       expect(res.success).toBe(true);
       expect(mockBookingRequests[0].status).toBe(BookingStatus.SUCCESS);
+    });
+  });
+
+  describe('CRITICAL: Super Admin Worker Push / Stop / Resume Execution Controls', () => {
+    it('1. verifies an unpaired worker cannot start', async () => {
+      mockWorkerMachines.push({
+        id: 'w-unpaired',
+        machineCode: 'PC-UNPAIRED',
+        active: false,
+        machineToken: null,
+        pairingCode: 'TA-9999',
+        desiredState: 'STOPPED',
+      });
+
+      await expect(
+        workersService.startWorker('w-unpaired', { id: 'admin-1' })
+      ).rejects.toThrow(BadRequestException);
+    });
+
+    it('2. verifies an approved but stopped worker cannot claim new jobs', async () => {
+      // Worker 1 is stopped
+      await workersService.stopWorker('w-1', { id: 'admin-1' });
+
+      const claimResult = await workersService.claimJob('w-1');
+      expect(claimResult.hasJob).toBe(false);
+      expect((claimResult as any).stopped).toBe(true);
+      expect((claimResult as any).desiredState).toBe('STOPPED');
+      expect(mockBookingJobs[0].workerId).toBeNull();
+    });
+
+    it('3. verifies stop immediately prevents further job claims and lease acquisition on server', async () => {
+      // Ensure job is queued
+      expect(mockBookingJobs[0].status).toBe(BookingStatus.QUEUED);
+
+      // Super Admin stops w-2
+      const stopRes = await workersService.stopWorker('w-2', { id: 'admin-1' });
+      expect(stopRes.machine.desiredState).toBe('STOPPED');
+
+      // w-2 attempts to claim
+      const claimRes = await workersService.claimJob('w-2');
+      expect(claimRes.hasJob).toBe(false);
+      expect((claimRes as any).stopped).toBe(true);
+    });
+
+    it('4. verifies in-flight operations follow safe recovery path (transitions to STOPPING without aborting)', async () => {
+      // w-1 claims and is actively executing job-1
+      const claimRes = await workersService.claimJob('w-1');
+      expect(claimRes.hasJob).toBe(true);
+
+      const worker1 = mockWorkerMachines.find(w => w.id === 'w-1');
+      worker1.currentJobId = 'job-1';
+
+      // Super Admin requests STOP while job is in-flight
+      const stopRes = await workersService.stopWorker('w-1', { id: 'admin-1' });
+      expect(stopRes.machine.desiredState).toBe('STOPPING');
+
+      // Verify in-flight job was NOT aborted or marked failed; remains EXECUTING
+      expect(mockBookingJobs[0].status).toBe(BookingStatus.EXECUTING);
+
+      // Heartbeat while still executing preserves STOPPING
+      const hb1 = await workersService.handleHeartbeat('w-1', {
+        status: WorkerStatus.BUSY,
+        currentJobId: 'job-1',
+      });
+      expect(hb1.desiredState).toBe('STOPPING');
+      expect(hb1.executionPermitted).toBe(false);
+
+      // Job completes normally
+      await workersService.completeJob('job-1', 'w-1', { officialReference: 'IVQ-CONFIRMED-99' });
+
+      // Worker sends heartbeat with no active jobs -> transitions to STOPPED
+      const hb2 = await workersService.handleHeartbeat('w-1', {
+        status: WorkerStatus.IDLE,
+        currentJobId: undefined,
+      });
+      expect(hb2.desiredState).toBe('STOPPED');
+      expect(worker1.desiredState).toBe('STOPPED');
+    });
+
+    it('5. verifies resume re-enables only the intended worker', async () => {
+      // Stop both w-1 and w-2
+      await workersService.stopWorker('w-1', { id: 'admin-1' });
+      await workersService.stopWorker('w-2', { id: 'admin-1' });
+
+      // Resume only w-1
+      const resumeRes = await workersService.resumeWorker('w-1', { id: 'admin-1' });
+      expect(resumeRes.machine.desiredState).toBe('RUNNING');
+
+      // w-1 can claim
+      const claim1 = await workersService.claimJob('w-1');
+      expect(claim1.hasJob).toBe(true);
+
+      // w-2 remains stopped and cannot claim
+      const claim2 = await workersService.claimJob('w-2');
+      expect(claim2.hasJob).toBe(false);
+      expect((claim2 as any).stopped).toBe(true);
+    });
+
+    it('6. verifies restarting the worker does not override persisted stopped state', async () => {
+      // Stopped by admin
+      await workersService.stopWorker('w-1', { id: 'admin-1' });
+
+      // Worker process restarts and checks pairing status
+      const pairingStatus = await workersService.checkPairingStatus('PC-001');
+      expect(pairingStatus.paired).toBe(true);
+      expect(pairingStatus.desiredState).toBe('STOPPED');
+
+      // Worker sends initial heartbeat after restart
+      const hb = await workersService.handleHeartbeat('w-1', { status: WorkerStatus.IDLE });
+      expect(hb.desiredState).toBe('STOPPED');
+      expect(hb.executionPermitted).toBe(false);
+    });
+
+    it('7. verifies repeated or concurrent start/stop commands are idempotent', async () => {
+      // Multiple stops
+      const stop1 = await workersService.stopWorker('w-1', { id: 'admin-1' });
+      const stop2 = await workersService.stopWorker('w-1', { id: 'admin-1' });
+      expect(stop1.machine.desiredState).toBe('STOPPED');
+      expect(stop2.machine.desiredState).toBe('STOPPED');
+
+      // Multiple starts
+      const start1 = await workersService.startWorker('w-1', { id: 'admin-1' });
+      const start2 = await workersService.startWorker('w-1', { id: 'admin-1' });
+      expect(start1.machine.desiredState).toBe('RUNNING');
+      expect(start2.machine.desiredState).toBe('RUNNING');
+    });
+
+    it('8. verifies a disconnected worker is not falsely reported as stopped', async () => {
+      // w-3 is running, but heartbeat is 60 seconds old
+      const worker3 = mockWorkerMachines.find(w => w.id === 'w-3');
+      worker3.desiredState = 'RUNNING';
+      worker3.lastHeartbeat = new Date(Date.now() - 60000);
+
+      const all = await workersService.getAllWorkers();
+      const w3Info = all.find(w => w.id === 'w-3');
+      expect(w3Info.status).toBe(WorkerStatus.OFFLINE);
+      expect(w3Info.isDisconnected).toBe(true);
+      expect(w3Info.desiredState).toBe('RUNNING'); // Desired state is preserved; not falsely reported as stopped
+    });
+
+    it('9. verifies one worker controls do not affect another worker', async () => {
+      // Stop w-1
+      await workersService.stopWorker('w-1', { id: 'admin-1' });
+
+      const w1 = mockWorkerMachines.find(w => w.id === 'w-1');
+      const w2 = mockWorkerMachines.find(w => w.id === 'w-2');
+
+      expect(w1.desiredState).toBe('STOPPED');
+      expect(w2.desiredState).toBe('RUNNING'); // w-2 unaffected
+    });
+
+    it('10. verifies no booking, ledger, wallet, or reconciliation regressions occur', async () => {
+      // Stopped worker claiming fails cleanly without modifying booking request or wallet
+      await workersService.stopWorker('w-1', { id: 'admin-1' });
+      await workersService.claimJob('w-1');
+
+      expect(mockBookingRequests[0].status).toBe(BookingStatus.QUEUED);
+      expect(releasedWalletHolds.length).toBe(0);
     });
   });
 });

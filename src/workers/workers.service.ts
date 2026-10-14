@@ -97,6 +97,7 @@ export class WorkersService {
         machineToken,
         status: WorkerStatus.ONLINE,
         active: true,
+        desiredState: 'STOPPED', // Pairing approval does NOT automatically start execution
         pairingCode: null,
         lastHeartbeat: new Date(),
       },
@@ -119,6 +120,128 @@ export class WorkersService {
   }
 
   /**
+   * Super Admin starts / pushes worker execution
+   */
+  async startWorker(machineId: string, adminUser?: any) {
+    const machine = (await this.prisma.workerMachine.findUnique({
+      where: { id: machineId },
+    })) || (await this.prisma.workerMachine.findUnique({
+      where: { machineCode: machineId },
+    }));
+
+    if (!machine) {
+      throw new NotFoundException('Worker machine not found');
+    }
+
+    if (!machine.active || !machine.machineToken) {
+      throw new BadRequestException('Cannot start an unpaired worker machine. Complete pairing approval first.');
+    }
+
+    const updated = await this.prisma.workerMachine.update({
+      where: { id: machine.id },
+      data: {
+        desiredState: 'RUNNING',
+      },
+    });
+
+    await this.audit.log({
+      actorId: adminUser?.id,
+      actorType: 'ADMIN',
+      action: 'WORKER_MACHINE_STARTED',
+      entity: 'WorkerMachine',
+      entityId: updated.id,
+      metadata: { machineCode: updated.machineCode, machineName: updated.machineName },
+    });
+
+    return {
+      message: `Worker ${updated.machineCode} authorized to execute permitted work`,
+      machine: updated,
+    };
+  }
+
+  /**
+   * Super Admin stops worker execution
+   */
+  async stopWorker(machineId: string, adminUser?: any) {
+    const machine = (await this.prisma.workerMachine.findUnique({
+      where: { id: machineId },
+    })) || (await this.prisma.workerMachine.findUnique({
+      where: { machineCode: machineId },
+    }));
+
+    if (!machine) {
+      throw new NotFoundException('Worker machine not found');
+    }
+
+    // If an in-flight job is currently being processed, transition to STOPPING
+    // to preserve transaction safety and allow clean conclusion. Otherwise immediately STOPPED.
+    const targetState = machine.currentJobId ? 'STOPPING' : 'STOPPED';
+
+    const updated = await this.prisma.workerMachine.update({
+      where: { id: machine.id },
+      data: {
+        desiredState: targetState,
+      },
+    });
+
+    await this.audit.log({
+      actorId: adminUser?.id,
+      actorType: 'ADMIN',
+      action: 'WORKER_MACHINE_STOPPED',
+      entity: 'WorkerMachine',
+      entityId: updated.id,
+      metadata: { machineCode: updated.machineCode, machineName: updated.machineName, state: targetState },
+    });
+
+    return {
+      message: targetState === 'STOPPING'
+        ? `Worker ${updated.machineCode} stop requested. Waiting for in-flight job to conclude safely.`
+        : `Worker ${updated.machineCode} execution stopped immediately.`,
+      machine: updated,
+    };
+  }
+
+  /**
+   * Super Admin resumes worker execution
+   */
+  async resumeWorker(machineId: string, adminUser?: any) {
+    const machine = (await this.prisma.workerMachine.findUnique({
+      where: { id: machineId },
+    })) || (await this.prisma.workerMachine.findUnique({
+      where: { machineCode: machineId },
+    }));
+
+    if (!machine) {
+      throw new NotFoundException('Worker machine not found');
+    }
+
+    if (!machine.active || !machine.machineToken) {
+      throw new BadRequestException('Cannot resume an unpaired worker machine. Complete pairing approval first.');
+    }
+
+    const updated = await this.prisma.workerMachine.update({
+      where: { id: machine.id },
+      data: {
+        desiredState: 'RUNNING',
+      },
+    });
+
+    await this.audit.log({
+      actorId: adminUser?.id,
+      actorType: 'ADMIN',
+      action: 'WORKER_MACHINE_RESUMED',
+      entity: 'WorkerMachine',
+      entityId: updated.id,
+      metadata: { machineCode: updated.machineCode, machineName: updated.machineName },
+    });
+
+    return {
+      message: `Worker ${updated.machineCode} execution resumed`,
+      machine: updated,
+    };
+  }
+
+  /**
    * Worker machine checks pairing status
    */
   async checkPairingStatus(machineCode: string) {
@@ -135,6 +258,7 @@ export class WorkersService {
         paired: true,
         machineToken: machine.machineToken,
         status: machine.status,
+        desiredState: machine.desiredState || 'STOPPED',
       };
     }
 
@@ -142,21 +266,33 @@ export class WorkersService {
       paired: false,
       pairingCode: machine.pairingCode,
       status: machine.status,
+      desiredState: 'UNPAIRED',
     };
   }
 
   /**
-   * Worker sends periodic heartbeat
+   * Worker sends periodic heartbeat and reconciles desired administrative state
    */
   async handleHeartbeat(machineId: string, dto: HeartbeatDto) {
+    const existingMachine = await this.prisma.workerMachine.findUnique({
+      where: { id: machineId },
+    });
+
     const effectiveJobId = dto.activeJobIds && dto.activeJobIds.length > 0
       ? dto.activeJobIds.join(',')
       : (dto.currentJobId ?? null);
 
+    // If machine was in STOPPING state and its in-flight job has concluded, advance to STOPPED
+    let nextDesiredState = existingMachine?.desiredState || 'STOPPED';
+    if (existingMachine?.desiredState === 'STOPPING' && !effectiveJobId) {
+      nextDesiredState = 'STOPPED';
+    }
+
     const updated = await this.prisma.workerMachine.update({
       where: { id: machineId },
       data: {
-        status: dto.status,
+        status: dto.status as any,
+        desiredState: nextDesiredState,
         version: dto.version,
         currentJobId: effectiveJobId,
         cpuUsage: dto.cpuUsage,
@@ -165,14 +301,39 @@ export class WorkersService {
       },
     });
 
-    return { status: 'OK', machineId: updated.id, serverTime: new Date() };
+    return {
+      status: 'OK',
+      machineId: updated.id,
+      desiredState: updated.desiredState,
+      executionPermitted: updated.desiredState === 'RUNNING',
+      serverTime: new Date(),
+    };
   }
 
   /**
-    * Worker claims next eligible job (ACCOUNT_VERIFICATION or BOOKING_EXECUTION)
+   * Worker claims next eligible job (ACCOUNT_VERIFICATION or BOOKING_EXECUTION)
    * Enforces atomic single-owner claim via Prisma transaction with conditional updates.
+   * Strictly enforces Super Admin start/stop state.
    */
   async claimJob(machineId: string) {
+    const machine = await this.prisma.workerMachine.findUnique({
+      where: { id: machineId },
+    });
+
+    if (!machine || !machine.active) {
+      throw new UnauthorizedException('Worker machine is not approved or active');
+    }
+
+    // Backend enforcement: Reject new job claims if machine is STOPPED or STOPPING
+    if (machine.desiredState === 'STOPPED' || machine.desiredState === 'STOPPING') {
+      return {
+        hasJob: false,
+        stopped: true,
+        desiredState: machine.desiredState,
+        message: `Worker execution is ${machine.desiredState} by administrator`,
+      };
+    }
+
     const now = new Date();
     const leaseExpiry = new Date(now.getTime() + 180 * 1000); // 3 min lease
 
@@ -739,9 +900,14 @@ export class WorkersService {
     const now = new Date();
     return workers.map((w) => {
       const isDead = !w.lastHeartbeat || now.getTime() - new Date(w.lastHeartbeat).getTime() > 45000;
+      const isUnpaired = !w.active || !!w.pairingCode || !w.machineToken;
       return {
         ...w,
         status: isDead && w.active ? WorkerStatus.OFFLINE : w.status,
+        isDisconnected: isDead,
+        pairingStatus: isUnpaired ? 'UNPAIRED' : 'PAIRED',
+        desiredState: isUnpaired ? 'UNPAIRED' : (w.desiredState || 'STOPPED'),
+        executionPermitted: !isUnpaired && w.desiredState === 'RUNNING',
       };
     });
   }
