@@ -53,6 +53,18 @@ export class CreateCentreDto {
   @IsString()
   @MinLength(6)
   temporaryPassword?: string;
+
+  @IsOptional()
+  @IsNumber()
+  latitude?: number;
+
+  @IsOptional()
+  @IsNumber()
+  longitude?: number;
+
+  @IsOptional()
+  @IsNumber()
+  accuracy?: number;
 }
 
 export class UpdateCentreDto {
@@ -99,4 +111,16 @@ export class UpdateCentreDto {
   @IsOptional()
   @IsString()
   expiryDate?: string;
+
+  @IsOptional()
+  @IsNumber()
+  latitude?: number;
+
+  @IsOptional()
+  @IsNumber()
+  longitude?: number;
+
+  @IsOptional()
+  @IsNumber()
+  accuracy?: number;
 }

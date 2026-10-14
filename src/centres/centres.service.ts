@@ -8,6 +8,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { CreateCentreDto, UpdateCentreDto } from './dto/centre.dto';
 import { Role, UserStatus, CentreStatus, Prisma } from '@prisma/client';
+import { isValidCoordinate } from '../common/utils/geo';
 import * as bcrypt from 'bcrypt';
 
 @Injectable()
@@ -21,7 +22,11 @@ export class CentresService {
     const centre = await this.prisma.centre.findUnique({
       where: { userId },
       include: {
-        user: true,
+        user: {
+          include: {
+            registeredLocation: true,
+          },
+        },
       },
     });
 
@@ -71,7 +76,11 @@ export class CentresService {
         take: limit,
         orderBy: { createdAt: 'desc' },
         include: {
-          user: true,
+          user: {
+            include: {
+              registeredLocation: true,
+            },
+          },
         },
       }),
       this.prisma.centre.count({ where }),
@@ -91,7 +100,11 @@ export class CentresService {
         OR: [{ id }, { userId: id }, { centreCode: id }],
       },
       include: {
-        user: true,
+        user: {
+          include: {
+            registeredLocation: true,
+          },
+        },
       },
     });
 
@@ -204,6 +217,30 @@ export class CentresService {
         },
       });
 
+      if (dto.latitude !== undefined && dto.longitude !== undefined) {
+        const coordValidation = isValidCoordinate({
+          latitude: dto.latitude,
+          longitude: dto.longitude,
+          accuracy: dto.accuracy || 10,
+        });
+
+        if (!coordValidation.valid) {
+          throw new BadRequestException(`Location validation failed: ${coordValidation.reason}`);
+        }
+
+        await tx.registeredLocation.create({
+          data: {
+            userId: user.id,
+            latitude: dto.latitude,
+            longitude: dto.longitude,
+            accuracy: dto.accuracy || 10,
+            address: dto.address || undefined,
+            district: dto.district,
+            status: 'ACTIVE',
+          },
+        });
+      }
+
       return { user, centre, wallet };
     });
 
@@ -278,11 +315,48 @@ export class CentresService {
       if (dto.pincode !== undefined) centreUpdate.pincode = dto.pincode?.trim() || null;
       if (dto.status) centreUpdate.status = dto.status;
 
+      if (dto.latitude !== undefined && dto.longitude !== undefined) {
+        const coordValidation = isValidCoordinate({
+          latitude: dto.latitude,
+          longitude: dto.longitude,
+          accuracy: dto.accuracy || 10,
+        });
+
+        if (!coordValidation.valid) {
+          throw new BadRequestException(`Location validation failed: ${coordValidation.reason}`);
+        }
+
+        await tx.registeredLocation.upsert({
+          where: { userId: existing.userId },
+          create: {
+            userId: existing.userId,
+            latitude: dto.latitude,
+            longitude: dto.longitude,
+            accuracy: dto.accuracy || 10,
+            address: dto.address || existing.address,
+            district: dto.district || existing.district,
+            status: 'ACTIVE',
+          },
+          update: {
+            latitude: dto.latitude,
+            longitude: dto.longitude,
+            accuracy: dto.accuracy || 10,
+            address: dto.address || undefined,
+            district: dto.district || undefined,
+            updatedAt: new Date(),
+          },
+        });
+      }
+
       return tx.centre.update({
         where: { id },
         data: centreUpdate,
         include: {
-          user: true,
+          user: {
+            include: {
+              registeredLocation: true,
+            },
+          },
         },
       });
     });

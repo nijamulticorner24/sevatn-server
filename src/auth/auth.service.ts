@@ -373,6 +373,7 @@ export class AuthService {
 
   /**
    * Register or update user's service location
+   * Security Rule: Centre location is permanent once registered. Only Super Admin can modify it thereafter.
    */
   async updateLocation(userId: string, dto: UpdateLocationDto) {
     const coordValidation = isValidCoordinate({
@@ -383,6 +384,22 @@ export class AuthService {
 
     if (!coordValidation.valid) {
       throw new BadRequestException(`Location validation failed: ${coordValidation.reason}`);
+    }
+
+    const [user, existingLocation] = await Promise.all([
+      this.prisma.user.findUnique({
+        where: { id: userId },
+        select: { id: true, role: true },
+      }),
+      this.prisma.registeredLocation.findUnique({
+        where: { userId },
+      }),
+    ]);
+
+    if (existingLocation && user?.role !== Role.SUPER_ADMIN) {
+      throw new ForbiddenException(
+        'Registered service location is locked for security purposes. Only a Super Administrator can change centre coordinates.',
+      );
     }
 
     const location = await this.prisma.registeredLocation.upsert({
@@ -408,15 +425,17 @@ export class AuthService {
 
     await this.audit.log({
       actorId: userId,
-      actorType: 'USER',
-      action: 'LOCATION_REGISTERED',
+      actorType: user?.role === Role.SUPER_ADMIN ? 'ADMIN' : 'USER',
+      action: existingLocation ? 'LOCATION_UPDATED' : 'LOCATION_REGISTERED',
       entity: 'RegisteredLocation',
       entityId: location.id,
       metadata: { latitude: dto.latitude, longitude: dto.longitude },
     });
 
     return {
-      message: 'Service location registered successfully',
+      message: existingLocation
+        ? 'Service location updated successfully'
+        : 'Default service location registered and locked successfully',
       location,
     };
   }
