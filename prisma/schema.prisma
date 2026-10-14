@@ -1,0 +1,679 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Role {
+  SUPER_ADMIN
+  CENTRE
+  WORKER
+  PARTNER
+}
+
+enum PartnerStatus {
+  PENDING_PAYMENT
+  PENDING_APPROVAL
+  ACTIVE
+  SUSPENDED
+  DISABLED
+}
+
+enum InvitationStatus {
+  ACTIVE
+  USED
+  EXPIRED
+  REVOKED
+}
+
+enum UserStatus {
+  REGISTERED
+  PAYMENT_PENDING
+  ACTIVE
+  EXPIRING
+  EXPIRED
+  SUSPENDED
+}
+
+enum CentreStatus {
+  PENDING_VERIFICATION
+  ACTIVE
+  EXPIRED
+  SUSPENDED
+}
+
+enum AccountStatus {
+  UNVERIFIED
+  VERIFYING
+  VERIFIED
+  INVALID
+  REQUIRES_HUMAN
+  DISABLED
+}
+
+enum JobType {
+  ACCOUNT_VERIFICATION
+  BOOKING_EXECUTION
+  AVAILABILITY_DISCOVERY
+}
+
+enum BookingStatus {
+  NEW
+  AVAILABILITY_CHECKING
+  DRAFT
+  PENDING
+  SUBMITTED
+  QUEUED
+  FAST_BOOKING_QUEUED
+  MATCHING
+  CLAIMED
+  EXECUTION_QUEUED
+  EXECUTING
+  WAITING_FOR_ACCOUNT
+  WORKER_ASSIGNED
+  ASSIGNED
+  BROWSER_STARTING
+  OFFICIAL_SITE_OPEN
+  OPENING_OFFICIAL_SITE
+  LOGIN_IN_PROGRESS
+  LOGIN_SUCCESS
+  LOGIN_FAILED
+  BOOKING_FLOW_STARTED
+  OPENING_VIRTUAL_Q
+  WAITING_FOR_DATE_AVAILABILITY
+  DATE_AVAILABLE
+  SELECTING_DATE
+  VERIFYING_DATE_SELECTION
+  DATE_SELECTION_VERIFIED
+  DATE_SELECTION_FAILED
+  DATE_VERIFICATION_FAILED
+  DATE_AVAILABILITY_TIMEOUT
+  SELECTING_ROUTE
+  OPENING_PILGRIM_SELECTION
+  SELECTING_EXISTING_PILGRIMS
+  SUBMITTING_PILGRIMS
+  SELECTING_RELIEF_FUND_NO
+  ADDING_TO_WISHLIST
+  VERIFYING_RESULT
+  WISHLIST_ADDED
+  CHECKING_AVAILABILITY
+  WATCHING
+  WAITING
+  AVAILABILITY_FOUND
+  BOOKING_IN_PROGRESS
+  BOOKING
+  CONFIRMATION_CHECK
+  BOOKING_CONFIRMED
+  SUCCESS
+  COMPLETED
+  TEMPORARY_SLOT_LOST
+  NO_AVAILABILITY
+  DATE_UNAVAILABLE
+  ROUTE_UNAVAILABLE
+  PILGRIM_SELECTION_FAILED
+  SUBMIT_FAILED
+  SITE_ERROR
+  CAPTCHA_REQUIRED
+  OTP_REQUIRED
+  WORKER_ERROR
+  TIMEOUT
+  FAILED
+  SITE_UNAVAILABLE
+  UNKNOWN
+  UNKNOWN_RESULT
+  CANCELLED
+  EXPIRED
+  REQUIRES_HUMAN
+}
+
+enum WorkerStatus {
+  UNPAIRED
+  ONLINE
+  OFFLINE
+  BUSY
+  IDLE
+  ERROR
+  MAINTENANCE
+  UPDATING
+}
+
+enum TransactionType {
+  TOPUP
+  RESERVE
+  CAPTURE
+  RELEASE
+  REFUND
+  ADJUSTMENT
+  SETTLEMENT
+}
+
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REVERSED
+}
+
+enum RefundStatus {
+  REQUESTED
+  UNDER_REVIEW
+  APPROVED
+  REJECTED
+  PROCESSED
+}
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+  SMS
+  WHATSAPP
+}
+
+enum PayoutStatus {
+  REQUESTED
+  SETTLED
+  REJECTED
+}
+
+model User {
+  id               String       @id @default(uuid())
+  name             String
+  mobile           String       @unique
+  email            String       @unique
+  passwordHash     String
+  role             Role         @default(CENTRE)
+  status           UserStatus   @default(REGISTERED)
+  registrationDate DateTime?
+  expiryDate       DateTime?
+  mustChangePassword Boolean   @default(false)
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  centre              Centre?
+  wallet              Wallet?
+  walletTransactions  WalletTransaction[]
+  bookingAccounts     BookingAccount[]
+  bookingRequests     BookingRequest[]
+  refundRequests      RefundRequest[]
+  auditLogs           AuditLog[]
+  notifications       NotificationEvent[]
+
+  // ServiceTN Platform Fields & Relations
+  partnerId           String?
+  partner             Partner?            @relation("PartnerRegisteredUsers", fields: [partnerId], references: [id], onDelete: SetNull)
+  partnerProfile      Partner?            @relation("PartnerUserAccount")
+  redeemedInvitation  PartnerInvitation?  @relation("InvitationRedeemedUser")
+  registeredLocation  RegisteredLocation?
+  instantServiceQueries InstantServiceQuery[]
+
+  @@index([mobile])
+  @@index([email])
+  @@index([role, status])
+  @@index([partnerId])
+}
+
+model Centre {
+  id               String       @id @default(uuid())
+  userId           String       @unique
+  user             User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  centreName       String
+  centreCode       String?      @unique
+  address          String
+  district         String
+  taluk            String
+  pincode          String?
+  registrationFee  Decimal      @default(249.00)
+  feePaid          Boolean      @default(false)
+  feeTransactionId String?
+  paymentProofUrl  String?
+  status           CentreStatus @default(PENDING_VERIFICATION)
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  @@index([district])
+  @@index([status])
+}
+
+model BookingAccount {
+  id                String         @id @default(uuid())
+  userId            String
+  user              User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  label             String?
+  username          String
+  encryptedPassword String
+  encryptionIv      String
+  encryptionTag     String
+  status            AccountStatus  @default(UNVERIFIED)
+  lastVerifiedAt    DateTime?
+  verificationNote  String?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+
+  bookingRequests   BookingRequest[]
+  verificationJobs  BookingJob[]
+
+  @@unique([userId, username])
+  @@index([userId, status])
+}
+
+model Wallet {
+  id               String       @id @default(uuid())
+  userId           String       @unique
+  user             User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  availableBalance Decimal      @default(0.00)
+  reservedBalance  Decimal      @default(0.00)
+  updatedAt        DateTime     @updatedAt
+
+  transactions     WalletTransaction[]
+
+  @@index([userId])
+}
+
+model WalletTransaction {
+  id             String            @id @default(uuid())
+  walletId       String
+  wallet         Wallet            @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bookingId      String?
+  booking        BookingRequest?   @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  type           TransactionType
+  amount         Decimal
+  yuktronShare   Decimal?          @default(0.00)
+  workerShare    Decimal?          @default(0.00)
+  status         TransactionStatus @default(COMPLETED)
+  reference      String?
+  idempotencyKey String?           @unique
+  metadata       Json?
+  createdAt      DateTime          @default(now())
+
+  @@index([userId, type])
+  @@index([bookingId])
+  @@index([createdAt])
+}
+
+model BookingRequest {
+  id                String          @id @default(uuid())
+  bookingCode       String          @unique
+  userId            String
+  user              User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accountId         String?
+  account           BookingAccount? @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  requestedDate     DateTime
+  requestedDateStr  String?         // YYYY-MM-DD explicit format
+  route             String
+  pilgrimCount      Int             @default(1)
+  timeSlot          String?
+  selectedTime      String?         // Discovered & confirmed official time slot
+  preferences       Json?
+  status            BookingStatus   @default(PENDING)
+  assignedMachineId String?
+  assignedMachine   WorkerMachine?  @relation(fields: [assignedMachineId], references: [id], onDelete: SetNull)
+  
+  // Job Leasing & Watcher fields
+  leaseStartedAt    DateTime?
+  leaseExpiresAt    DateTime?
+  lastCheckedAt     DateTime?
+  nextCheckAt       DateTime?
+  checkCount        Int             @default(0)
+  
+  // Verification & Confirmation
+  officialReference String?
+  confirmationData  Json?
+  failureReason     String?
+  requiresHumanNote String?
+  matchedAt         DateTime?
+  completedAt       DateTime?
+
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  pilgrims          BookingPilgrim[]
+  attempts          BookingAttempt[]
+  jobs              BookingJob[]
+  transactions      WalletTransaction[]
+
+  @@index([userId, status])
+  @@index([status, nextCheckAt])
+  @@index([assignedMachineId])
+  @@index([requestedDate, route])
+  @@index([requestedDate, status, createdAt])
+  @@index([requestedDate, route, status, createdAt])
+  @@index([accountId, status])
+}
+
+model BookingJob {
+  id                String          @id @default(uuid())
+  jobType           JobType         @default(BOOKING_EXECUTION)
+  bookingRequestId  String?
+  bookingRequest    BookingRequest? @relation(fields: [bookingRequestId], references: [id], onDelete: Cascade)
+  accountId         String?
+  account           BookingAccount? @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  workerId          String?
+  worker            WorkerMachine?  @relation(fields: [workerId], references: [id], onDelete: SetNull)
+  status            BookingStatus   @default(QUEUED)
+  attempt           Int             @default(0)
+  maxAttempts       Int             @default(3)
+  startedAt         DateTime?
+  completedAt       DateTime?
+  heartbeatAt       DateTime?
+  leaseExpiresAt    DateTime?
+  errorCode         String?
+  errorMessage      String?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  attempts          BookingAttempt[]
+
+  @@index([status, leaseExpiresAt])
+  @@index([workerId])
+  @@index([bookingRequestId])
+  @@index([accountId])
+}
+
+model BookingPilgrim {
+  id               String         @id @default(uuid())
+  bookingRequestId String
+  bookingRequest   BookingRequest @relation(fields: [bookingRequestId], references: [id], onDelete: Cascade)
+  fullName         String
+  age              Int
+  gender           String
+  idType           String         // AADHAAR, VOTER_ID, PASSPORT
+  idNumber         String
+  photoUrl         String?
+  metadata         Json?
+  createdAt        DateTime       @default(now())
+
+  @@index([bookingRequestId])
+}
+
+model WorkerMachine {
+  id             String         @id @default(uuid())
+  machineCode    String         @unique // e.g. PC-001
+  machineName    String
+  pairingCode    String?        @unique
+  machineToken   String?        @unique
+  status         WorkerStatus   @default(UNPAIRED)
+  version        String         @default("1.0.0")
+  ipAddress      String?
+  lastHeartbeat  DateTime?
+  active         Boolean        @default(false)
+  currentJobId   String?
+  cpuUsage       Float?         @default(0)
+  memoryUsage    Float?         @default(0)
+  jobsCompleted  Int            @default(0)
+  successCount   Int            @default(0)
+  failureCount   Int            @default(0)
+  operatorShareBalance Decimal  @default(0.00)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  assignedBookings BookingRequest[]
+  assignedJobs     BookingJob[]
+  attempts         BookingAttempt[]
+
+  @@index([status])
+  @@index([active])
+  @@index([machineCode])
+}
+
+model BookingAttempt {
+  id               String          @id @default(uuid())
+  bookingId        String?
+  booking          BookingRequest? @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  jobId            String?
+  job              BookingJob?     @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  machineId        String?
+  machine          WorkerMachine?  @relation(fields: [machineId], references: [id], onDelete: SetNull)
+  attemptNumber    Int             @default(1)
+  startedAt        DateTime        @default(now())
+  completedAt      DateTime?
+  status           BookingStatus
+  officialState    String?
+  errorCode        String?
+  errorMessage     String?
+  resultReference  String?
+  executionLogs    Json?
+  screenshotUrl    String?
+
+  @@index([bookingId])
+  @@index([jobId])
+  @@index([machineId])
+}
+
+model RefundRequest {
+  id          String       @id @default(uuid())
+  userId      String
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  amount      Decimal
+  reason      String
+  upiId       String?
+  proofUrl    String?
+  status      RefundStatus @default(REQUESTED)
+  reference   String?
+  adminNotes  String?
+  requestedAt DateTime     @default(now())
+  processedAt DateTime?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@index([userId, status])
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  actorId   String?
+  user      User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  actorType String   // USER, WORKER, SYSTEM, ADMIN
+  action    String
+  entity    String
+  entityId  String?
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  @@index([actorId])
+  @@index([entity, entityId])
+  @@index([createdAt])
+}
+
+model NotificationEvent {
+  id        String              @id @default(uuid())
+  userId    String?
+  user      User?               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  recipient String
+  channel   NotificationChannel @default(IN_APP)
+  title     String
+  body      String
+  status    String              @default("PENDING") // PENDING, SENT, FAILED
+  payload   Json?
+  createdAt DateTime            @default(now())
+
+  @@index([userId])
+  @@index([status])
+}
+
+model IdempotencyRecord {
+  id             String   @id @default(uuid())
+  key            String   @unique
+  operation      String
+  responsePayload Json
+  createdAt      DateTime @default(now())
+  expiresAt      DateTime
+
+  @@index([key])
+  @@index([expiresAt])
+}
+
+model SystemConfig {
+  id                     String   @id @default("default")
+  serviceFee             Decimal  @default(100.00)
+  yuktronShare           Decimal  @default(80.00)
+  workerShare            Decimal  @default(20.00)
+  registrationFee        Decimal  @default(249.00)
+  franchiseFee           Decimal  @default(599.00)
+  accountValidityDays    Int      @default(365)
+  checkingIntervalSeconds Int     @default(300) // 5 minutes compliant interval
+  leaseTimeoutSeconds    Int      @default(120) // 2 minutes heartbeat lease
+  humanAssistedModeOnly  Boolean  @default(false)
+  partnerMinWithdrawal   Decimal  @default(100.00)
+
+  // Payment Methods Configuration (Online & Offline)
+  onlinePaymentEnabled   Boolean  @default(true)
+  onlineGatewayProvider  String   @default("RAZORPAY") // RAZORPAY, CASHFREE, PHONEPE, STRIPE
+  onlineGatewayKeyId     String?
+  onlineGatewayKeySecret String?
+
+  offlinePaymentEnabled  Boolean  @default(true)
+  offlineUpiId           String   @default("pay.ticketassist@okaxis")
+  offlineAccountName     String   @default("TicketAssist Services & Network")
+  offlineQrImageUrl      String?  // Base64 or Image URL of Admin Uploaded Payment QR Code
+  offlineBankName        String?  @default("HDFC Bank")
+  offlineAccountNumber   String?  @default("50200012345678")
+  offlineIfscCode        String?  @default("HDFC0001234")
+  offlinePaymentInstructions String? @default("Scan the official QR code or pay via UPI. Enter your 12-digit UTR/Reference ID for instant validation.")
+
+  updatedAt              DateTime @updatedAt
+}
+
+model AvailabilityOpportunity {
+  id               String   @id @default(uuid())
+  date             String   // YYYY-MM-DD
+  route            String
+  timeSlot         String
+  status           String   @default("AVAILABLE") // AVAILABLE, MATCHED, EXPIRED
+  source           String   @default("official-portal")
+  idempotencyKey   String   @unique
+  matchedBookingId String?
+  detectedAt       DateTime @default(now())
+
+  @@index([date, route, status])
+  @@index([detectedAt])
+}
+
+model AccountLock {
+  accountId   String   @id
+  bookingId   String
+  workerId    String?
+  lockedAt    DateTime @default(now())
+  expiresAt   DateTime
+
+  @@index([expiresAt])
+}
+
+model Partner {
+  id               String              @id @default(uuid())
+  partnerCode      String              @unique // e.g. PT-001
+  name             String
+  mobile           String
+  email            String
+  district         String?
+  taluk            String?
+  status           PartnerStatus       @default(PENDING_PAYMENT)
+  franchiseFee     Decimal             @default(599.00)
+  feePaid          Boolean             @default(false)
+  paymentReference String?
+  paymentProofUrl  String?
+  userId           String?             @unique
+  user             User?               @relation("PartnerUserAccount", fields: [userId], references: [id], onDelete: SetNull)
+  balance          Decimal             @default(0.00)
+  commissionRate       Decimal             @default(20.00)
+  commissionPercentage Decimal             @default(20.00)
+  commissionSlab       String?             @default("STANDARD")
+  invitations          PartnerInvitation[]
+  registeredUsers  User[]              @relation("PartnerRegisteredUsers")
+  payouts          PartnerPayout[]
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+
+  @@index([status])
+  @@index([partnerCode])
+}
+
+model PartnerPayout {
+  id               String       @id @default(uuid())
+  partnerId        String
+  partner          Partner      @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  amount           Decimal
+  upiId            String
+  accountHolder    String?
+  status           PayoutStatus @default(REQUESTED)
+  paymentReference String?      // UTR / Transaction reference ID from bank transfer
+  screenshotUrl    String?      // Proof of settlement (base64 image or screenshot URL)
+  adminNotes       String?
+  requestedAt      DateTime     @default(now())
+  settledAt        DateTime?
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  @@index([partnerId])
+  @@index([status])
+}
+
+model PartnerInvitation {
+  id           String           @id @default(uuid())
+  partnerId    String
+  partner      Partner          @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  token        String           @unique // non-guessable secure token
+  status       InvitationStatus @default(ACTIVE)
+  expiresAt    DateTime?
+  usedAt       DateTime?
+  usedByUserId String?          @unique
+  usedByUser   User?            @relation("InvitationRedeemedUser", fields: [usedByUserId], references: [id], onDelete: SetNull)
+  metadata     Json?
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  @@index([token])
+  @@index([partnerId, status])
+}
+
+model RegisteredLocation {
+  id          String   @id @default(uuid())
+  userId      String   @unique
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  latitude    Float
+  longitude   Float
+  accuracy    Float?
+  address     String?
+  district    String?
+  status      String   @default("ACTIVE")
+  capturedAt  DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([userId])
+}
+
+model PlatformService {
+  id          String   @id @default(uuid())
+  code        String   @unique // TICKET_ASSIST, INSTANT_SERVICE, etc.
+  name        String
+  description String?
+  category    String?
+  status      String   @default("ACTIVE") // ACTIVE, MAINTENANCE, DISABLED
+  config      Json?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([code])
+  @@index([status])
+}
+
+model InstantServiceQuery {
+  id                String   @id @default(uuid())
+  userId            String
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  serviceType       String   // e.g. COMMUNITY_CERTIFICATE, INCOME_CERTIFICATE, PATTA_CHITTA, EC
+  applicationNumber String
+  status            String   @default("SUCCESS") // SUCCESS, FAILED, PENDING
+  responseData      Json?
+  errorMessage      String?
+  createdAt         DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([applicationNumber])
+}
+
+
