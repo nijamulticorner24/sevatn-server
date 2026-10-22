@@ -10,20 +10,42 @@
 
 set -euo pipefail
 
+# 1. Directory Resolution & Working Tree Setup
+# Production repository root is /home/ubuntu/sevatn-server containing
+# package.json, package-lock.json, prisma/schema.prisma, and scripts/ directly.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 API_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-REPO_ROOT="$(cd "${API_DIR}/.." && pwd)"
+REPO_ROOT="${API_DIR}"
 
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "================================================================="
 echo "🚀  TicketAssist / ServiceTN — Production Deployment"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "================================================================="
 echo "Timestamp: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-echo "Root Directory: ${REPO_ROOT}"
+echo "Repository Root: ${REPO_ROOT}"
+echo "API Directory  : ${API_DIR}"
 
-# STEP 0: Verify Working Directory Structure
-if [ ! -f "${API_DIR}/package.json" ] || [ ! -f "${API_DIR}/prisma/schema.prisma" ]; then
-  echo "[-] FATAL: Invalid deployment directory. Expected 'api/package.json' and 'prisma/schema.prisma'."
+# STEP 0: Validate Required Files & Repository Layout
+echo -e "\n🔍 [Step 0/8] Validating repository structure and required files..."
+if [ ! -f "${REPO_ROOT}/package.json" ]; then
+  echo "[-] FATAL: 'package.json' not found in repository root: ${REPO_ROOT}"
   exit 1
+fi
+
+if [ ! -f "${REPO_ROOT}/package-lock.json" ]; then
+  echo "[-] FATAL: 'package-lock.json' not found in repository root: ${REPO_ROOT}. Cannot perform reproducible npm ci."
+  exit 1
+fi
+
+if [ ! -f "${REPO_ROOT}/prisma/schema.prisma" ]; then
+  echo "[-] FATAL: 'prisma/schema.prisma' not found in repository root: ${REPO_ROOT}."
+  exit 1
+fi
+
+# Preserve local .env if present
+if [ -f "${API_DIR}/.env" ]; then
+  echo "[+] Preserving existing .env configuration in ${API_DIR}."
+else
+  echo "[!] Notice: .env file not found in ${API_DIR}. Ensure production environment variables are exported."
 fi
 
 # STEP 1: Verify Git State & Pull Reviewed Code
@@ -67,7 +89,7 @@ fi
 echo -e "\n📚 [Step 2/8] Installing dependencies reproducibly with existing lockfile..."
 cd "${API_DIR}"
 if [ ! -f "package-lock.json" ]; then
-  echo "[-] FATAL: 'package-lock.json' not found. Cannot perform reproducible npm ci."
+  echo "[-] FATAL: 'package-lock.json' not found in ${API_DIR}. Cannot perform reproducible npm ci."
   exit 1
 fi
 
@@ -75,20 +97,24 @@ npm ci --prefer-offline --no-audit
 
 # STEP 3: Validate and Generate Prisma Client
 echo -e "\n⚙️  [Step 3/8] Validating schema and generating Prisma Client..."
+cd "${API_DIR}"
 npx prisma validate --schema=prisma/schema.prisma
 npx prisma generate --schema=prisma/schema.prisma
 
 # STEP 4: Run Guarded Schema Synchronization
 echo -e "\n🛡️  [Step 4/8] Running Guarded Schema Synchronization..."
+cd "${API_DIR}"
 # Runs independent diff review and rejects destructive changes before updating database
 npm run schema:sync
 
 # STEP 5: Build NestJS Application
 echo -e "\n🏗️  [Step 5/8] Building NestJS application..."
+cd "${API_DIR}"
 npm run build
 
 # STEP 6: Restart API Process via PM2 (Only reached after prior steps succeed)
 echo -e "\n🔄 [Step 6/8] Restarting API process (ticketassist-api)..."
+cd "${API_DIR}"
 if command -v pm2 > /dev/null 2>&1; then
   if pm2 list | grep -q "ticketassist-api"; then
     echo "[+] Restarting existing PM2 process 'ticketassist-api'..."
@@ -134,6 +160,6 @@ if command -v pm2 > /dev/null 2>&1 && pm2 list | grep -q "ticketassist-api"; the
   pm2 logs ticketassist-api --lines 25 --nostream
 fi
 
-echo -e "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo -e "\n================================================================="
 echo "✅  DEPLOYMENT SUCCESSFUL: All validation, schema sync, and health checks passed."
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "================================================================="

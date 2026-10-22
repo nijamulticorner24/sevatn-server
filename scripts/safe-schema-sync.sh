@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # TicketAssist / ServiceTN — Hardened Schema Synchronization Script
-# Environment: Linux / Ubuntu AWS EC2 (/home/ubuntu/sevatn-server/api)
+# Environment: Linux / Ubuntu AWS EC2 (/home/ubuntu/sevatn-server)
 # Description: Enforces fail-closed database validation, masks credentials,
 #              independently reviews schema diffs, and rejects destructive operations.
 # ==============================================================================
