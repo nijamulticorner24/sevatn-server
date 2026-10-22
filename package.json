@@ -15,6 +15,7 @@
     "prisma:generate": "prisma generate",
     "prisma:push": "prisma db push",
     "schema:sync": "ts-node scripts/safe-schema-sync.ts",
+    "schema:dry-run": "ts-node scripts/safe-schema-sync.ts --dry-run",
     "prisma:seed": "ts-node prisma/seed.ts",
     "clear:queues": "ts-node clear_all_queues.ts",
     "test": "jest",

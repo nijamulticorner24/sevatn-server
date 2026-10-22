@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# TicketAssist / ServiceTN — Controlled Schema Synchronization Script
+# TicketAssist / ServiceTN — Hardened Schema Synchronization Script
 # Environment: Linux / Ubuntu AWS EC2 (/home/ubuntu/sevatn-server/api)
-# Description: Validates DATABASE_URL, masks credentials, checks for unexpected
-#              destructive drift, and safely pushes additive schema updates.
+# Description: Enforces fail-closed database validation, masks credentials,
+#              independently reviews schema diffs, and rejects destructive operations.
 # ==============================================================================
 
 set -euo pipefail
@@ -14,46 +14,49 @@ API_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${API_DIR}"
 
 echo "================================================================="
-echo "  TicketAssist / ServiceTN — Production Safe Schema Sync"
+echo "  TicketAssist / ServiceTN — Hardened Schema Synchronization"
 echo "================================================================="
 
-# 1. Check if .env exists
+# 1. Verify .env file exists
 if [ ! -f .env ]; then
-  echo "[-] ERROR: .env file not found in ${API_DIR}"
+  echo "[-] FATAL: .env file not found in ${API_DIR}"
   exit 1
 fi
 
-# Load environment variables
+# Load environment variables safely
 set -a
 # shellcheck disable=SC1091
 source .env
 set +a
 
-# 2. Check if DATABASE_URL is set
+# 2. Verify DATABASE_URL exists
 if [ -z "${DATABASE_URL:-}" ]; then
-  echo "[-] ERROR: DATABASE_URL is not set or empty."
+  echo "[-] FATAL: DATABASE_URL is not set or empty."
   exit 1
 fi
 
-# 3. Mask credentials for logging
+# 3. Mask credentials for all terminal logs
 MASKED_DB_URL=$(echo "${DATABASE_URL}" | sed -E 's|://[^:]+:[^@]+@|://***:***@|')
 echo "[+] Target Database: ${MASKED_DB_URL}"
 
-# 4. Confirm expected database name in production
+# 4. Strict Production Pre-Flight Validation (Fail-Closed)
 if [[ "${NODE_ENV:-}" == "production" ]]; then
-  if [[ "${DATABASE_URL}" != *"servicetn_db"* ]]; then
-    echo "[!] WARNING: DATABASE_URL does not reference 'servicetn_db'. Please check configuration."
+  # Expected database name check
+  EXPECTED_DB="${EXPECTED_DB_NAME:-servicetn_db}"
+  if [[ "${DATABASE_URL}" != *"${EXPECTED_DB}"* ]]; then
+    echo "[-] FATAL: Production database must be '${EXPECTED_DB}'. Aborting deployment."
+    exit 1
+  fi
+
+  # Expected hostname check if configured
+  if [ -n "${EXPECTED_DB_HOST:-}" ]; then
+    if [[ "${DATABASE_URL}" != *"${EXPECTED_DB_HOST}"* ]]; then
+      echo "[-] FATAL: Production database host does not match EXPECTED_DB_HOST. Aborting deployment."
+      exit 1
+    fi
   fi
 fi
 
-# 5. Execute safe schema synchronization
-echo "[+] Running Prisma schema sync (prisma db push --skip-generate)..."
-if npx prisma db push --skip-generate; then
-  echo "[+] SUCCESS: Prisma schema synchronization completed safely."
-  echo "================================================================="
-  exit 0
-else
-  echo "[-] ERROR: Prisma schema push failed. Halting deployment."
-  echo "================================================================="
-  exit 1
-fi
+# 5. Delegate to the hardened TypeScript schema synchronizer
+echo "[+] Launching schema synchronizer with independent diff classification..."
+exec npx ts-node "${SCRIPT_DIR}/safe-schema-sync.ts" "$@"
