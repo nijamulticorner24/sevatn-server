@@ -2,30 +2,44 @@ import {
   Controller,
   Get,
   Post,
+  Patch,
+  Delete,
   Body,
   Param,
+  Query,
   UseGuards,
 } from '@nestjs/common';
 import { WorkersService } from './workers.service';
-import { JwtAuthGuard, RolesGuard, MachineAuthGuard } from '../common/guards';
-import { CurrentUser, CurrentMachine, Roles } from '../common/decorators';
+import { SmartAllocatorService } from './smart-allocator.service';
+import { JwtAuthGuard, RolesGuard, MachineAuthGuard, RateLimiterGuard } from '../common/guards';
+import { CurrentUser, CurrentMachine, Roles, Throttle } from '../common/decorators';
 import {
   RegisterMachineDto,
   PairMachineDto,
   HeartbeatDto,
   UpdateJobStatusDto,
   ReportJobResultDto,
+  CreateWorkerDto,
+  AdminWorkerActionDto,
+  ActivityLogQueryDto,
+  UpdateWorkerCapacityDto,
+  AllocationQueryDto,
 } from './dto/worker.dto';
 import { Role } from '@prisma/client';
 
 @Controller('workers')
 export class WorkersController {
-  constructor(private readonly workersService: WorkersService) {}
+  constructor(
+    private readonly workersService: WorkersService,
+    private readonly smartAllocator: SmartAllocatorService,
+  ) {}
 
   /**
    * Worker initial boot: Register & get pairing code
    */
   @Post('register')
+  @UseGuards(RateLimiterGuard)
+  @Throttle(10, 60)
   async registerMachine(@Body() dto: RegisterMachineDto) {
     return this.workersService.registerMachine(dto);
   }
@@ -39,6 +53,16 @@ export class WorkersController {
   }
 
   /**
+   * Super Admin initiates new worker registration directly
+   */
+  @Post('admin/create')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN)
+  async adminCreateWorker(@Body() dto: CreateWorkerDto, @CurrentUser() admin: any) {
+    return this.workersService.adminCreateWorker(dto, admin);
+  }
+
+  /**
    * Admin approves worker pairing
    */
   @Post('pair')
@@ -49,6 +73,36 @@ export class WorkersController {
   }
 
   /**
+   * Admin retrieves fleet real-time summary statistics
+   */
+  @Get('summary')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN)
+  async getFleetSummary() {
+    return this.workersService.getFleetSummary();
+  }
+
+  /**
+   * Super Admin retrieves detailed queue health, allocator status & worker execution diagnostics
+   */
+  @Get('diagnostics/queue-health')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN)
+  async getQueueAndWorkerDiagnostics() {
+    return this.workersService.getQueueAndWorkerDiagnostics();
+  }
+
+  /**
+   * Admin retrieves fleet-wide activity logs
+   */
+  @Get('logs/all')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN)
+  async getFleetActivityLogs(@Query() query: ActivityLogQueryDto) {
+    return this.workersService.getFleetActivityLogs(query);
+  }
+
+  /**
    * Admin lists all workers in fleet
    */
   @Get()
@@ -56,6 +110,169 @@ export class WorkersController {
   @Roles(Role.SUPER_ADMIN)
   async getAllWorkers() {
     return this.workersService.getAllWorkers();
+  }
+
+  /**
+   * Super Admin retrieves smart job allocation logs & history
+   */
+  @Get('allocations')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN)
+  async getAllocationHistory(@Query() query: AllocationQueryDto) {
+    return this.smartAllocator.getAllocationHistory(query);
+  }
+
+  /**
+   * Super Admin triggers manual allocation sweep across eligible pending jobs
+   */
+  @Post('allocations/sweep')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN)
+  async runAllocationSweep() {
+    return this.smartAllocator.runAllocationSweep();
+  }
+
+  /**
+   * Super Admin triggers stale reservation and expired lease recovery
+   */
+  @Post('allocations/recover-stale')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN)
+  async recoverStaleAllocations() {
+    return this.smartAllocator.recoverStaleLeases();
+  }
+
+  /**
+   * Admin retrieves single worker details
+   */
+  @Get(':id')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN)
+  async getWorkerById(@Param('id') id: string) {
+    return this.workersService.getWorkerById(id);
+  }
+
+  /**
+   * Super Admin updates worker capacity, deployment configuration, and capabilities
+   */
+  @Patch(':id/capacity')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN)
+  async updateWorkerCapacity(
+    @Param('id') id: string,
+    @Body() dto: UpdateWorkerCapacityDto,
+  ) {
+    return this.smartAllocator.updateWorkerCapacity(id, dto);
+  }
+
+  /**
+   * Admin retrieves activity logs for a specific worker
+   */
+  @Get(':id/logs')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN)
+  async getWorkerActivityLogs(@Param('id') id: string, @Query() query: ActivityLogQueryDto) {
+    return this.workersService.getWorkerActivityLogs(id, query);
+  }
+
+  /**
+   * Super Admin enables a worker machine
+   */
+  @Post(':id/enable')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN)
+  async enableWorker(@Param('id') id: string, @CurrentUser() admin: any) {
+    return this.workersService.enableWorker(id, admin);
+  }
+
+  /**
+   * Super Admin disables a worker machine
+   */
+  @Post(':id/disable')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN)
+  async disableWorker(
+    @Param('id') id: string,
+    @Body() dto: AdminWorkerActionDto,
+    @CurrentUser() admin: any,
+  ) {
+    return this.workersService.disableWorker(id, dto?.reason, admin);
+  }
+
+  /**
+   * Super Admin pauses worker job assignments
+   */
+  @Post(':id/pause')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN)
+  async pauseWorker(
+    @Param('id') id: string,
+    @Body() dto: AdminWorkerActionDto,
+    @CurrentUser() admin: any,
+  ) {
+    return this.workersService.pauseWorker(id, dto?.reason, admin);
+  }
+
+  /**
+   * Super Admin sets worker to monitor-only mode
+   */
+  @Post(':id/monitor-only')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN)
+  async setMonitorOnly(@Param('id') id: string, @CurrentUser() admin: any) {
+    return this.workersService.setMonitorOnly(id, admin);
+  }
+
+  /**
+   * Super Admin requests graceful shutdown & drain
+   */
+  @Post(':id/drain')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN)
+  async drainWorker(@Param('id') id: string, @CurrentUser() admin: any) {
+    return this.workersService.drainWorker(id, admin);
+  }
+
+  /**
+   * Super Admin revokes worker credentials
+   */
+  @Post(':id/revoke')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN)
+  async revokeWorker(
+    @Param('id') id: string,
+    @Body() dto: AdminWorkerActionDto,
+    @CurrentUser() admin: any,
+  ) {
+    return this.workersService.revokeWorker(id, dto.reason || '', admin);
+  }
+
+  /**
+   * Super Admin retires worker from active fleet
+   */
+  @Post(':id/retire')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN)
+  async retireWorker(
+    @Param('id') id: string,
+    @Body() dto: AdminWorkerActionDto,
+    @CurrentUser() admin: any,
+  ) {
+    return this.workersService.retireWorker(id, dto.reason || '', admin);
+  }
+
+  /**
+   * Super Admin completely deletes worker and revokes all terminal access
+   */
+  @Delete(':id')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN)
+  async deleteWorker(
+    @Param('id') id: string,
+    @Body() dto: AdminWorkerActionDto,
+    @CurrentUser() admin: any,
+  ) {
+    return this.workersService.deleteWorker(id, dto?.reason, admin);
   }
 
   /**

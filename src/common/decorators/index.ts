@@ -19,3 +19,4 @@ export const CurrentMachine = createParamDecorator(
 );
 
 export * from './require-service.decorator';
+export * from './throttle.decorator';

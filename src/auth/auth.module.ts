@@ -5,12 +5,16 @@ import { AuthService } from './auth.service';
 import { AuthController } from './auth.controller';
 import { JwtStrategy } from './jwt.strategy';
 
+import { getValidatedJwtSecret } from '../common/security/jwt-config';
+
 @Module({
   imports: [
     PassportModule.register({ defaultStrategy: 'jwt' }),
-    JwtModule.register({
-      secret: process.env.JWT_SECRET || 'super_secret_ticketassist_jwt_key_yuktron_2026',
-      signOptions: { expiresIn: '7d' },
+    JwtModule.registerAsync({
+      useFactory: () => ({
+        secret: getValidatedJwtSecret(),
+        signOptions: { expiresIn: process.env.JWT_EXPIRES_IN || '7d' },
+      }),
     }),
   ],
   controllers: [AuthController],

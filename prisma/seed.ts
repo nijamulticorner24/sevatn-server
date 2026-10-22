@@ -30,9 +30,10 @@ async function main() {
 
   const passwordHash = await bcrypt.hash('Admin@123456', 10);
 
-  // Super Admin
+  // Super Admin (fixed ID prevents token invalidation across dev re-seeds)
   await prisma.user.create({
     data: {
+      id: 'cb75ce11-ab7b-49dd-9038-be51871f2bb3',
       name: 'Super Admin',
       email: 'superadmin@ticketassist.in',
       mobile: '9876543210',
@@ -63,27 +64,7 @@ async function main() {
     },
   });
 
-  // Default Worker Machine (PC-001) for local worker node
-  await prisma.workerMachine.upsert({
-    where: { machineCode: 'PC-001' },
-    update: {
-      machineToken: 'wkt_pc001_chennai_live_token_7728',
-      status: WorkerStatus.ONLINE,
-      active: true,
-      lastHeartbeat: new Date(),
-    },
-    create: {
-      machineCode: 'PC-001',
-      machineName: 'Local Worker PC 1',
-      machineToken: 'wkt_pc001_chennai_live_token_7728',
-      status: WorkerStatus.ONLINE,
-      active: true,
-      version: '1.0.0',
-      lastHeartbeat: new Date(),
-    },
-  });
-
-  console.log('✅ Minimal seed done (including Worker PC-001)!');
+  console.log('✅ Minimal seed done (No pre-seeded workers — register via /admin/fleet)!');
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log('🔑 Login Credentials (all use same password):');
   console.log('   Password : Admin@123456');

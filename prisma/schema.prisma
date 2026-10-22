@@ -398,7 +398,16 @@ model WorkerMachine {
   pairingCode    String?        @unique
   machineToken   String?        @unique
   status         WorkerStatus   @default(UNPAIRED)
-  desiredState   String         @default("STOPPED") // STOPPED | RUNNING | STOPPING | STARTING
+  adminStatus    String         @default("ENABLED") // ENABLED | DISABLED | REVOKED | RETIRED
+  desiredState   String         @default("STOPPED") // STOPPED | RUNNING | STOPPING | STARTING | PAUSED | MONITOR_ONLY
+  currentActivity String?       // IDLE | DISCOVERING_AVAILABILITY | PROCESSING_JOB | NAVIGATING_PORTAL | WAITING_HUMAN_INTERVENTION | VERIFYING_RESULT | DRAINING
+  activityDetails String?
+  activityStartedAt DateTime?
+  lastActivityAt DateTime?
+  currentBookingId String?
+  retirementReason String?
+  retiredAt      DateTime?
+  revokedAt      DateTime?
   version        String         @default("1.0.0")
   ipAddress      String?
   lastHeartbeat  DateTime?
@@ -413,13 +422,63 @@ model WorkerMachine {
   createdAt      DateTime       @default(now())
   updatedAt      DateTime       @updatedAt
 
+  deploymentType String         @default("LOCAL_PC") // LOCAL_PC | CLOUD_VM | DOCKER
+  installationId String?
+  maxConcurrentJobs Int          @default(1)
+  currentActiveJobs Int          @default(0)
+  capabilities   String[]       @default(["ACCOUNT_VERIFICATION", "BOOKING_EXECUTION", "AVAILABILITY_DISCOVERY"])
+  lastJobAt      DateTime?
+
   assignedBookings BookingRequest[]
   assignedJobs     BookingJob[]
   attempts         BookingAttempt[]
+  activityLogs     WorkerActivityLog[]
+  allocationLogs   JobAllocationLog[]
 
   @@index([status])
   @@index([active])
+  @@index([adminStatus])
   @@index([machineCode])
+  @@index([deploymentType])
+}
+
+model WorkerActivityLog {
+  id           String        @id @default(uuid())
+  workerId     String
+  worker       WorkerMachine @relation(fields: [workerId], references: [id], onDelete: Cascade)
+  jobId        String?
+  bookingId    String?
+  eventType    String        // HEARTBEAT | JOB_CLAIMED | STEP_PROGRESS | HUMAN_ACTION_REQUIRED | JOB_COMPLETED | JOB_FAILED | LEASE_RENEWED | STATE_CHANGE | ERROR
+  severity     String        @default("INFO") // INFO | WARN | ERROR | CRITICAL
+  activity     String?
+  message      String
+  details      Json?
+  timestamp    DateTime      @default(now())
+
+  @@index([workerId, timestamp])
+  @@index([jobId])
+  @@index([eventType])
+  @@index([severity])
+  @@index([timestamp])
+}
+
+model JobAllocationLog {
+  id               String          @id @default(uuid())
+  jobId            String?
+  bookingId        String?
+  workerId         String?
+  worker           WorkerMachine?  @relation(fields: [workerId], references: [id], onDelete: SetNull)
+  status           String          // ALLOCATED | REJECTED | RECOVERED | NO_WORKER_AVAILABLE
+  decisionReason   String
+  candidateCount   Int             @default(0)
+  evaluatedWorkers Json?
+  createdAt        DateTime        @default(now())
+
+  @@index([jobId])
+  @@index([bookingId])
+  @@index([workerId])
+  @@index([status])
+  @@index([createdAt])
 }
 
 model BookingAttempt {

@@ -3,17 +3,22 @@ import {
   BadRequestException,
   NotFoundException,
   Logger,
+  Optional,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CredentialCrypto } from '../common/security/credential-crypto';
 import { CreateAccountDto, VerifyAccountDto } from './dto/account.dto';
 import { AccountStatus, BookingStatus, JobType } from '@prisma/client';
+import { SmartAllocatorService } from '../workers/smart-allocator.service';
 
 @Injectable()
 export class AccountsService {
   private readonly logger = new Logger(AccountsService.name);
 
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    @Optional() private smartAllocator?: SmartAllocatorService,
+  ) {}
 
   /**
    * Save or update an official Sabarimala account with authenticated encryption
@@ -110,6 +115,12 @@ export class AccountsService {
     });
 
     this.logger.log(`Account verification job created: Job ${job.id} for account ${account.username}`);
+
+    if (this.smartAllocator) {
+      this.smartAllocator.allocateJob(job.id).catch((err) => {
+        this.logger.warn(`Verification allocation error: ${err.message}`);
+      });
+    }
 
     return {
       message: 'Verification job queued. Playwright worker will verify credentials on official website.',

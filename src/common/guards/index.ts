@@ -39,6 +39,8 @@ export class RolesGuard implements CanActivate {
   }
 }
 
+import { hashMachineToken } from '../security/token-hash';
+
 @Injectable()
 export class MachineAuthGuard implements CanActivate {
   constructor(private prisma: PrismaService) {}
@@ -53,16 +55,35 @@ export class MachineAuthGuard implements CanActivate {
       token = authHeader.split(' ')[1];
     }
 
-    if (!token) {
+    if (!token || typeof token !== 'string' || token.trim().length === 0) {
       throw new UnauthorizedException('Worker machine token missing in x-machine-token or Authorization header');
     }
 
-    const machine = await this.prisma.workerMachine.findUnique({
-      where: { machineToken: String(token) },
+    const cleanToken = token.trim();
+    const tokenHash = hashMachineToken(cleanToken);
+
+    // 1. Look up worker machine by SHA-256 hash verifier
+    let machine = await this.prisma.workerMachine.findUnique({
+      where: { machineToken: tokenHash },
     });
 
-    if (!machine || !machine.active) {
-      throw new UnauthorizedException('Invalid or inactive machine token');
+    // 2. Controlled zero-downtime migration: check if machine still has legacy plaintext token
+    if (!machine) {
+      const legacyMachine = await this.prisma.workerMachine.findUnique({
+        where: { machineToken: cleanToken },
+      });
+
+      if (legacyMachine) {
+        // Upgrade legacy plaintext token to SHA-256 hash verifier automatically on first successful authentication
+        machine = await this.prisma.workerMachine.update({
+          where: { id: legacyMachine.id },
+          data: { machineToken: tokenHash },
+        });
+      }
+    }
+
+    if (!machine || !machine.active || (machine as any).adminStatus === 'REVOKED' || (machine as any).adminStatus === 'RETIRED') {
+      throw new UnauthorizedException('Invalid or inactive machine token or credentials revoked');
     }
 
     request.machine = machine;
@@ -75,3 +96,4 @@ function ctxGetRequest(context: ExecutionContext) {
 }
 
 export * from './service-access.guard';
+export * from './rate-limiter.guard';

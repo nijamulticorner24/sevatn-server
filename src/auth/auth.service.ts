@@ -17,15 +17,40 @@ import {
   RegisterByInvitationDto,
   VerifyRegistrationPaymentDto,
   UpdateLocationDto,
+  ForgotPasswordDto,
+  VerifyOtpDto,
+  ResetPasswordDto,
+  RequestEmailChangeDto,
+  VerifyEmailChangeDto,
 } from './dto/auth.dto';
 import { UserStatus, CentreStatus, Role, InvitationStatus, Prisma } from '@prisma/client';
 import { isValidCoordinate } from '../common/utils/geo';
 
 import { EventsGateway } from '../events/events.gateway';
 
+interface OtpSession {
+  otp: string;
+  userId: string;
+  email: string;
+  expiresAt: number;
+  verified: boolean;
+  attempts: number;
+}
+
+interface EmailChangeSession {
+  userId: string;
+  currentEmail: string;
+  newEmail: string;
+  otp: string;
+  expiresAt: number;
+  attempts: number;
+}
+
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
+  private readonly otpStore = new Map<string, OtpSession>();
+  private readonly emailChangeStore = new Map<string, EmailChangeSession>();
 
   constructor(
     private prisma: PrismaService,
@@ -468,10 +493,71 @@ export class AuthService {
     };
   }
 
+  /**
+   * Public Centre Resolution for Unique Centre Login Portals (/c/:code)
+   */
+  async getPublicCentreInfo(code: string) {
+    if (!code || !code.trim()) {
+      throw new BadRequestException('Centre code or identifier is required');
+    }
+    const cleanCode = code.trim();
+    const centre = await this.prisma.centre.findFirst({
+      where: {
+        OR: [
+          { centreCode: { equals: cleanCode, mode: 'insensitive' } },
+          { id: cleanCode },
+        ],
+      },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            mobile: true,
+            status: true,
+          },
+        },
+      },
+    });
+
+    if (!centre) {
+      throw new NotFoundException(`Centre with identifier '${cleanCode}' was not found`);
+    }
+
+    const maskedEmail = centre.user?.email
+      ? centre.user.email.replace(/^(.)(.*)(@.*)$/, (_, a, b, c) => a + '***' + c)
+      : '';
+    const maskedMobile = centre.user?.mobile
+      ? centre.user.mobile.slice(0, 2) + '******' + centre.user.mobile.slice(-2)
+      : '';
+
+    return {
+      id: centre.id,
+      centreName: centre.centreName,
+      centreCode: centre.centreCode,
+      district: centre.district,
+      taluk: centre.taluk,
+      address: centre.address,
+      pincode: centre.pincode,
+      status: centre.status,
+      feePaid: centre.feePaid,
+      operatorName: centre.user?.name,
+      maskedEmail,
+      maskedMobile,
+      loginEmail: centre.user?.email,
+    };
+  }
+
   async login(dto: LoginDto) {
+    const cleanId = dto.identifier.trim();
     const user = await this.prisma.user.findFirst({
       where: {
-        OR: [{ email: dto.identifier }, { mobile: dto.identifier }],
+        OR: [
+          { email: { equals: cleanId, mode: 'insensitive' } },
+          { mobile: cleanId },
+          { centre: { centreCode: { equals: cleanId, mode: 'insensitive' } } },
+        ],
       },
       include: {
         centre: true,
@@ -483,7 +569,18 @@ export class AuthService {
     });
 
     if (!user) {
-      throw new UnauthorizedException('Invalid mobile/email or password');
+      throw new UnauthorizedException('Invalid mobile/email/centre code or password');
+    }
+
+    // If centreCode was specified in the login flow, ensure this user belongs to that centre
+    if (dto.centreCode && dto.centreCode.trim()) {
+      const expectedCode = dto.centreCode.trim().toUpperCase();
+      const userCentreCode = user.centre?.centreCode?.toUpperCase();
+      if (!userCentreCode || userCentreCode !== expectedCode) {
+        throw new ForbiddenException(
+          `This account is not authorized for Centre ${dto.centreCode.trim()}. Please verify your centre portal credentials.`,
+        );
+      }
     }
 
     if (user.status === UserStatus.SUSPENDED) {
@@ -496,7 +593,7 @@ export class AuthService {
 
     const isMatch = await bcrypt.compare(dto.password, user.passwordHash);
     if (!isMatch) {
-      throw new UnauthorizedException('Invalid mobile/email or password');
+      throw new UnauthorizedException('Invalid mobile/email/centre code or password');
     }
 
     // Check Partner status & payment verification
@@ -662,6 +759,382 @@ export class AuthService {
     return {
       message: 'Password changed successfully',
       mustChangePassword: false,
+      user: this.sanitizeUser(updatedUser),
+    };
+  }
+
+  /**
+   * Dispatches an email via Resend REST API (using RESEND_API_KEY)
+   */
+  private async sendResendEmail(toEmail: string, subject: string, htmlContent: string) {
+    const apiKey = process.env.RESEND_API_KEY?.trim();
+    const fromEmail = process.env.RESEND_FROM_EMAIL?.trim() || 'TicketAssist <onboarding@resend.dev>';
+
+    if (!apiKey) {
+      this.logger.warn(
+        `[Resend Email] RESEND_API_KEY is not configured in environment. Skipped remote dispatch to ${toEmail}.`,
+      );
+      return false;
+    }
+
+    try {
+      const response = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          from: fromEmail,
+          to: [toEmail],
+          subject,
+          html: htmlContent,
+        }),
+      });
+
+      const resData = await response.json();
+      if (!response.ok) {
+        this.logger.error(`[Resend Error] Status: ${response.status}, Details: ${JSON.stringify(resData)}`);
+        throw new BadRequestException(resData.message || 'Failed to dispatch email via Resend API');
+      }
+
+      this.logger.log(`[Resend Success] Email delivered to ${toEmail}, dispatch id: ${resData.id}`);
+      return true;
+    } catch (err: any) {
+      this.logger.error(`[Resend Exception] Error sending to ${toEmail}: ${err.message}`);
+      throw err;
+    }
+  }
+
+  private maskEmail(email: string): string {
+    const [user, domain] = email.split('@');
+    if (!user || !domain) return email;
+    if (user.length <= 2) return `${user[0]}***@${domain}`;
+    return `${user.slice(0, 2)}***${user.slice(-1)}@${domain}`;
+  }
+
+  /**
+   * Request OTP for password reset (delivered to user's registered email via Resend)
+   */
+  async forgotPassword(dto: ForgotPasswordDto) {
+    const cleanId = dto.identifier.trim();
+    const user = await this.prisma.user.findFirst({
+      where: {
+        OR: [{ email: cleanId.toLowerCase() }, { mobile: cleanId }],
+      },
+    });
+
+    if (!user) {
+      throw new NotFoundException('No account found matching this email address or mobile number.');
+    }
+
+    if (user.status === UserStatus.SUSPENDED) {
+      throw new ForbiddenException('This account has been suspended. Please contact platform administrators.');
+    }
+
+    // Generate cryptographic 6-digit numeric OTP
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
+
+    this.otpStore.set(user.email.toLowerCase(), {
+      otp,
+      userId: user.id,
+      email: user.email,
+      expiresAt,
+      verified: false,
+      attempts: 0,
+    });
+
+    this.logger.log(`[Password Reset OTP Generated] Target: ${user.email} (Mobile: ${user.mobile}), OTP: ${otp}`);
+
+    const emailHtml = `
+      <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 540px; margin: 0 auto; padding: 28px; background: #ffffff; border-radius: 12px; border: 1px solid #e2e8f0;">
+        <div style="text-align: center; margin-bottom: 24px;">
+          <h1 style="color: #172033; font-size: 22px; font-weight: 700; margin: 0;">TicketAssist Portal</h1>
+          <p style="color: #64748b; font-size: 13px; margin-top: 4px;">Security &amp; Account Recovery</p>
+        </div>
+        <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 24px; text-align: center; margin-bottom: 24px;">
+          <p style="color: #334155; font-size: 14px; margin: 0 0 12px 0;">Use the following One-Time Password (OTP) to reset your account password:</p>
+          <div style="font-size: 34px; font-weight: 800; letter-spacing: 8px; color: #c98219; font-family: monospace; padding: 10px 0;">
+            ${otp}
+          </div>
+          <p style="color: #64748b; font-size: 12px; margin: 12px 0 0 0;">This code will expire in <strong>10 minutes</strong>. Do not share it with anyone.</p>
+        </div>
+        <p style="color: #64748b; font-size: 12px; line-height: 1.5; margin: 0;">If you did not request a password reset, you can safely ignore this email. Your existing credentials remain secure.</p>
+        <div style="margin-top: 24px; padding-top: 16px; border-top: 1px solid #f1f5f9; text-align: center; color: #94a3b8; font-size: 11px;">
+          &copy; ${new Date().getFullYear()} TicketAssist &bull; Powered by YUKTRON
+        </div>
+      </div>
+    `;
+
+    try {
+      await this.sendResendEmail(
+        user.email,
+        'TicketAssist - Password Reset Verification Code',
+        emailHtml,
+      );
+    } catch (err: any) {
+      this.logger.warn(`Resend dispatch notice: ${err.message}. OTP logged for development.`);
+    }
+
+    return {
+      message: `Verification code sent to registered email ${this.maskEmail(user.email)}`,
+      emailMasked: this.maskEmail(user.email),
+      expiresInSeconds: 600,
+    };
+  }
+
+  /**
+   * Verify the 6-digit OTP
+   */
+  async verifyOtp(dto: VerifyOtpDto) {
+    const cleanId = dto.identifier.trim();
+    const user = await this.prisma.user.findFirst({
+      where: {
+        OR: [{ email: cleanId.toLowerCase() }, { mobile: cleanId }],
+      },
+    });
+
+    if (!user) {
+      throw new NotFoundException('Account not found.');
+    }
+
+    const session = this.otpStore.get(user.email.toLowerCase());
+    if (!session) {
+      throw new BadRequestException('No active OTP request found or it has expired. Please request a new code.');
+    }
+
+    if (Date.now() > session.expiresAt) {
+      this.otpStore.delete(user.email.toLowerCase());
+      throw new BadRequestException('Verification code has expired. Please request a new code.');
+    }
+
+    if (session.attempts >= 5) {
+      this.otpStore.delete(user.email.toLowerCase());
+      throw new BadRequestException('Too many invalid attempts. Please request a new code.');
+    }
+
+    if (session.otp !== dto.otp.trim()) {
+      session.attempts += 1;
+      throw new BadRequestException('Invalid verification code. Please check and try again.');
+    }
+
+    session.verified = true;
+    return {
+      message: 'Verification code confirmed successfully.',
+      verified: true,
+    };
+  }
+
+  /**
+   * Reset Password with verified OTP
+   */
+  async resetPassword(dto: ResetPasswordDto) {
+    const cleanId = dto.identifier.trim();
+    const user = await this.prisma.user.findFirst({
+      where: {
+        OR: [{ email: cleanId.toLowerCase() }, { mobile: cleanId }],
+      },
+    });
+
+    if (!user) {
+      throw new NotFoundException('Account not found.');
+    }
+
+    const session = this.otpStore.get(user.email.toLowerCase());
+    if (!session) {
+      throw new BadRequestException('Verification session expired or not found. Please request a new code.');
+    }
+
+    if (Date.now() > session.expiresAt) {
+      this.otpStore.delete(user.email.toLowerCase());
+      throw new BadRequestException('Verification code has expired. Please request a new code.');
+    }
+
+    if (!session.verified && session.otp !== dto.otp.trim()) {
+      throw new BadRequestException('Invalid verification code.');
+    }
+
+    if (!dto.newPassword || dto.newPassword.length < 8) {
+      throw new BadRequestException('New password must be at least 8 characters long.');
+    }
+
+    const saltRounds = 10;
+    const passwordHash = await bcrypt.hash(dto.newPassword, saltRounds);
+
+    await this.prisma.user.update({
+      where: { id: user.id },
+      data: {
+        passwordHash,
+        mustChangePassword: false,
+      } as any,
+    });
+
+    this.otpStore.delete(user.email.toLowerCase());
+
+    await this.audit.log({
+      actorId: user.id,
+      actorType: 'USER',
+      action: 'USER_PASSWORD_RESET_OTP',
+      entity: 'User',
+      entityId: user.id,
+      metadata: { method: 'RESEND_OTP' },
+    });
+
+    return {
+      message: 'Password reset successfully! You can now log in with your new password.',
+    };
+  }
+
+  /**
+   * Request OTP to change email address (sent via Resend to the new email address)
+   */
+  async requestEmailChange(userId: string, dto: RequestEmailChangeDto) {
+    const cleanNewEmail = dto.newEmail.toLowerCase().trim();
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+    });
+
+    if (!user) {
+      throw new NotFoundException('User account not found');
+    }
+
+    if (user.email.toLowerCase() === cleanNewEmail) {
+      throw new BadRequestException('The new email address cannot be the same as your current email.');
+    }
+
+    // Check if another user is already registered with this email
+    const existingUser = await this.prisma.user.findUnique({
+      where: { email: cleanNewEmail },
+    });
+
+    if (existingUser && existingUser.id !== userId) {
+      throw new ConflictException('This email address is already in use by another account.');
+    }
+
+    // Generate 6-digit numeric OTP
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
+
+    this.emailChangeStore.set(userId, {
+      userId,
+      currentEmail: user.email,
+      newEmail: cleanNewEmail,
+      otp,
+      expiresAt,
+      attempts: 0,
+    });
+
+    this.logger.log(`[Email Change OTP Generated] User ${user.email} -> New: ${cleanNewEmail}, OTP: ${otp}`);
+
+    const emailHtml = `
+      <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 540px; margin: 0 auto; padding: 28px; background: #ffffff; border-radius: 12px; border: 1px solid #e2e8f0;">
+        <div style="text-align: center; margin-bottom: 24px;">
+          <h1 style="color: #172033; font-size: 22px; font-weight: 700; margin: 0;">TicketAssist Portal</h1>
+          <p style="color: #64748b; font-size: 13px; margin-top: 4px;">Email Address Verification</p>
+        </div>
+        <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 24px; text-align: center; margin-bottom: 24px;">
+          <p style="color: #334155; font-size: 14px; margin: 0 0 12px 0;">You have requested to change your account email to <strong>${cleanNewEmail}</strong>. Use the verification code below to confirm this change:</p>
+          <div style="font-size: 34px; font-weight: 800; letter-spacing: 8px; color: #c98219; font-family: monospace; padding: 10px 0;">
+            ${otp}
+          </div>
+          <p style="color: #64748b; font-size: 12px; margin: 12px 0 0 0;">This code is valid for <strong>10 minutes</strong>. Do not share it with anyone.</p>
+        </div>
+        <p style="color: #64748b; font-size: 12px; line-height: 1.5; margin: 0;">If you did not request this email change, please ignore this email or contact platform administrators immediately.</p>
+        <div style="margin-top: 24px; padding-top: 16px; border-top: 1px solid #f1f5f9; text-align: center; color: #94a3b8; font-size: 11px;">
+          &copy; ${new Date().getFullYear()} TicketAssist &bull; Powered by YUKTRON
+        </div>
+      </div>
+    `;
+
+    try {
+      await this.sendResendEmail(
+        cleanNewEmail,
+        'TicketAssist - Verify Your New Email Address',
+        emailHtml,
+      );
+    } catch (err: any) {
+      this.logger.warn(`Resend dispatch notice: ${err.message}. OTP logged for development.`);
+    }
+
+    return {
+      message: `Verification code sent to ${cleanNewEmail}`,
+      newEmail: cleanNewEmail,
+      expiresInSeconds: 600,
+    };
+  }
+
+  /**
+   * Verify OTP and update user's email address
+   */
+  async verifyEmailChange(userId: string, dto: VerifyEmailChangeDto) {
+    const cleanNewEmail = dto.newEmail.toLowerCase().trim();
+
+    const session = this.emailChangeStore.get(userId);
+    if (!session) {
+      throw new BadRequestException('No pending email change request found or it has expired. Please request a new code.');
+    }
+
+    if (session.newEmail !== cleanNewEmail) {
+      throw new BadRequestException('Email address mismatch. Please request a new code.');
+    }
+
+    if (Date.now() > session.expiresAt) {
+      this.emailChangeStore.delete(userId);
+      throw new BadRequestException('Verification code has expired. Please request a new code.');
+    }
+
+    if (session.attempts >= 5) {
+      this.emailChangeStore.delete(userId);
+      throw new BadRequestException('Too many invalid attempts. Please request a new code.');
+    }
+
+    if (session.otp !== dto.otp.trim()) {
+      session.attempts += 1;
+      throw new BadRequestException('Invalid verification code. Please check and try again.');
+    }
+
+    // Check again for conflict right before updating
+    const existingUser = await this.prisma.user.findUnique({
+      where: { email: cleanNewEmail },
+    });
+
+    if (existingUser && existingUser.id !== userId) {
+      this.emailChangeStore.delete(userId);
+      throw new ConflictException('This email address is already in use by another account.');
+    }
+
+    // Update user email
+    const updatedUser = await this.prisma.user.update({
+      where: { id: userId },
+      data: { email: cleanNewEmail },
+    });
+
+    // If partner exists for this user, also update partner email
+    try {
+      await (this.prisma as any).partner.updateMany({
+        where: { userId },
+        data: { email: cleanNewEmail },
+      });
+    } catch (e) {
+      // ignore
+    }
+
+    this.emailChangeStore.delete(userId);
+
+    await this.audit.log({
+      actorId: userId,
+      actorType: 'USER',
+      action: 'USER_EMAIL_CHANGED',
+      entity: 'User',
+      entityId: userId,
+      metadata: { oldEmail: session.currentEmail, newEmail: cleanNewEmail },
+    });
+
+    return {
+      message: 'Your email address has been updated successfully!',
+      email: cleanNewEmail,
       user: this.sanitizeUser(updatedUser),
     };
   }

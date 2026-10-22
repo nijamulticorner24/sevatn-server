@@ -11,6 +11,7 @@ import {
 import { Server, Socket } from 'socket.io';
 import { Injectable, Logger } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
+import { getValidatedJwtSecret } from '../common/security/jwt-config';
 
 @Injectable()
 @WebSocketGateway({
@@ -49,7 +50,7 @@ export class EventsGateway
       if (token) {
         try {
           const payload = this.jwtService.verify(token, {
-            secret: process.env.JWT_SECRET || 'ticketassist-dev-super-secret-jwt-key-32chars',
+            secret: getValidatedJwtSecret(),
           });
 
           client.data.user = payload;

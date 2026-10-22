@@ -11,11 +11,15 @@ import {
 export class LoginDto {
   @IsString()
   @IsNotEmpty()
-  identifier: string; // Email or Mobile
+  identifier: string; // Email, Mobile or Centre Code
 
   @IsString()
   @MinLength(6)
   password: string;
+
+  @IsOptional()
+  @IsString()
+  centreCode?: string;
 }
 
 export class ChangePasswordDto {
@@ -26,6 +30,55 @@ export class ChangePasswordDto {
   @IsString()
   @MinLength(8, { message: 'New password must be at least 8 characters long' })
   newPassword: string;
+}
+
+export class ForgotPasswordDto {
+  @IsString()
+  @IsNotEmpty()
+  identifier: string; // Email or Mobile
+}
+
+export class VerifyOtpDto {
+  @IsString()
+  @IsNotEmpty()
+  identifier: string;
+
+  @IsString()
+  @IsNotEmpty()
+  @MinLength(6)
+  otp: string;
+}
+
+export class ResetPasswordDto {
+  @IsString()
+  @IsNotEmpty()
+  identifier: string;
+
+  @IsString()
+  @IsNotEmpty()
+  @MinLength(6)
+  otp: string;
+
+  @IsString()
+  @MinLength(8, { message: 'New password must be at least 8 characters long' })
+  newPassword: string;
+}
+
+export class RequestEmailChangeDto {
+  @IsEmail({}, { message: 'Please enter a valid new email address' })
+  @IsNotEmpty()
+  newEmail: string;
+}
+
+export class VerifyEmailChangeDto {
+  @IsEmail({}, { message: 'Please enter a valid new email address' })
+  @IsNotEmpty()
+  newEmail: string;
+
+  @IsString()
+  @IsNotEmpty()
+  @MinLength(6)
+  otp: string;
 }
 
 export class RegisterByInvitationDto {

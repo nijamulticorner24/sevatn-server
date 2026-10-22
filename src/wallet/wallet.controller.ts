@@ -8,13 +8,13 @@ import {
   UseInterceptors,
 } from '@nestjs/common';
 import { WalletService } from './wallet.service';
-import { JwtAuthGuard } from '../common/guards';
-import { CurrentUser } from '../common/decorators';
+import { JwtAuthGuard, RateLimiterGuard } from '../common/guards';
+import { CurrentUser, Throttle } from '../common/decorators';
 import { TopupDto, RequestRefundDto } from './dto/wallet.dto';
 import { IdempotencyInterceptor } from '../common/interceptors/idempotency.interceptor';
 
 @Controller('wallet')
-@UseGuards(JwtAuthGuard)
+@UseGuards(JwtAuthGuard, RateLimiterGuard)
 @UseInterceptors(IdempotencyInterceptor)
 export class WalletController {
   constructor(private readonly walletService: WalletService) {}
@@ -25,6 +25,7 @@ export class WalletController {
   }
 
   @Post('topup')
+  @Throttle(10, 60)
   async topup(@CurrentUser() user: any, @Body() dto: TopupDto) {
     return this.walletService.topup(user.id, dto);
   }
@@ -39,6 +40,7 @@ export class WalletController {
   }
 
   @Post('refund')
+  @Throttle(5, 60)
   async requestRefund(@CurrentUser() user: any, @Body() dto: RequestRefundDto) {
     return this.walletService.requestRefund(user.id, dto);
   }

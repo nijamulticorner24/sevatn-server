@@ -13,9 +13,11 @@ import { CredentialCrypto } from '../common/security/credential-crypto';
 import { SmartMatcherService } from '../availability/smart-matcher.service';
 import { AccountLockService } from '../availability/account-lock.service';
 import { CreateBookingDto, ResolveHumanActionDto } from './dto/booking.dto';
-import { BookingStatus, JobType, AccountStatus, Role } from '@prisma/client';
+import { BookingStatus, JobType, AccountStatus, Role, Prisma } from '@prisma/client';
 
 import { EventsGateway } from '../events/events.gateway';
+import { SmartAllocatorService } from '../workers/smart-allocator.service';
+import { Optional } from '@nestjs/common';
 
 @Injectable()
 export class BookingsService {
@@ -29,6 +31,7 @@ export class BookingsService {
     private smartMatcher: SmartMatcherService,
     private accountLockService: AccountLockService,
     private eventsGateway: EventsGateway,
+    @Optional() private smartAllocator?: SmartAllocatorService,
   ) {}
 
   /**
@@ -58,9 +61,36 @@ export class BookingsService {
     });
     const feeAmount = Number(config?.serviceFee ?? 20);
 
+    // Verify user role
+    const callingUser = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, role: true },
+    });
+    const isSuperAdmin = callingUser?.role === Role.SUPER_ADMIN;
+
     const result = await this.prisma.$transaction(async (tx) => {
-      // 1. Verify and reserve funds from wallet
-      const wallet = await tx.wallet.findUnique({ where: { userId } });
+      // 1. Verify and reserve funds from wallet (Super Admin auto-funded/exempted)
+      let wallet = await tx.wallet.findUnique({ where: { userId } });
+
+      if (isSuperAdmin) {
+        if (!wallet) {
+          wallet = await tx.wallet.create({
+            data: {
+              userId,
+              availableBalance: new Prisma.Decimal(999999),
+              reservedBalance: new Prisma.Decimal(0),
+            },
+          });
+        } else if (Number(wallet.availableBalance) < feeAmount) {
+          wallet = await tx.wallet.update({
+            where: { userId },
+            data: {
+              availableBalance: { increment: 100000 },
+            },
+          });
+        }
+      }
+
       if (!wallet || Number(wallet.availableBalance) < feeAmount) {
         throw new BadRequestException(
           `Insufficient wallet balance. Required: ₹${feeAmount}, Available: ₹${wallet?.availableBalance || 0}`,
@@ -169,7 +199,7 @@ export class BookingsService {
         },
       });
 
-      this.logger.log(`[BOOKING] New request: #${booking.bookingCode}`);
+      this.logger.log(`[BOOKING] New request: #${booking.bookingCode}${isSuperAdmin ? ' (by Super Admin)' : ''}`);
 
       return booking;
     });
@@ -201,6 +231,12 @@ export class BookingsService {
       timestamp: new Date().toISOString(),
     });
 
+    if (this.smartAllocator) {
+      this.smartAllocator.runAllocationSweep().catch((err) => {
+        this.logger.warn(`Proactive allocation error: ${err.message}`);
+      });
+    }
+
     return result;
   }
 
@@ -215,7 +251,15 @@ export class BookingsService {
     const where: any = {};
     if (user.role === Role.CENTRE) {
       where.userId = user.id;
+    } else if (user.role === Role.PARTNER) {
+      const partnerId = user.partnerProfile?.id || user.partnerId;
+      if (partnerId) {
+        where.user = { partnerId };
+      } else {
+        where.userId = user.id;
+      }
     }
+
     if (query.status) {
       where.status = query.status;
     }
@@ -236,7 +280,7 @@ export class BookingsService {
           pilgrims: true,
           account: { select: { id: true, label: true, username: true, status: true } as any },
           assignedMachine: { select: { machineCode: true, machineName: true, status: true } },
-          user: { select: { name: true, email: true, mobile: true, centre: { select: { centreName: true, district: true } } } },
+          user: { select: { name: true, email: true, mobile: true, partnerId: true, centre: { select: { centreName: true, district: true } } } },
         },
       }),
       this.prisma.bookingRequest.count({ where }),
@@ -270,6 +314,13 @@ export class BookingsService {
       throw new ForbiddenException('Access denied to other centres booking data');
     }
 
+    if (user.role === Role.PARTNER) {
+      const partnerId = user.partnerProfile?.id || user.partnerId;
+      if (!partnerId || booking.user?.partnerId !== partnerId) {
+        throw new ForbiddenException('Access denied to bookings outside your authorized partner franchise');
+      }
+    }
+
     return booking;
   }
 
@@ -279,6 +330,7 @@ export class BookingsService {
   async cancelBooking(id: string, user: any) {
     const booking = await this.prisma.bookingRequest.findUnique({
       where: { id },
+      include: { user: true },
     });
 
     if (!booking) {
@@ -287,6 +339,13 @@ export class BookingsService {
 
     if (user.role === Role.CENTRE && booking.userId !== user.id) {
       throw new ForbiddenException('Access denied');
+    }
+
+    if (user.role === Role.PARTNER) {
+      const partnerId = user.partnerProfile?.id || user.partnerId;
+      if (!partnerId || booking.user?.partnerId !== partnerId) {
+        throw new ForbiddenException('Access denied to bookings outside your authorized partner franchise');
+      }
     }
 
     if (([BookingStatus.SUCCESS, BookingStatus.CANCELLED, BookingStatus.FAILED] as BookingStatus[]).includes(booking.status)) {
@@ -342,15 +401,28 @@ export class BookingsService {
   async resolveHumanAction(id: string, dto: ResolveHumanActionDto, user: any) {
     const booking = await this.prisma.bookingRequest.findUnique({
       where: { id },
+      include: { user: true },
     });
 
     if (!booking) {
       throw new NotFoundException('Booking not found');
     }
 
+    if (user.role === Role.CENTRE && booking.userId !== user.id) {
+      throw new ForbiddenException('Access denied to other centres booking data');
+    }
+
+    if (user.role === Role.PARTNER) {
+      const partnerId = user.partnerProfile?.id || user.partnerId;
+      if (!partnerId || booking.user?.partnerId !== partnerId) {
+        throw new ForbiddenException('Access denied to bookings outside your authorized partner franchise');
+      }
+    }
+
     if (dto.action === 'SUCCESS_CONFIRMED') {
-      if (!dto.officialReference) {
-        throw new BadRequestException('Official reference is required when manually confirming');
+      const ref = dto.officialReference?.trim();
+      if (!ref || ref.length < 5 || ref.startsWith('SAB-2026-') || ref === 'SAB-2026-VERIFIED') {
+        throw new BadRequestException('Authoritative official booking reference is required. Synthetic or mock references are rejected.');
       }
 
       const reserveTx = await this.prisma.walletTransaction.findFirst({

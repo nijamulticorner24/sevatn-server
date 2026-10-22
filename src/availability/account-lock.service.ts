@@ -70,6 +70,21 @@ export class AccountLockService {
   }
 
   /**
+   * Releases all locks held by a specific worker machine
+   */
+  async releaseLockByWorker(workerId: string) {
+    if (!workerId) return;
+    try {
+      const res = await this.prisma.accountLock.deleteMany({ where: { workerId } });
+      if (res.count > 0) {
+        this.logger.log(`[ACCOUNT_LOCK] Released ${res.count} lock(s) held by worker ${workerId}`);
+      }
+    } catch (err: any) {
+      this.logger.warn(`[ACCOUNT_LOCK] Error releasing locks for worker ${workerId}: ${err.message}`);
+    }
+  }
+
+  /**
    * Checks if an account currently has an active lock
    */
   async isLocked(accountId: string): Promise<boolean> {

@@ -375,6 +375,121 @@ describe('Location Validation & ServiceAccessGuard Suite', () => {
       await expect(guard.canActivate(context)).rejects.toThrow(BadRequestException);
     });
 
+    it('throws 403 Forbidden when centre operator omits mandatory GPS coordinates', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue({
+        id: 'u-1',
+        email: 'operator@test.com',
+        status: UserStatus.ACTIVE,
+        role: Role.CENTRE,
+        registeredLocation: {
+          id: 'loc-1',
+          latitude: 13.0067,
+          longitude: 80.2024,
+          status: 'ACTIVE',
+        },
+      });
+
+      // Headers omitted completely
+      const context = createMockContext({ id: 'u-1', role: Role.CENTRE }, {});
+
+      await expect(guard.canActivate(context)).rejects.toThrow(
+        /Location validation failed: Current GPS latitude and longitude .* are mandatory/
+      );
+      expect(mockAudit.log).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'LOCATION_MISSING_DENIED' })
+      );
+    });
+
+    it('throws BadRequestException when coordinates are malformed/non-numeric strings', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue({
+        id: 'u-1',
+        email: 'operator@test.com',
+        status: UserStatus.ACTIVE,
+        role: Role.CENTRE,
+        registeredLocation: {
+          id: 'loc-1',
+          latitude: 13.0067,
+          longitude: 80.2024,
+          status: 'ACTIVE',
+        },
+      });
+
+      const context = createMockContext(
+        { id: 'u-1', role: Role.CENTRE },
+        { 'x-user-latitude': 'not-a-number', 'x-user-longitude': '80.2024' }
+      );
+
+      await expect(guard.canActivate(context)).rejects.toThrow(
+        /Malformed coordinate value 'not-a-number'/
+      );
+    });
+
+    it('throws 403 Forbidden when user account is SUSPENDED', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue({
+        id: 'u-1',
+        email: 'suspended@test.com',
+        status: UserStatus.SUSPENDED,
+        role: Role.CENTRE,
+        registeredLocation: { id: 'loc-1', latitude: 13.0067, longitude: 80.2024, status: 'ACTIVE' },
+      });
+
+      const context = createMockContext({ id: 'u-1', role: Role.CENTRE }, {
+        'x-user-latitude': '13.0067',
+        'x-user-longitude': '80.2024',
+      });
+
+      await expect(guard.canActivate(context)).rejects.toThrow(
+        /Your SevaTN account is suspended/
+      );
+    });
+
+    it('throws 403 Forbidden when user account is PAYMENT_PENDING', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue({
+        id: 'u-1',
+        email: 'pending@test.com',
+        status: UserStatus.PAYMENT_PENDING,
+        role: Role.CENTRE,
+        registeredLocation: { id: 'loc-1', latitude: 13.0067, longitude: 80.2024, status: 'ACTIVE' },
+      });
+
+      const context = createMockContext({ id: 'u-1', role: Role.CENTRE }, {
+        'x-user-latitude': '13.0067',
+        'x-user-longitude': '80.2024',
+      });
+
+      await expect(guard.canActivate(context)).rejects.toThrow(
+        /Account activation payment is pending/
+      );
+    });
+
+    it('throws 403 Forbidden when user account license has EXPIRED', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue({
+        id: 'u-1',
+        email: 'expired@test.com',
+        status: UserStatus.EXPIRED,
+        role: Role.CENTRE,
+        registeredLocation: { id: 'loc-1', latitude: 13.0067, longitude: 80.2024, status: 'ACTIVE' },
+      });
+
+      const context = createMockContext({ id: 'u-1', role: Role.CENTRE }, {
+        'x-user-latitude': '13.0067',
+        'x-user-longitude': '80.2024',
+      });
+
+      await expect(guard.canActivate(context)).rejects.toThrow(
+        /Your operational license has expired/
+      );
+    });
+
+    it('bypasses location validation for WORKER and PARTNER roles', async () => {
+      const workerContext = createMockContext({ id: 'worker-1', role: Role.WORKER });
+      expect(await guard.canActivate(workerContext)).toBe(true);
+
+      const partnerContext = createMockContext({ id: 'partner-1', role: Role.PARTNER });
+      expect(await guard.canActivate(partnerContext)).toBe(true);
+      expect(mockPrisma.user.findUnique).not.toHaveBeenCalled();
+    });
+
     it('bypasses location validation for SUPER_ADMIN role', async () => {
       const context = createMockContext({ id: 'admin-1', role: Role.SUPER_ADMIN });
       const result = await guard.canActivate(context);
