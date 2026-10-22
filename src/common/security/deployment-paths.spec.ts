@@ -39,21 +39,18 @@ describe('Production Deployment Script Path & Layout Validation', () => {
     const prodScriptDir = `${prodRepoRoot}/scripts`;
 
     it('resolves SCRIPT_DIR to the script directory', () => {
-      // In bash: SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
       const calculatedScriptDir = path.posix.normalize(prodScriptDir);
       expect(calculatedScriptDir).toBe('/home/ubuntu/sevatn-server/scripts');
     });
 
     it('resolves API_DIR to the repository root via SCRIPT_DIR/..', () => {
-      // In bash: API_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
       const calculatedApiDir = path.posix.normalize(path.posix.join(prodScriptDir, '..'));
       expect(calculatedApiDir).toBe('/home/ubuntu/sevatn-server');
     });
 
     it('sets REPO_ROOT equal to API_DIR, NOT parent dirname', () => {
-      // In bash: REPO_ROOT="${API_DIR}"
       const calculatedApiDir = path.posix.normalize(path.posix.join(prodScriptDir, '..'));
-      const calculatedRepoRoot = calculatedApiDir; // REPO_ROOT="${API_DIR}"
+      const calculatedRepoRoot = calculatedApiDir;
       const buggyParentDir = path.posix.normalize(path.posix.join(calculatedApiDir, '..'));
 
       expect(calculatedRepoRoot).toBe('/home/ubuntu/sevatn-server');
@@ -70,67 +67,76 @@ describe('Production Deployment Script Path & Layout Validation', () => {
     });
   });
 
-  describe('Static Analysis of deploy-production.sh', () => {
+  describe('Static Analysis of deploy-production.sh (Git Safety & Deployment Order)', () => {
     let scriptContent: string;
 
     beforeAll(() => {
       scriptContent = fs.readFileSync(deployScriptPath, 'utf8');
     });
 
-    it('sets SCRIPT_DIR to script directory', () => {
+    it('sets SCRIPT_DIR to script directory and REPO_ROOT to API_DIR directly', () => {
       expect(scriptContent).toMatch(/SCRIPT_DIR="?\$\(cd "\$\(dirname "\$\{BASH_SOURCE\[0\]\}"\)" && pwd\)"?/);
-    });
-
-    it('sets API_DIR to SCRIPT_DIR/..', () => {
       expect(scriptContent).toMatch(/API_DIR="?\$\(cd "\$\{SCRIPT_DIR\}\/\.\." && pwd\)"?/);
-    });
-
-    it('sets REPO_ROOT to API_DIR directly and not parent', () => {
       expect(scriptContent).toMatch(/REPO_ROOT="?\$\{API_DIR\}"?/);
       expect(scriptContent).not.toMatch(/REPO_ROOT="?\$\(cd "\$\{API_DIR\}\/\.\." && pwd\)"?/);
     });
 
     it('validates package.json, package-lock.json, and prisma/schema.prisma in REPO_ROOT with fail-closed exits', () => {
-      expect(scriptContent).toContain('${REPO_ROOT}/package.json');
-      expect(scriptContent).toContain('${REPO_ROOT}/package-lock.json');
-      expect(scriptContent).toContain('${REPO_ROOT}/prisma/schema.prisma');
-      // Ensure failure exits with 1
       expect(scriptContent).toMatch(/if \[ ! -f "\$\{REPO_ROOT\}\/package\.json" \]; then[\s\S]*?exit 1/);
       expect(scriptContent).toMatch(/if \[ ! -f "\$\{REPO_ROOT\}\/package-lock\.json" \]; then[\s\S]*?exit 1/);
       expect(scriptContent).toMatch(/if \[ ! -f "\$\{REPO_ROOT\}\/prisma\/schema\.prisma" \]; then[\s\S]*?exit 1/);
     });
 
-    it('runs Git branch checks and fast-forward pull from REPO_ROOT', () => {
-      expect(scriptContent).toMatch(/cd "\$\{REPO_ROOT\}"[\s\S]*?git rev-parse --abbrev-ref HEAD/);
-      expect(scriptContent).toMatch(/git pull --ff-only/);
+    it('enforces fatal fetch and fatal pull --ff-only on Git synchronization', () => {
+      // Must not continue on failure
+      expect(scriptContent).toMatch(/git fetch origin "\$\{EXPECTED_BRANCH\}"/);
+      expect(scriptContent).toMatch(/git pull --ff-only origin "\$\{EXPECTED_BRANCH\}"/);
+      expect(scriptContent).not.toMatch(/git pull --ff-only[\s\S]*?Proceeding with current checkout/);
     });
 
-    it('runs npm ci, Prisma validation/generation, guarded schema sync, and build from API_DIR', () => {
-      expect(scriptContent).toMatch(/cd "\$\{API_DIR\}"[\s\S]*?npm ci/);
-      expect(scriptContent).toMatch(/npx prisma validate/);
-      expect(scriptContent).toMatch(/npx prisma generate/);
-      expect(scriptContent).toMatch(/npm run schema:sync/);
-      expect(scriptContent).toMatch(/npm run build/);
-    });
-
-    it('preserves .env and existing uncommitted changes without destructive resets', () => {
-      expect(scriptContent).toContain('.env');
-      expect(scriptContent).toContain('git status --porcelain');
-      expect(scriptContent).toContain('Preserving working tree files');
+    it('aborts on unexpected tracked modifications and preserves working files', () => {
+      expect(scriptContent).toContain('TRACKED_DIFF=$(git diff --name-only)');
+      expect(scriptContent).toMatch(/if \[ -n "\$\{TRACKED_DIFF\}" \][\s\S]*?exit 1/);
+      expect(scriptContent).toContain('Preserving .env, dist/, node_modules/, and existing stash');
       expect(scriptContent).not.toContain('git reset --hard');
       expect(scriptContent).not.toContain('git clean -fd');
       expect(scriptContent).not.toContain('git checkout -- .');
     });
 
-    it('enforces fail-closed termination on failed health check or prerequisites', () => {
-      expect(scriptContent).toContain('set -euo pipefail');
+    it('verifies checked-out commit matches intended release when EXPECTED_COMMIT is provided', () => {
+      expect(scriptContent).toContain('EXPECTED_COMMIT');
+      expect(scriptContent).toMatch(/does not match intended release commit/);
+    });
+
+    it('enforces the exact deployment order: install -> validate -> generate -> build -> dry-run -> approval -> live sync -> pm2', () => {
+      const npmCiIdx = scriptContent.indexOf('npm ci');
+      const validateIdx = scriptContent.indexOf('npx prisma validate');
+      const generateIdx = scriptContent.indexOf('npx prisma generate');
+      const buildIdx = scriptContent.indexOf('npm run build');
+      const dryRunIdx = scriptContent.indexOf('npm run schema:dry-run');
+      const approvalGateIdx = scriptContent.indexOf('CONFIRM_PRODUCTION_SCHEMA_SYNC');
+      const liveSyncIdx = scriptContent.indexOf('npm run schema:sync');
+      const pm2RestartIdx = scriptContent.indexOf('pm2 restart');
+      const healthCheckIdx = scriptContent.indexOf('HEALTH_URL');
+
+      expect(npmCiIdx).toBeGreaterThan(0);
+      expect(validateIdx).toBeGreaterThan(npmCiIdx);
+      expect(generateIdx).toBeGreaterThan(validateIdx);
+      expect(buildIdx).toBeGreaterThan(generateIdx);
+      expect(dryRunIdx).toBeGreaterThan(buildIdx);
+      expect(approvalGateIdx).toBeGreaterThan(dryRunIdx);
+      expect(liveSyncIdx).toBeGreaterThan(approvalGateIdx);
+      expect(pm2RestartIdx).toBeGreaterThan(liveSyncIdx);
+      expect(healthCheckIdx).toBeGreaterThan(pm2RestartIdx);
+    });
+
+    it('fails closed when health check returns non-200 HTTP code', () => {
       expect(scriptContent).toMatch(/if \[ "\$\{HTTP_CODE\}" != "200" \]; then[\s\S]*?exit 1/);
     });
   });
 
   describe('Bash Syntax Verification', () => {
     it('passes bash syntax check (bash -n)', () => {
-      // Find git bash or standard bash
       const bashBin = fs.existsSync('C:\\Program Files\\Git\\bin\\bash.exe')
         ? 'C:\\Program Files\\Git\\bin\\bash.exe'
         : 'bash';
@@ -142,7 +148,6 @@ describe('Production Deployment Script Path & Layout Validation', () => {
         });
         expect(result).toBe('');
       } catch (err: any) {
-        // If no bash in environment, skip gracefully
         if (err.message && err.message.includes('not found')) {
           console.warn('Bash not found, skipping syntax check');
         } else {

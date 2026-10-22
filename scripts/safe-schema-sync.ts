@@ -86,18 +86,26 @@ async function runSafeSchemaSync() {
     process.exit(0);
   }
 
-  // 4. Classify Proposed Schema Changes
+  // 4. Classify Proposed Schema Changes (Fail-Closed)
   console.log('\n🔬 Classifying proposed schema changes...');
   const classification = classifySqlDiff(sqlDiff);
 
   if (!classification.isAdditiveOnly) {
-    console.error('\n❌ DESTRUCTIVE SCHEMA CHANGES DETECTED:');
-    console.error('   The proposed schema synchronization contains potentially destructive operations:');
-    classification.destructiveOperations.forEach((op, idx) => {
-      console.error(`   ${idx + 1}. ${op}`);
-    });
-    console.error('\n🛑 DEPLOYMENT ABORTED: Destructive operations (DROP TABLE/COLUMN, TYPE ALTERATION, etc.)');
-    console.error('   are strictly forbidden in production. Manual database administrator review required.');
+    console.error('\n❌ DISALLOWED SCHEMA CHANGES DETECTED:');
+    if (classification.destructiveOperations.length > 0) {
+      console.error('   Destructive or unsafe operations detected:');
+      classification.destructiveOperations.forEach((op, idx) => {
+        console.error(`   [Destructive ${idx + 1}] ${op}`);
+      });
+    }
+    if (classification.unapprovedOperations.length > 0) {
+      console.error('   Unapproved or unclassified operations detected:');
+      classification.unapprovedOperations.forEach((op, idx) => {
+        console.error(`   [Unapproved ${idx + 1}] ${op}`);
+      });
+    }
+    console.error('\n🛑 DEPLOYMENT ABORTED: Strict fail-closed policy allows only reviewed additive DDL operations.');
+    console.error('   Destructive actions, unsafe constraints, and unapproved statements are forbidden.');
     console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     process.exit(1);
   }
@@ -120,6 +128,14 @@ async function runSafeSchemaSync() {
     console.log(`   ➕ Foreign Keys to Add (${classification.summary.foreignKeysAdded.length}):`);
     classification.summary.foreignKeysAdded.forEach((f) => console.log(`      - ${f}`));
   }
+  if (classification.summary.enumsCreated.length > 0) {
+    console.log(`   ➕ Enum Types to Create (${classification.summary.enumsCreated.length}):`);
+    classification.summary.enumsCreated.forEach((e) => console.log(`      - ${e}`));
+  }
+  if (classification.summary.enumValuesAdded.length > 0) {
+    console.log(`   ➕ Enum Values to Add (${classification.summary.enumValuesAdded.length}):`);
+    classification.summary.enumValuesAdded.forEach((ev) => console.log(`      - ${ev}`));
+  }
 
   // 6. Dry-Run Completion
   if (isDryRun) {
@@ -132,7 +148,23 @@ async function runSafeSchemaSync() {
     process.exit(0);
   }
 
-  // 7. Live Synchronization (Only reached if additive-only check passed)
+  // 7. Production Approval Gate (Fail-Closed)
+  if (process.env.NODE_ENV === 'production') {
+    const isApproved =
+      process.env.CONFIRM_PRODUCTION_SCHEMA_SYNC === 'yes' ||
+      args.includes('--approve-schema-sync') ||
+      args.includes('--confirm');
+    if (!isApproved) {
+      console.error('\n🛑 PRODUCTION SCHEMA MUTATION NOT APPROVED:');
+      console.error('   Live database changes in production require explicit confirmation.');
+      console.error('   Set CONFIRM_PRODUCTION_SCHEMA_SYNC=yes or pass --approve-schema-sync.');
+      console.error('   Halting before executing prisma db push. Database was NOT modified.');
+      console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      process.exit(1);
+    }
+  }
+
+  // 8. Live Synchronization (Only reached if additive-only check AND production approval passed)
   console.log('\n⚙️  Applying validated additive schema updates (prisma db push)...');
   try {
     const pushOutput = execSync('npx prisma db push --skip-generate', {

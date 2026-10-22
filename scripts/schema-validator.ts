@@ -12,12 +12,18 @@ export interface DatabaseValidationResult {
 export interface SqlClassificationResult {
   isAdditiveOnly: boolean;
   destructiveOperations: string[];
+  unapprovedOperations: string[];
   additiveOperations: string[];
+  totalStatements: number;
   summary: {
     tablesCreated: string[];
     columnsAdded: string[];
     indexesCreated: string[];
     foreignKeysAdded: string[];
+    primaryKeysAdded: string[];
+    enumsCreated: string[];
+    enumValuesAdded: string[];
+    sequencesCreated: string[];
     otherOperations: string[];
   };
 }
@@ -186,42 +192,114 @@ const DESTRUCTIVE_PATTERNS: Array<{ regex: RegExp; description: string }> = [
   { regex: /\bDROP\s+INDEX\b/i, description: 'Drop Index' },
   { regex: /\bDROP\s+SEQUENCE\b/i, description: 'Drop Sequence' },
   { regex: /\bDROP\s+TYPE\b/i, description: 'Drop Enum / Custom Type' },
+  { regex: /\bDROP\s+CONSTRAINT\b/i, description: 'Drop Constraint' },
+  { regex: /\bDROP\s+SCHEMA\b/i, description: 'Drop Schema' },
+  { regex: /\bDROP\s+DATABASE\b/i, description: 'Drop Database' },
   { regex: /\bTRUNCATE\b/i, description: 'Truncate Table' },
-  { regex: /\bALTER\s+COLUMN\s+[^;]+\s+TYPE\b/i, description: 'Alter Column Type' },
+  { regex: /\bALTER\s+(?:TABLE\s+[^;]+\s+)?ALTER\s+COLUMN\s+[^;]+\s+TYPE\b/i, description: 'Alter Column Type' },
+  { regex: /\bALTER\s+(?:TABLE\s+[^;]+\s+)?ALTER\s+COLUMN\s+[^;]+\s+DROP\s+DEFAULT\b/i, description: 'Drop Column Default' },
   { regex: /\bSET\s+NOT\s+NULL\b/i, description: 'Set NOT NULL constraint without default' },
+  { regex: /\bRENAME\s+(?:TO|COLUMN)\b/i, description: 'Rename Table / Column' },
+  { regex: /\bDELETE\s+FROM\b/i, description: 'Data Mutation (DELETE)' },
+  { regex: /\bUPDATE\s+[^;]+\s+SET\b/i, description: 'Data Mutation (UPDATE)' },
+  { regex: /\bINSERT\s+INTO\b/i, description: 'Data Mutation (INSERT)' },
+  { regex: /\b(?:GRANT|REVOKE)\b/i, description: 'Permissions Change (GRANT/REVOKE)' },
 ];
 
 /**
- * Classifies statements in an SQL migration diff into additive vs destructive.
+ * Robustly splits SQL text into individual statements, ignoring semicolons
+ * inside single quotes ('...'), double quotes ("..."), and comments.
  */
-export function classifySqlDiff(sqlDiff: string): SqlClassificationResult {
-  const cleanSql = sqlDiff.trim();
-  if (!cleanSql) {
-    return {
-      isAdditiveOnly: true,
-      destructiveOperations: [],
-      additiveOperations: [],
-      summary: {
-        tablesCreated: [],
-        columnsAdded: [],
-        indexesCreated: [],
-        foreignKeysAdded: [],
-        otherOperations: [],
-      },
-    };
+export function splitSqlStatements(sql: string): string[] {
+  const statements: string[] = [];
+  let current = '';
+  let inSingleQuote = false;
+  let inDoubleQuote = false;
+  let inLineComment = false;
+  let inBlockComment = false;
+
+  for (let i = 0; i < sql.length; i++) {
+    const char = sql[i];
+    const nextChar = sql[i + 1];
+
+    if (inLineComment) {
+      if (char === '\n' || char === '\r') {
+        inLineComment = false;
+      }
+      continue;
+    }
+
+    if (inBlockComment) {
+      if (char === '*' && nextChar === '/') {
+        inBlockComment = false;
+        i++;
+      }
+      continue;
+    }
+
+    if (!inSingleQuote && !inDoubleQuote) {
+      if (char === '-' && nextChar === '-') {
+        inLineComment = true;
+        i++;
+        continue;
+      }
+      if (char === '/' && nextChar === '*') {
+        inBlockComment = true;
+        i++;
+        continue;
+      }
+    }
+
+    if (char === "'" && !inDoubleQuote) {
+      if (inSingleQuote && nextChar === "'") {
+        current += "''";
+        i++;
+        continue;
+      }
+      inSingleQuote = !inSingleQuote;
+      current += char;
+      continue;
+    }
+
+    if (char === '"' && !inSingleQuote) {
+      inDoubleQuote = !inDoubleQuote;
+      current += char;
+      continue;
+    }
+
+    if (char === ';' && !inSingleQuote && !inDoubleQuote) {
+      const trimmed = current.trim();
+      if (trimmed.length > 0) {
+        statements.push(trimmed);
+      }
+      current = '';
+      continue;
+    }
+
+    current += char;
   }
 
-  // Split into individual SQL statements
-  // Filter out comments and empty statements
-  const statements = cleanSql
-    .split(';')
-    .map((s) => s.trim())
-    .filter((s) => {
-      const stripped = s.replace(/^--.*$/gm, '').trim();
-      return stripped.length > 0;
-    });
+  const trimmed = current.trim();
+  if (trimmed.length > 0) {
+    statements.push(trimmed);
+  }
+
+  return statements;
+}
+
+/**
+ * Classifies statements in an SQL migration diff into additive vs destructive.
+ * STRICT FAIL-CLOSED ENFORCEMENT:
+ * 1. Only explicitly reviewed and approved additive statement types are permitted.
+ * 2. Every unknown or unclassified statement is rejected.
+ * 3. Any destructive statement, type narrowing, or unsafe constraint/default is rejected.
+ * 4. Empty or unclassified diffs cannot be reported as safe.
+ */
+export function classifySqlDiff(sqlDiff: string): SqlClassificationResult {
+  const statements = splitSqlStatements(sqlDiff);
 
   const destructiveOperations: string[] = [];
+  const unapprovedOperations: string[] = [];
   const additiveOperations: string[] = [];
 
   const summary = {
@@ -229,12 +307,30 @@ export function classifySqlDiff(sqlDiff: string): SqlClassificationResult {
     columnsAdded: [] as string[],
     indexesCreated: [] as string[],
     foreignKeysAdded: [] as string[],
+    primaryKeysAdded: [] as string[],
+    enumsCreated: [] as string[],
+    enumValuesAdded: [] as string[],
+    sequencesCreated: [] as string[],
     otherOperations: [] as string[],
   };
 
-  for (const statement of statements) {
-    const normalized = statement.replace(/\s+/g, ' ');
+  // Fail-closed rule 1: Empty or comment-only diff cannot be reported as safe
+  if (statements.length === 0) {
+    unapprovedOperations.push('SQL diff contains no actionable statements. Empty or unclassified diff cannot be reported as safe.');
+    return {
+      isAdditiveOnly: false,
+      destructiveOperations,
+      unapprovedOperations,
+      additiveOperations,
+      totalStatements: 0,
+      summary,
+    };
+  }
 
+  for (const statement of statements) {
+    const normalized = statement.replace(/\s+/g, ' ').trim();
+
+    // 1. Check known destructive patterns
     let isDestructive = false;
     for (const pattern of DESTRUCTIVE_PATTERNS) {
       if (pattern.regex.test(normalized)) {
@@ -248,33 +344,99 @@ export function classifySqlDiff(sqlDiff: string): SqlClassificationResult {
       continue;
     }
 
-    // Classify additive operation
-    if (/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["']?([a-zA-Z0-9_]+)["']?/i.test(normalized)) {
-      const match = normalized.match(/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["']?([a-zA-Z0-9_]+)["']?/i);
-      summary.tablesCreated.push(match ? match[1] : normalized);
-      additiveOperations.push(normalized);
-    } else if (/ALTER\s+TABLE\s+["']?([a-zA-Z0-9_]+)["']?\s+ADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?["']?([a-zA-Z0-9_]+)["']?/i.test(normalized)) {
-      const match = normalized.match(/ALTER\s+TABLE\s+["']?([a-zA-Z0-9_]+)["']?\s+ADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?["']?([a-zA-Z0-9_]+)["']?\s+([^,;]+)/i);
-      summary.columnsAdded.push(match ? `${match[1]}.${match[2]} (${match[3].trim()})` : normalized);
-      additiveOperations.push(normalized);
-    } else if (/CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?["']?([a-zA-Z0-9_]+)["']?/i.test(normalized)) {
-      const match = normalized.match(/CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?["']?([a-zA-Z0-9_]+)["']?\s+ON\s+["']?([a-zA-Z0-9_]+)["']?/i);
-      summary.indexesCreated.push(match ? `${match[1]} on ${match[2]}` : normalized);
-      additiveOperations.push(normalized);
-    } else if (/ADD\s+CONSTRAINT\s+["']?([a-zA-Z0-9_]+)["']?\s+FOREIGN\s+KEY/i.test(normalized)) {
-      const match = normalized.match(/ADD\s+CONSTRAINT\s+["']?([a-zA-Z0-9_]+)["']?\s+FOREIGN\s+KEY/i);
-      summary.foreignKeysAdded.push(match ? match[1] : normalized);
-      additiveOperations.push(normalized);
-    } else {
-      summary.otherOperations.push(normalized);
-      additiveOperations.push(normalized);
+    // 2. Check for unsafe constraints or unsafe defaults on ALTER TABLE ADD COLUMN
+    // If a column is added as NOT NULL on an existing table without a DEFAULT value, PostgreSQL rejects it or locks table
+    if (/^ALTER\s+TABLE\s+["']?([a-zA-Z0-9_]+)["']?\s+ADD\s+(?:COLUMN\s+)?(?!CONSTRAINT\b)["']?([a-zA-Z0-9_]+)["']?/i.test(normalized)) {
+      const hasNotNull = /\bNOT\s+NULL\b/i.test(normalized);
+      const hasDefault = /\bDEFAULT\b/i.test(normalized);
+      if (hasNotNull && !hasDefault) {
+        destructiveOperations.push(`[Unsafe Constraint / Default] Adding NOT NULL column without a DEFAULT value: ${normalized}`);
+        continue;
+      }
     }
+
+    // 3. Match against explicitly approved additive statement types
+
+    // Type 1: CREATE TABLE (quoted or unquoted identifier)
+    const createTableMatch = normalized.match(/^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["']?([a-zA-Z0-9_]+)["']?\s*\(/i);
+    if (createTableMatch) {
+      summary.tablesCreated.push(createTableMatch[1]);
+      additiveOperations.push(normalized);
+      continue;
+    }
+
+    // Type 2: ALTER TABLE ADD CONSTRAINT ... FOREIGN KEY (must precede addColumnMatch)
+    const addFkMatch = normalized.match(/^ALTER\s+TABLE\s+["']?([a-zA-Z0-9_]+)["']?\s+ADD\s+CONSTRAINT\s+["']?([a-zA-Z0-9_]+)["']?\s+FOREIGN\s+KEY/i);
+    if (addFkMatch) {
+      summary.foreignKeysAdded.push(`${addFkMatch[2]} on ${addFkMatch[1]}`);
+      additiveOperations.push(normalized);
+      continue;
+    }
+
+    // Type 3: ALTER TABLE ADD CONSTRAINT ... PRIMARY KEY
+    const addPkMatch = normalized.match(/^ALTER\s+TABLE\s+["']?([a-zA-Z0-9_]+)["']?\s+ADD\s+CONSTRAINT\s+["']?([a-zA-Z0-9_]+)["']?\s+PRIMARY\s+KEY/i);
+    if (addPkMatch) {
+      summary.primaryKeysAdded.push(`${addPkMatch[2]} on ${addPkMatch[1]}`);
+      additiveOperations.push(normalized);
+      continue;
+    }
+
+    // Type 4: ALTER TABLE ADD COLUMN (explicitly negative lookahead on CONSTRAINT)
+    const addColumnMatch = normalized.match(/^ALTER\s+TABLE\s+["']?([a-zA-Z0-9_]+)["']?\s+ADD\s+(?:COLUMN\s+)?(?!CONSTRAINT\b)["']?([a-zA-Z0-9_]+)["']?\s+(.+)$/i);
+    if (addColumnMatch) {
+      summary.columnsAdded.push(`${addColumnMatch[1]}.${addColumnMatch[2]} (${addColumnMatch[3].trim()})`);
+      additiveOperations.push(normalized);
+      continue;
+    }
+
+    // Type 5: CREATE [UNIQUE] INDEX
+    const createIndexMatch = normalized.match(/^CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?["']?([a-zA-Z0-9_]+)["']?\s+ON\s+["']?([a-zA-Z0-9_]+)["']?/i);
+    if (createIndexMatch) {
+      summary.indexesCreated.push(`${createIndexMatch[1]} on ${createIndexMatch[2]}`);
+      additiveOperations.push(normalized);
+      continue;
+    }
+
+    // Type 6: CREATE TYPE ... AS ENUM
+    const createEnumMatch = normalized.match(/^CREATE\s+TYPE\s+["']?([a-zA-Z0-9_]+)["']?\s+AS\s+ENUM\s*\(/i);
+    if (createEnumMatch) {
+      summary.enumsCreated.push(createEnumMatch[1]);
+      additiveOperations.push(normalized);
+      continue;
+    }
+
+    // Type 7: ALTER TYPE ... ADD VALUE
+    const addEnumValueMatch = normalized.match(/^ALTER\s+TYPE\s+["']?([a-zA-Z0-9_]+)["']?\s+ADD\s+VALUE\s+(?:IF\s+NOT\s+EXISTS\s+)?'([^']+)'/i);
+    if (addEnumValueMatch) {
+      summary.enumValuesAdded.push(`${addEnumValueMatch[1]}: '${addEnumValueMatch[2]}'`);
+      additiveOperations.push(normalized);
+      continue;
+    }
+
+    // Type 8: CREATE SEQUENCE
+    const createSeqMatch = normalized.match(/^CREATE\s+SEQUENCE\s+(?:IF\s+NOT\s+EXISTS\s+)?["']?([a-zA-Z0-9_]+)["']?/i);
+    if (createSeqMatch) {
+      summary.sequencesCreated.push(createSeqMatch[1]);
+      additiveOperations.push(normalized);
+      continue;
+    }
+
+    // Fail-closed rule 2: Every statement not explicitly matching an approved pattern is REJECTED
+    unapprovedOperations.push(`[Unapproved / Unknown Statement] ${normalized}`);
   }
 
+  // Fail-closed rule 3: Safe ONLY if there are statements and ZERO destructive or unapproved operations
+  const isAdditiveOnly =
+    statements.length > 0 &&
+    destructiveOperations.length === 0 &&
+    unapprovedOperations.length === 0;
+
   return {
-    isAdditiveOnly: destructiveOperations.length === 0,
+    isAdditiveOnly,
     destructiveOperations,
+    unapprovedOperations,
     additiveOperations,
+    totalStatements: statements.length,
     summary,
   };
 }
