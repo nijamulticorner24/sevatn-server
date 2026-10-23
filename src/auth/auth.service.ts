@@ -294,6 +294,20 @@ export class AuthService {
     const isOnline = dto.paymentMethod === 'ONLINE' || (!dto.paymentMethod && !dto.screenshotUrl);
     const paymentRef = dto.paymentReference?.trim() || (dto.screenshotUrl ? 'RECEIPT_PROOF_ATTACHED' : `PAY-${Date.now()}`);
 
+    const config = await this.prisma.systemConfig.findUnique({ where: { id: 'default' } });
+    const onlineEnabled = config?.onlinePaymentEnabled ?? true;
+    const offlineEnabled = config?.offlinePaymentEnabled ?? true;
+
+    if (isOnline && !onlineEnabled) {
+      throw new BadRequestException('Online payment gateway method is currently disabled by administrator.');
+    }
+    if (!isOnline && !offlineEnabled) {
+      throw new BadRequestException('Offline UPI payment method is currently disabled by administrator.');
+    }
+    if (!onlineEnabled && !offlineEnabled) {
+      throw new BadRequestException('All registration payment methods are currently disabled by administrator.');
+    }
+
     if (isOnline) {
       // 1. ONLINE GATEWAY: Instant auto-verification & activation
       const result = await this.prisma.$transaction(async (tx) => {

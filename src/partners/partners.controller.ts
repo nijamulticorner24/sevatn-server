@@ -3,6 +3,7 @@ import {
   Get,
   Post,
   Put,
+  Delete,
   Param,
   Body,
   Query,
@@ -49,6 +50,16 @@ export class PartnersController {
     @Body() dto: UpdatePartnerDto,
   ) {
     return this.partnersService.updatePartner(req.user, id, dto);
+  }
+
+  @Delete(':id')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN)
+  async deletePartner(
+    @Request() req: any,
+    @Param('id') id: string,
+  ) {
+    return this.partnersService.deletePartner(req.user, id);
   }
 
   @Post(':id/invitations')

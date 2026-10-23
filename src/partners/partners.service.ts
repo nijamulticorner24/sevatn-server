@@ -376,6 +376,95 @@ export class PartnersService {
   }
 
   /**
+   * Delete a partner franchise and clean up associated records
+   */
+  async deletePartner(adminUser: any, partnerId: string) {
+    const partner = await (this.prisma as any).partner.findUnique({
+      where: { id: partnerId },
+      include: {
+        registeredUsers: {
+          select: { id: true, name: true, centre: true },
+        },
+      },
+    });
+
+    if (!partner) {
+      throw new NotFoundException(`Partner with ID '${partnerId}' not found`);
+    }
+
+    const partnerCode = partner.partnerCode;
+    const partnerName = partner.name;
+    const partnerUserId = partner.userId;
+    const unlinkedCentresCount = partner.registeredUsers?.length || 0;
+
+    // Execute in transaction to ensure atomicity
+    await this.prisma.$transaction(async (tx) => {
+      // 1. Unlink any registered users/centres so their accounts remain functional
+      await tx.user.updateMany({
+        where: { partnerId },
+        data: { partnerId: null },
+      });
+
+      // 2. Delete invitations generated for or by this partner
+      await tx.partnerInvitation.deleteMany({
+        where: { partnerId },
+      });
+
+      // 3. Delete partner payouts
+      await (tx as any).partnerPayout.deleteMany({
+        where: { partnerId },
+      });
+
+      // 4. Delete the partner record
+      await (tx as any).partner.delete({
+        where: { id: partnerId },
+      });
+
+      // 5. Clean up dedicated User login if role is PARTNER and has no bookings
+      if (partnerUserId) {
+        const user = await tx.user.findUnique({
+          where: { id: partnerUserId },
+          include: { bookingRequests: true },
+        });
+        if (user && user.role === Role.PARTNER && (!user.bookingRequests || user.bookingRequests.length === 0)) {
+          await tx.wallet.deleteMany({ where: { userId: partnerUserId } });
+          await tx.user.delete({ where: { id: partnerUserId } }).catch(() => {});
+        }
+      }
+    });
+
+    // Audit log
+    await this.audit.log({
+      actorId: adminUser?.id,
+      actorType: 'ADMIN',
+      action: 'PARTNER_DELETED',
+      entity: 'Partner',
+      entityId: partnerId,
+      metadata: {
+        partnerCode,
+        partnerName,
+        email: partner.email,
+        mobile: partner.mobile,
+        unlinkedCentresCount,
+      },
+    });
+
+    // Notify admins via websocket
+    if (this.eventsGateway) {
+      this.eventsGateway.emitToAdmins('admin:partner_deleted', {
+        partnerId,
+        partnerCode,
+        partnerName,
+      });
+    }
+
+    return {
+      message: `Partner ${partnerCode} (${partnerName}) deleted successfully`,
+      partnerId,
+    };
+  }
+
+  /**
    * Generate an additional invitation token for partner
    */
   async generateInvitation(actorUser: any, partnerId: string, dto?: GenerateInvitationDto) {
@@ -1018,6 +1107,20 @@ export class PartnersService {
     }
 
     const isOnline = dto.paymentMethod === 'ONLINE' || !!dto.gatewayPaymentId;
+
+    const config = await this.prisma.systemConfig.findUnique({ where: { id: 'default' } });
+    const onlineEnabled = config?.onlinePaymentEnabled ?? true;
+    const offlineEnabled = config?.offlinePaymentEnabled ?? true;
+
+    if (isOnline && !onlineEnabled) {
+      throw new BadRequestException('Online payment gateway method is currently disabled by administrator.');
+    }
+    if (!isOnline && !offlineEnabled) {
+      throw new BadRequestException('Offline UPI QR payment method is currently disabled by administrator.');
+    }
+    if (!onlineEnabled && !offlineEnabled) {
+      throw new BadRequestException('All payment methods are currently disabled by administrator.');
+    }
 
     if (isOnline) {
       // 1. ONLINE PAYMENT: Auto-verify and immediately activate partner!

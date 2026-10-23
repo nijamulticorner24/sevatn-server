@@ -167,10 +167,10 @@ export class AdminService {
     )}`;
 
     return {
-      onlinePaymentEnabled: config.onlinePaymentEnabled ?? true,
+      onlinePaymentEnabled: config.onlinePaymentEnabled === undefined || config.onlinePaymentEnabled === null ? true : Boolean(config.onlinePaymentEnabled && config.onlinePaymentEnabled !== 'false'),
       onlineGatewayProvider: config.onlineGatewayProvider || 'RAZORPAY',
       onlineGatewayKeyId: config.onlineGatewayKeyId || null,
-      offlinePaymentEnabled: config.offlinePaymentEnabled ?? true,
+      offlinePaymentEnabled: config.offlinePaymentEnabled === undefined || config.offlinePaymentEnabled === null ? true : Boolean(config.offlinePaymentEnabled && config.offlinePaymentEnabled !== 'false'),
       offlineUpiId: upiId,
       offlineAccountName: accountName,
       offlineQrImageUrl: config.offlineQrImageUrl || defaultQr,

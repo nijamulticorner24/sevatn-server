@@ -82,6 +82,20 @@ export class WalletService {
 
     const isOffline = paymentMethod === 'OFFLINE_QR';
 
+    const config = await this.prisma.systemConfig.findUnique({ where: { id: 'default' } });
+    const onlineEnabled = config?.onlinePaymentEnabled ?? true;
+    const offlineEnabled = config?.offlinePaymentEnabled ?? true;
+
+    if (isOffline && !offlineEnabled) {
+      throw new BadRequestException('Offline QR / UPI payment method is currently disabled by administrator.');
+    }
+    if (!isOffline && !onlineEnabled) {
+      throw new BadRequestException('Online payment gateway method is currently disabled by administrator.');
+    }
+    if (!onlineEnabled && !offlineEnabled) {
+      throw new BadRequestException('All payment methods are currently disabled by administrator.');
+    }
+
     // Validate receipt for UPI / QR submissions
     if (isOffline) {
       if (!receiptUrl || !receiptUrl.trim()) {
