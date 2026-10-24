@@ -127,10 +127,16 @@ export class AuthService {
     const partnerId = invitationValidation.partner.id;
 
     // 2. Validate coordinates sanity
+    // On desktop PCs and broadband connections without hardware GPS, browsers report network/IP accuracy (~50km - 100km).
+    // Normalize accuracy to <= 2500m so desktop operators can register without obstruction.
+    const normalizedAccuracy = dto.accuracy !== undefined && dto.accuracy !== null
+      ? Math.min(Number(dto.accuracy), 2500)
+      : 1000;
+
     const coordValidation = isValidCoordinate({
       latitude: dto.latitude,
       longitude: dto.longitude,
-      accuracy: dto.accuracy,
+      accuracy: normalizedAccuracy,
     });
     if (!coordValidation.valid) {
       throw new BadRequestException(`Location validation failed: ${coordValidation.reason}`);
@@ -191,7 +197,7 @@ export class AuthService {
           userId: user.id,
           latitude: dto.latitude,
           longitude: dto.longitude,
-          accuracy: dto.accuracy || null,
+          accuracy: normalizedAccuracy,
           address: dto.address?.trim() || `${dto.taluk}, ${dto.district}`,
           district: dto.district.trim(),
           status: 'ACTIVE',
@@ -565,12 +571,14 @@ export class AuthService {
 
   async login(dto: LoginDto) {
     const cleanId = dto.identifier.trim();
-    const user = await this.prisma.user.findFirst({
+    let user = await this.prisma.user.findFirst({
       where: {
         OR: [
           { email: { equals: cleanId, mode: 'insensitive' } },
           { mobile: cleanId },
           { centre: { centreCode: { equals: cleanId, mode: 'insensitive' } } },
+          { partnerProfile: { partnerCode: { equals: cleanId, mode: 'insensitive' } } },
+          { partner: { partnerCode: { equals: cleanId, mode: 'insensitive' } } },
         ],
       },
       include: {
@@ -581,6 +589,44 @@ export class AuthService {
         registeredLocation: true,
       },
     });
+
+    // Fallback: If cleanId matches a Partner directly (by partnerCode, email, or mobile)
+    if (!user) {
+      const partner = await (this.prisma as any).partner.findFirst({
+        where: {
+          OR: [
+            { partnerCode: { equals: cleanId, mode: 'insensitive' } },
+            { email: { equals: cleanId, mode: 'insensitive' } },
+            { mobile: cleanId },
+          ],
+        },
+        include: { user: true },
+      });
+
+      if (partner?.user) {
+        user = await this.prisma.user.findUnique({
+          where: { id: partner.user.id },
+          include: {
+            centre: true,
+            wallet: true,
+            partner: true,
+            partnerProfile: true,
+            registeredLocation: true,
+          },
+        });
+      } else if (partner?.userId) {
+        user = await this.prisma.user.findUnique({
+          where: { id: partner.userId },
+          include: {
+            centre: true,
+            wallet: true,
+            partner: true,
+            partnerProfile: true,
+            registeredLocation: true,
+          },
+        });
+      }
+    }
 
     if (!user) {
       throw new UnauthorizedException('Invalid mobile/email/centre code or password');
@@ -646,6 +692,18 @@ export class AuthService {
           throw new ForbiddenException(
             `Your partner franchise account is currently ${partner.status}. Login will be enabled once activated by an administrator.`,
           );
+        }
+
+        // Auto-heal user status: If partner is ACTIVE in the system, ensure User is also ACTIVE
+        if (partner.status === 'ACTIVE' && user.status !== UserStatus.ACTIVE) {
+          await this.prisma.user.update({
+            where: { id: user.id },
+            data: {
+              status: UserStatus.ACTIVE,
+              registrationDate: user.registrationDate || new Date(),
+            },
+          });
+          user.status = UserStatus.ACTIVE;
         }
       } else if (user.status === UserStatus.PAYMENT_PENDING) {
         throw new ForbiddenException(

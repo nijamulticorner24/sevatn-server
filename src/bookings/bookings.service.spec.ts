@@ -17,6 +17,9 @@ describe('BookingsService - Terms Acceptance Enforcement', () => {
 
   beforeEach(async () => {
     mockPrisma = {
+      user: {
+        findUnique: jest.fn().mockResolvedValue({ id: 'user-1', role: 'CENTRE' }),
+      },
       bookingRequest: {
         count: jest.fn().mockResolvedValue(100),
         create: jest.fn().mockImplementation(({ data }) => ({

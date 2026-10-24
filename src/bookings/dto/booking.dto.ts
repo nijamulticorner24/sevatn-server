@@ -4,6 +4,7 @@ import {
   IsDateString,
   IsInt,
   IsNotEmpty,
+  IsNumber,
   IsOptional,
   IsString,
   Min,
@@ -85,6 +86,18 @@ export class CreateBookingDto {
   @IsOptional()
   @IsBoolean()
   termsAccepted?: boolean;
+
+  @IsOptional()
+  @IsNumber()
+  latitude?: number;
+
+  @IsOptional()
+  @IsNumber()
+  longitude?: number;
+
+  @IsOptional()
+  @IsNumber()
+  accuracy?: number;
 }
 
 export class ResolveHumanActionDto {

@@ -62,6 +62,17 @@ export class PartnersController {
     return this.partnersService.deletePartner(req.user, id);
   }
 
+  @Post(':id/reset-password')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN)
+  async resetPartnerPassword(
+    @Request() req: any,
+    @Param('id') id: string,
+    @Body() body: { password?: string },
+  ) {
+    return this.partnersService.resetPartnerPassword(req.user, id, body?.password);
+  }
+
   @Post(':id/invitations')
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(Role.SUPER_ADMIN)

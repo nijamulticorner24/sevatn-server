@@ -332,32 +332,89 @@ export class PartnersService {
       newCommissionPercentage = (newCommissionRate / serviceFee) * 100;
     }
 
+    const dataUpdate: any = {
+      name: dto.name ? dto.name.trim() : undefined,
+      email: dto.email ? dto.email.toLowerCase().trim() : undefined,
+      mobile: dto.mobile ? dto.mobile.trim() : undefined,
+      district: dto.district !== undefined ? dto.district?.trim() : undefined,
+      taluk: dto.taluk !== undefined ? dto.taluk?.trim() : undefined,
+      status: dto.status || undefined,
+      commissionPercentage: newCommissionPercentage !== undefined ? new Prisma.Decimal(newCommissionPercentage) : undefined,
+      commissionRate: newCommissionRate !== undefined ? new Prisma.Decimal(newCommissionRate) : undefined,
+      commissionSlab: dto.commissionSlab !== undefined ? dto.commissionSlab?.trim() : undefined,
+    };
+
+    if (dto.status === 'ACTIVE') {
+      dataUpdate.feePaid = true;
+    }
+
     const updated = await (this.prisma as any).partner.update({
       where: { id },
-      data: {
-        name: dto.name ? dto.name.trim() : undefined,
-        email: dto.email ? dto.email.toLowerCase().trim() : undefined,
-        mobile: dto.mobile ? dto.mobile.trim() : undefined,
-        district: dto.district !== undefined ? dto.district?.trim() : undefined,
-        taluk: dto.taluk !== undefined ? dto.taluk?.trim() : undefined,
-        status: dto.status || undefined,
-        commissionPercentage: newCommissionPercentage !== undefined ? new Prisma.Decimal(newCommissionPercentage) : undefined,
-        commissionRate: newCommissionRate !== undefined ? new Prisma.Decimal(newCommissionRate) : undefined,
-        commissionSlab: dto.commissionSlab !== undefined ? dto.commissionSlab?.trim() : undefined,
-      },
+      data: dataUpdate,
     });
 
-    // If name/email/mobile were updated, keep partner's User login account in sync
-    if (existing.userId && (dto.name || dto.email || dto.mobile)) {
-      try {
-        await this.prisma.user.update({
-          where: { id: existing.userId },
+    // Ensure linked User account exists and stays in sync
+    let linkedUserId = existing.userId;
+    if (!linkedUserId) {
+      const existingUser = await this.prisma.user.findFirst({
+        where: {
+          OR: [{ email: updated.email }, { mobile: updated.mobile }],
+        },
+      });
+      if (existingUser) {
+        linkedUserId = existingUser.id;
+        await (this.prisma as any).partner.update({
+          where: { id },
+          data: { userId: linkedUserId },
+        });
+      } else {
+        const defaultPassword = `Partner@${updated.mobile.slice(-4)}`;
+        const passwordHash = await bcrypt.hash(dto.password || defaultPassword, 10);
+        const newUser = await this.prisma.user.create({
           data: {
-            name: dto.name ? dto.name.trim() : undefined,
-            email: dto.email ? dto.email.toLowerCase().trim() : undefined,
-            mobile: dto.mobile ? dto.mobile.trim() : undefined,
+            name: updated.name,
+            email: updated.email,
+            mobile: updated.mobile,
+            passwordHash,
+            role: Role.PARTNER,
+            status: dto.status === 'ACTIVE' ? UserStatus.ACTIVE : UserStatus.PAYMENT_PENDING,
+            mustChangePassword: !dto.password,
           },
         });
+        linkedUserId = newUser.id;
+        await (this.prisma as any).partner.update({
+          where: { id },
+          data: { userId: linkedUserId },
+        });
+      }
+    }
+
+    if (linkedUserId) {
+      try {
+        const userUpdate: any = {};
+        if (dto.name) userUpdate.name = dto.name.trim();
+        if (dto.email) userUpdate.email = dto.email.toLowerCase().trim();
+        if (dto.mobile) userUpdate.mobile = dto.mobile.trim();
+        if (dto.password && dto.password.length >= 6) {
+          userUpdate.passwordHash = await bcrypt.hash(dto.password, 10);
+          userUpdate.mustChangePassword = false;
+        }
+        if (dto.status === 'ACTIVE') {
+          userUpdate.status = UserStatus.ACTIVE;
+          userUpdate.role = Role.PARTNER;
+          userUpdate.registrationDate = new Date();
+        } else if (dto.status === 'SUSPENDED') {
+          userUpdate.status = UserStatus.SUSPENDED;
+        } else if (dto.status === 'PENDING_PAYMENT') {
+          userUpdate.status = UserStatus.PAYMENT_PENDING;
+        }
+
+        if (Object.keys(userUpdate).length > 0) {
+          await this.prisma.user.update({
+            where: { id: linkedUserId },
+            data: userUpdate,
+          });
+        }
       } catch (err: any) {
         this.logger.warn(`Could not sync linked User for partner ${id}: ${err.message}`);
       }
@@ -373,6 +430,87 @@ export class PartnersService {
     });
 
     return { message: 'Partner updated successfully', partner: updated };
+  }
+
+  /**
+   * Admin directly resets partner dashboard login password
+   */
+  async resetPartnerPassword(adminUser: any, partnerId: string, newPassword?: string) {
+    const partner = await (this.prisma as any).partner.findUnique({
+      where: { id: partnerId },
+      include: { user: true },
+    });
+
+    if (!partner) {
+      throw new NotFoundException(`Partner with ID '${partnerId}' not found`);
+    }
+
+    const passwordToSet = newPassword?.trim() || `Partner@${partner.mobile.slice(-4)}`;
+    if (passwordToSet.length < 6) {
+      throw new BadRequestException('Password must be at least 6 characters long');
+    }
+
+    const passwordHash = await bcrypt.hash(passwordToSet, 10);
+
+    let userId = partner.userId;
+    if (!userId) {
+      const existingUser = await this.prisma.user.findFirst({
+        where: {
+          OR: [{ email: partner.email }, { mobile: partner.mobile }],
+        },
+      });
+      if (existingUser) {
+        userId = existingUser.id;
+        await (this.prisma as any).partner.update({
+          where: { id: partnerId },
+          data: { userId },
+        });
+      } else {
+        const newUser = await this.prisma.user.create({
+          data: {
+            name: partner.name,
+            email: partner.email,
+            mobile: partner.mobile,
+            passwordHash,
+            role: Role.PARTNER,
+            status: partner.status === 'ACTIVE' ? UserStatus.ACTIVE : UserStatus.PAYMENT_PENDING,
+            mustChangePassword: false,
+          },
+        });
+        userId = newUser.id;
+        await (this.prisma as any).partner.update({
+          where: { id: partnerId },
+          data: { userId },
+        });
+      }
+    }
+
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: {
+        passwordHash,
+        mustChangePassword: false,
+        status: partner.status === 'ACTIVE' ? UserStatus.ACTIVE : undefined,
+        role: Role.PARTNER,
+      },
+    });
+
+    await this.audit.log({
+      actorId: adminUser?.id,
+      actorType: 'ADMIN',
+      action: 'PARTNER_PASSWORD_RESET',
+      entity: 'Partner',
+      entityId: partnerId,
+      metadata: { partnerCode: partner.partnerCode, email: partner.email },
+    });
+
+    return {
+      message: `Password reset successfully for partner ${partner.name} (${partner.partnerCode}).`,
+      partnerCode: partner.partnerCode,
+      email: partner.email,
+      mobile: partner.mobile,
+      newPassword: passwordToSet,
+    };
   }
 
   /**

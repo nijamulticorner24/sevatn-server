@@ -85,6 +85,11 @@ export class UpdatePartnerDto {
   @IsString()
   @IsOptional()
   commissionSlab?: string;
+
+  @IsString()
+  @IsOptional()
+  @MinLength(6, { message: 'Password must be at least 6 characters long' })
+  password?: string;
 }
 
 export class GenerateInvitationDto {
