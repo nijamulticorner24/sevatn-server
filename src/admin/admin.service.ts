@@ -1,6 +1,7 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
+import { BookingStateMachineService } from '../bookings/booking-state-machine.service';
 import {
   BookingStatus,
   UserStatus,
@@ -23,6 +24,7 @@ export class AdminService {
   constructor(
     private prisma: PrismaService,
     private walletService: WalletService,
+    @Optional() private stateMachine?: BookingStateMachineService,
   ) {}
 
   async getDashboardMetrics() {
@@ -301,6 +303,11 @@ export class AdminService {
       BookingStatus.BOOKING,
       BookingStatus.CONFIRMATION_CHECK,
       BookingStatus.REQUIRES_HUMAN,
+      BookingStatus.WORKER_ERROR,
+      BookingStatus.SITE_ERROR,
+      BookingStatus.TIMEOUT,
+      BookingStatus.HOLD_INVALID_NOMINEE,
+      BookingStatus.RETRYABLE_FAILURE,
     ];
 
     const pendingRequests = await this.prisma.bookingRequest.findMany({
@@ -319,17 +326,42 @@ export class AdminService {
       });
       releasedHoldsCount++;
 
-      // Cancel booking request
-      await this.prisma.bookingRequest.update({
-        where: { id: booking.id },
-        data: {
-          status: BookingStatus.CANCELLED,
-          assignedMachineId: null,
-          leaseExpiresAt: null,
-          leaseStartedAt: null,
-          failureReason: `Queue cleared by Admin (${adminUser?.name || 'Administrator'})`,
-        },
-      });
+      // Cancel booking request via State Machine
+      if (this.stateMachine) {
+        try {
+          await this.stateMachine.transition({
+            bookingId: booking.id,
+            targetStatus: BookingStatus.CANCELLED,
+            targetExecutionStatus: 'IDLE',
+            failureReason: `Queue cleared by Admin (${adminUser?.name || 'Administrator'})`,
+            milestone: 'CANCELLED_BY_ADMIN',
+            force: true,
+          });
+        } catch (smErr: any) {
+          this.logger.warn(`Admin clearQueue fallback for #${booking.id}: ${smErr.message}`);
+          await this.prisma.bookingRequest.update({
+            where: { id: booking.id },
+            data: {
+              status: BookingStatus.CANCELLED,
+              assignedMachineId: null,
+              leaseExpiresAt: null,
+              leaseStartedAt: null,
+              failureReason: `Queue cleared by Admin (${adminUser?.name || 'Administrator'})`,
+            },
+          });
+        }
+      } else {
+        await this.prisma.bookingRequest.update({
+          where: { id: booking.id },
+          data: {
+            status: BookingStatus.CANCELLED,
+            assignedMachineId: null,
+            leaseExpiresAt: null,
+            leaseStartedAt: null,
+            failureReason: `Queue cleared by Admin (${adminUser?.name || 'Administrator'})`,
+          },
+        });
+      }
     }
 
     // Cancel all pending/active jobs

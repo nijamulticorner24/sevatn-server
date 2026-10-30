@@ -63,6 +63,9 @@ describe('SmartAllocatorService — Worker Availability & Automatic Allocation',
         bookingCode: 'BK-101',
         status: BookingStatus.QUEUED,
         officialReference: null,
+        nomineeName: 'Test Nominee',
+        nomineeAge: 35,
+        nomineeRelationship: 'Brother',
       },
     ];
 

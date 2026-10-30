@@ -12,30 +12,75 @@ import {
 } from 'class-validator';
 import { Type } from 'class-transformer';
 
+export class NomineeDto {
+  @IsString()
+  @IsNotEmpty({ message: 'Nominee name is required' })
+  nomineeName: string;
+
+  @IsInt({ message: 'Nominee age must be an integer' })
+  @Min(18, { message: 'Nominee must be at least 18 years of age' })
+  nomineeAge: number;
+
+  @IsString()
+  @IsNotEmpty({ message: 'Nominee relationship is required' })
+  nomineeRelationship: string;
+
+  @IsOptional()
+  @IsString()
+  nomineePhone?: string;
+}
+
 export class PilgrimDto {
   @IsString()
-  @IsNotEmpty()
+  @IsNotEmpty({ message: 'Pilgrim full name is required' })
   fullName: string;
 
-  @IsInt()
-  @Min(1)
+  @IsInt({ message: 'Age must be an integer' })
+  @Min(1, { message: 'Age must be at least 1' })
   age: number;
 
   @IsString()
-  @IsNotEmpty()
+  @IsNotEmpty({ message: 'Gender is required' })
   gender: string;
 
   @IsString()
-  @IsNotEmpty()
+  @IsNotEmpty({ message: 'ID type is required' })
   idType: string;
 
   @IsString()
-  @IsNotEmpty()
+  @IsNotEmpty({ message: 'ID number is required' })
   idNumber: string;
 
   @IsOptional()
   @IsString()
   photoUrl?: string;
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => NomineeDto)
+  nominee?: NomineeDto;
+
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => NomineeDto)
+  nominees?: NomineeDto[];
+
+  @IsOptional()
+  @IsString()
+  nomineeName?: string;
+
+  @IsOptional()
+  @IsInt()
+  nomineeAge?: number;
+
+  @IsOptional()
+  @IsString()
+  nomineeRelationship?: string;
+
+  @IsOptional()
+  @IsString()
+  nomineePhone?: string;
 }
 
 export class CreateBookingDto {
@@ -80,6 +125,33 @@ export class CreateBookingDto {
   pilgrims?: PilgrimDto[];
 
   @IsOptional()
+  @ValidateNested()
+  @Type(() => NomineeDto)
+  nominee?: NomineeDto;
+
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => NomineeDto)
+  nominees?: NomineeDto[];
+
+  @IsOptional()
+  @IsString()
+  nomineeName?: string;
+
+  @IsOptional()
+  @IsInt()
+  nomineeAge?: number;
+
+  @IsOptional()
+  @IsString()
+  nomineeRelationship?: string;
+
+  @IsOptional()
+  @IsString()
+  nomineePhone?: string;
+
+  @IsOptional()
   @IsString()
   idempotencyKey?: string;
 
@@ -108,6 +180,18 @@ export class ResolveHumanActionDto {
   @IsOptional()
   @IsString()
   officialReference?: string;
+
+  @IsOptional()
+  @IsString()
+  officialBookingReference?: string;
+
+  @IsOptional()
+  @IsString()
+  cartId?: string;
+
+  @IsOptional()
+  @IsString()
+  portalTransactionReference?: string;
 
   @IsOptional()
   @IsString()

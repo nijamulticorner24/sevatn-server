@@ -10,7 +10,9 @@ import { Interval } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
 import { AccountLockService } from '../availability/account-lock.service';
 import { EventsGateway } from '../events/events.gateway';
+import { BookingStateMachineService } from '../bookings/booking-state-machine.service';
 import { WorkerStatus, BookingStatus, JobType, Prisma } from '@prisma/client';
+import { validateNominee } from '../common/nominee-validator';
 
 export interface WorkerAvailabilityAssessment {
   workerId: string;
@@ -60,6 +62,7 @@ export class SmartAllocatorService {
     private prisma: PrismaService,
     private accountLockService: AccountLockService,
     @Optional() private eventsGateway?: EventsGateway,
+    @Optional() private stateMachine?: BookingStateMachineService,
   ) {}
 
   /**
@@ -447,8 +450,67 @@ export class SmartAllocatorService {
       };
     }
 
+    // Guard: Existing confirmed bookings are not resubmitted
+    const allocBooking = job.bookingRequest as any;
+    if (allocBooking && (allocBooking.status === BookingStatus.SUCCESS || allocBooking.status === 'BOOKING_CONFIRMED' || allocBooking.officialBookingReference)) {
+      this.logger.log(`[ALLOCATOR] Skipping allocation for Job #${job.id}: Booking #${allocBooking.bookingCode} is already confirmed with reference ${allocBooking.officialBookingReference || allocBooking.officialReference}.`);
+      return {
+        allocated: false,
+        jobId: job.id,
+        decisionReason: `Booking #${allocBooking.bookingCode} is already confirmed with authoritative reference. Resubmission rejected.`,
+      };
+    }
+
+    // 0. Mandatory Nominee Pre-Validation: Validate before any worker allocation
+    if (job.bookingRequestId && job.bookingRequest) {
+      const nomineeResult = validateNominee(job.bookingRequest);
+      if (!nomineeResult.valid) {
+        this.logger.warn(
+          `[ALLOCATOR] Holding Job #${job.id} / Booking #${job.bookingRequest.bookingCode}: Mandatory nominee validation failed: ${nomineeResult.errors.join('; ')}`,
+        );
+        await this.prisma.$transaction(async (tx) => {
+          await tx.bookingJob.update({
+            where: { id: job.id },
+            data: {
+              status: BookingStatus.HOLD_INVALID_NOMINEE,
+              errorMessage: `HOLD_INVALID_NOMINEE: ${nomineeResult.errors.join('; ')}`,
+            },
+          });
+          await tx.bookingRequest.update({
+            where: { id: job.bookingRequestId! },
+            data: {
+              status: BookingStatus.HOLD_INVALID_NOMINEE,
+              requiresHumanNote: `HOLD_INVALID_NOMINEE: ${nomineeResult.errors.join('; ')}`,
+            },
+          });
+          if ((tx as any).bookingMilestone?.create) {
+            await tx.bookingMilestone.create({
+              data: {
+                bookingRequestId: job.bookingRequestId!,
+                milestone: 'NOMINEE_VALIDATION_FAILED',
+                metadata: { errors: nomineeResult.errors },
+              },
+            });
+          }
+        });
+
+        return {
+          allocated: false,
+          jobId: job.id,
+          decisionReason: `Mandatory nominee validation failed: ${nomineeResult.errors.join('; ')}. Booking placed on HOLD_INVALID_NOMINEE.`,
+        };
+      }
+    }
+
     // 1. Check account lock if linked to an account
     const account = job.account || job.bookingRequest?.account;
+    if (account?.status === ('ACCOUNT_PREVIOUS_BOOKING_RESTRICTED' as any) || account?.status === 'DISABLED') {
+      return {
+        allocated: false,
+        jobId: job.id,
+        decisionReason: `Account '${account.username}' is restricted (${account.status}). Retries stopped.`,
+      };
+    }
     if (account?.id && job.bookingRequestId) {
       const lockAcquired = await this.accountLockService.acquireLock(account.id, job.bookingRequestId);
       if (!lockAcquired) {
@@ -501,11 +563,21 @@ export class SmartAllocatorService {
     // 3. Atomically reserve job and worker capacity inside transaction
     const now = new Date();
     const leaseExpiry = new Date(now.getTime() + this.DEFAULT_LEASE_DURATION_SEC * 1000);
+    const leaseId = `lease_${job.id.slice(0, 8)}_${Date.now()}`;
 
     try {
       const allocationTx = await this.prisma.$transaction(async (tx) => {
+        const txAny = tx as any;
         // Atomic conditional check: verify job is STILL in expected queued status
-        const updateCount = await tx.bookingJob.updateMany({
+        const currentJob = await txAny.bookingJob.findUnique({
+          where: { id: job.id },
+          select: { leaseGeneration: true, version: true },
+        });
+
+        const nextLeaseGeneration = (currentJob?.leaseGeneration || 0) + 1;
+        const fencingToken = `fnc_${job.id}_gen${nextLeaseGeneration}_${selected.id.slice(0, 8)}`;
+
+        const updateCount = await txAny.bookingJob.updateMany({
           where: {
             id: job.id,
             status: job.status,
@@ -516,6 +588,10 @@ export class SmartAllocatorService {
             startedAt: now,
             heartbeatAt: now,
             leaseExpiresAt: leaseExpiry,
+            leaseId,
+            leaseGeneration: nextLeaseGeneration,
+            fencingToken,
+            version: { increment: 1 },
             attempt: { increment: 1 },
           },
         });
@@ -526,15 +602,30 @@ export class SmartAllocatorService {
 
         // Update BookingRequest if applicable
         if (job.bookingRequestId) {
-          await tx.bookingRequest.update({
-            where: { id: job.bookingRequestId },
-            data: {
+          if (this.stateMachine) {
+            await this.stateMachine.transition({
+              bookingId: job.bookingRequestId,
+              targetStatus: BookingStatus.EXECUTING,
+              targetExecutionStatus: 'RUNNING',
               assignedMachineId: selected.id,
               leaseStartedAt: now,
               leaseExpiresAt: leaseExpiry,
-              status: BookingStatus.EXECUTING,
-            },
-          });
+              milestone: 'ALLOCATED_BY_SMART_ALLOCATOR',
+              operator: 'SmartAllocatorService',
+            }, tx);
+          } else {
+            await txAny.bookingRequest.update({
+              where: { id: job.bookingRequestId },
+              data: {
+                assignedMachineId: selected.id,
+                leaseStartedAt: now,
+                leaseExpiresAt: leaseExpiry,
+                status: BookingStatus.EXECUTING,
+                version: { increment: 1 },
+                executionStatus: 'RUNNING',
+              },
+            });
+          }
         }
 
         // Increment worker capacity counter and record assignment
@@ -813,13 +904,24 @@ export class SmartAllocatorService {
           });
 
           if (job.bookingRequestId) {
-            await this.prisma.bookingRequest.update({
-              where: { id: job.bookingRequestId },
-              data: {
-                status: BookingStatus.REQUIRES_HUMAN,
-                requiresHumanNote: 'Worker lease expired during execution. Check Sabarimala portal before retrying.',
-              },
-            });
+            if (this.stateMachine) {
+              await this.stateMachine.transition({
+                bookingId: job.bookingRequestId,
+                targetStatus: BookingStatus.REQUIRES_HUMAN,
+                note: 'Worker lease expired during execution. Check Sabarimala portal before retrying.',
+                reason: 'Worker lease expired during active execution. Ambiguous portal state requires verification.',
+                milestone: 'STALE_LEASE_REAPED_TO_HUMAN',
+                operator: 'SmartAllocatorService:reapStaleLeases',
+              });
+            } else {
+              await this.prisma.bookingRequest.update({
+                where: { id: job.bookingRequestId },
+                data: {
+                  status: BookingStatus.REQUIRES_HUMAN,
+                  requiresHumanNote: 'Worker lease expired during execution. Check Sabarimala portal before retrying.',
+                },
+              });
+            }
           }
 
           humanReviewCount++;
@@ -836,15 +938,28 @@ export class SmartAllocatorService {
           });
 
           if (job.bookingRequestId) {
-            await this.prisma.bookingRequest.update({
-              where: { id: job.bookingRequestId },
-              data: {
-                status: BookingStatus.QUEUED,
+            if (this.stateMachine) {
+              await this.stateMachine.transition({
+                bookingId: job.bookingRequestId,
+                targetStatus: BookingStatus.QUEUED,
                 assignedMachineId: null,
                 leaseStartedAt: null,
                 leaseExpiresAt: null,
-              },
-            });
+                reason: 'Worker lease expired before critical stage. Recovered to queue.',
+                milestone: 'STALE_LEASE_RECOVERED_TO_QUEUE',
+                operator: 'SmartAllocatorService:reapStaleLeases',
+              });
+            } else {
+              await this.prisma.bookingRequest.update({
+                where: { id: job.bookingRequestId },
+                data: {
+                  status: BookingStatus.QUEUED,
+                  assignedMachineId: null,
+                  leaseStartedAt: null,
+                  leaseExpiresAt: null,
+                },
+              });
+            }
           }
 
           recoveredCount++;

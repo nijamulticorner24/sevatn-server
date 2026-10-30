@@ -8,6 +8,8 @@ import { NotificationsService } from '../notifications/notifications.service';
 import { SmartMatcherService } from '../availability/smart-matcher.service';
 import { AccountLockService } from '../availability/account-lock.service';
 import { EventsGateway } from '../events/events.gateway';
+import { BookingStateMachineService } from './booking-state-machine.service';
+import { SmartAllocatorService } from '../workers/smart-allocator.service';
 import { Role, BookingStatus } from '@prisma/client';
 
 describe('Phase 2B: Tenant Scoping & Role-Based Authorization Suite', () => {
@@ -58,6 +60,8 @@ describe('Phase 2B: Tenant Scoping & Role-Based Authorization Suite', () => {
         { provide: SmartMatcherService, useValue: {} },
         { provide: AccountLockService, useValue: {} },
         { provide: EventsGateway, useValue: mockEventsGateway },
+        { provide: BookingStateMachineService, useValue: { transition: jest.fn().mockResolvedValue({}) } },
+        { provide: SmartAllocatorService, useValue: {} },
       ],
     }).compile();
 

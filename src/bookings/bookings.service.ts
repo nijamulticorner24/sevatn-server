@@ -17,6 +17,7 @@ import { BookingStatus, JobType, AccountStatus, Role, Prisma } from '@prisma/cli
 
 import { EventsGateway } from '../events/events.gateway';
 import { SmartAllocatorService } from '../workers/smart-allocator.service';
+import { BookingStateMachineService } from './booking-state-machine.service';
 import { Optional } from '@nestjs/common';
 
 @Injectable()
@@ -31,11 +32,14 @@ export class BookingsService {
     private smartMatcher: SmartMatcherService,
     private accountLockService: AccountLockService,
     private eventsGateway: EventsGateway,
+    private stateMachine: BookingStateMachineService,
     @Optional() private smartAllocator?: SmartAllocatorService,
   ) {}
 
   /**
-   * Create a new official Sabarimala booking request (Date demand registered in PENDING state)
+   * Create a new official Sabarimala booking request with pre-queue validation gating.
+   * Ensures account verification, pilgrim details, and nominee requirements are satisfied
+   * before admission into queue / pending demand index.
    */
   async createBooking(userId: string, dto: CreateBookingDto) {
     if (dto.termsAccepted !== true) {
@@ -46,6 +50,123 @@ export class BookingsService {
 
     if (!dto.requestedDate || !dto.route) {
       throw new BadRequestException('Preferred Darshan Date and Route are required');
+    }
+
+    // 1. Optional Pilgrim Details Validation (if explicitly supplied)
+    if (dto.pilgrims && Array.isArray(dto.pilgrims) && dto.pilgrims.length > 0) {
+      if (dto.pilgrims.length > 10) {
+        throw new BadRequestException('A maximum of 10 pilgrims is permitted per booking.');
+      }
+
+      for (let i = 0; i < dto.pilgrims.length; i++) {
+        const p = dto.pilgrims[i];
+        if (!p.fullName || p.fullName.trim().length < 2) {
+          throw new BadRequestException(`Pilgrim #${i + 1}: Full name is required.`);
+        }
+        if (!p.age || typeof p.age !== 'number' || p.age < 1 || p.age > 120) {
+          throw new BadRequestException(`Pilgrim #${i + 1}: Valid age between 1 and 120 is required.`);
+        }
+        if (!p.gender || !['MALE', 'FEMALE', 'TRANSGENDER'].includes(p.gender.toUpperCase())) {
+          throw new BadRequestException(`Pilgrim #${i + 1}: Valid gender (MALE, FEMALE, TRANSGENDER) is required.`);
+        }
+        if (!p.idType || !['AADHAAR', 'VOTER_ID', 'PASSPORT'].includes(p.idType.toUpperCase())) {
+          throw new BadRequestException(`Pilgrim #${i + 1}: Valid ID type (AADHAAR, VOTER_ID, PASSPORT) is required.`);
+        }
+        if (!p.idNumber || p.idNumber.trim().length < 4) {
+          throw new BadRequestException(`Pilgrim #${i + 1}: Valid ID number is required.`);
+        }
+      }
+    }
+
+    // 2. Mandatory Nominee Validation (Required for Pilgrim Insurance)
+    const resolvedNominee = (dto.nominees && dto.nominees[0]) || dto.nominee || (dto.nomineeName ? {
+      nomineeName: dto.nomineeName,
+      nomineeAge: dto.nomineeAge,
+      nomineeRelationship: dto.nomineeRelationship,
+      nomineePhone: dto.nomineePhone,
+    } : null) || (dto.pilgrims && dto.pilgrims[0]?.nominee ? dto.pilgrims[0].nominee : null) || (dto.pilgrims && dto.pilgrims[0]?.nomineeName ? {
+      nomineeName: dto.pilgrims[0].nomineeName,
+      nomineeAge: dto.pilgrims[0].nomineeAge,
+      nomineeRelationship: dto.pilgrims[0].nomineeRelationship,
+      nomineePhone: dto.pilgrims[0].nomineePhone,
+    } : null);
+
+    if (!resolvedNominee || !resolvedNominee.nomineeName || resolvedNominee.nomineeName.trim().length < 2) {
+      throw new BadRequestException('Nominee name is required for pilgrim insurance.');
+    }
+    if (!resolvedNominee.nomineeAge || typeof resolvedNominee.nomineeAge !== 'number' || resolvedNominee.nomineeAge < 18 || resolvedNominee.nomineeAge > 120) {
+      throw new BadRequestException('Nominee must be an adult with a valid age (minimum 18 years).');
+    }
+    if (!resolvedNominee.nomineeRelationship || resolvedNominee.nomineeRelationship.trim().length < 2) {
+      throw new BadRequestException('Nominee relationship is required.');
+    }
+
+    if (dto.nominees && Array.isArray(dto.nominees)) {
+      for (let i = 0; i < dto.nominees.length; i++) {
+        const n = dto.nominees[i];
+        if (!n.nomineeName || n.nomineeName.trim().length < 2) {
+          throw new BadRequestException(`Nominee #${i + 1}: Name is required.`);
+        }
+        if (!n.nomineeAge || typeof n.nomineeAge !== 'number' || n.nomineeAge < 18 || n.nomineeAge > 120) {
+          throw new BadRequestException(`Nominee #${i + 1}: Must be an adult (minimum 18 years).`);
+        }
+        if (!n.nomineeRelationship || n.nomineeRelationship.trim().length < 2) {
+          throw new BadRequestException(`Nominee #${i + 1}: Relationship is required.`);
+        }
+      }
+    }
+
+    // Verify user role
+    const callingUser = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, role: true },
+    });
+    const isSuperAdmin = callingUser?.role === Role.SUPER_ADMIN;
+
+    // 3. Official Devotee Account Validation & Ownership
+    let accountId = dto.accountId;
+    let isNewAccountCredentials = false;
+
+    if (!accountId && (!dto.username || !dto.password)) {
+      throw new BadRequestException('Official devotee account credentials or saved account ID is required.');
+    }
+
+    if (accountId) {
+      const existingAccount = await this.prisma.bookingAccount.findUnique({
+        where: { id: accountId },
+      });
+      if (!existingAccount) {
+        throw new NotFoundException('Selected devotee account was not found.');
+      }
+      if (existingAccount.userId !== userId && !isSuperAdmin) {
+        throw new ForbiddenException('You do not have permission to use this devotee account.');
+      }
+      if (existingAccount.status !== AccountStatus.VERIFIED) {
+        throw new BadRequestException(
+          `Devotee account credentials must be verified before booking can proceed. Current status: ${existingAccount.status}`,
+        );
+      }
+    } else {
+      isNewAccountCredentials = true;
+    }
+
+    // 4. Idempotency Guard (Avoid duplicate wallet holds and requests)
+    if (dto.idempotencyKey) {
+      const existingTx = await this.prisma.walletTransaction.findUnique({
+        where: { idempotencyKey: dto.idempotencyKey },
+        include: {
+          booking: {
+            include: {
+              pilgrims: true,
+              account: { select: { id: true, username: true, status: true } },
+            },
+          },
+        },
+      });
+      if (existingTx && existingTx.booking) {
+        this.logger.log(`[BOOKING] Idempotent replay for key: ${dto.idempotencyKey} -> #${existingTx.booking.bookingCode}`);
+        return existingTx.booking;
+      }
     }
 
     // Generate readable booking code e.g. TA-10492
@@ -60,13 +181,6 @@ export class BookingsService {
       where: { id: 'default' },
     });
     const feeAmount = Number(config?.serviceFee ?? 20);
-
-    // Verify user role
-    const callingUser = await this.prisma.user.findUnique({
-      where: { id: userId },
-      select: { id: true, role: true },
-    });
-    const isSuperAdmin = callingUser?.role === Role.SUPER_ADMIN;
 
     const result = await this.prisma.$transaction(async (tx) => {
       // 1. Verify and reserve funds from wallet (Super Admin auto-funded/exempted)
@@ -97,9 +211,7 @@ export class BookingsService {
         );
       }
 
-      // 2. Handle Official Devotee Account credentials
-      let accountId = dto.accountId;
-
+      // 2. Handle Official Devotee Account credentials (if newly provided)
       if (dto.username && dto.password) {
         const { encryptedData, iv, authTag } = CredentialCrypto.encrypt(dto.password);
         const resolvedLabel = (dto.label || dto.accountLabel)?.trim() || null;
@@ -129,9 +241,53 @@ export class BookingsService {
           },
         });
         accountId = account.id;
+
+        // Trigger asynchronous account verification job for worker pickup
+        await tx.bookingJob.create({
+          data: {
+            jobType: JobType.ACCOUNT_VERIFICATION,
+            accountId: account.id,
+            status: BookingStatus.QUEUED,
+          },
+        });
       }
 
-      // 3. Create Booking Request in AVAILABILITY_CHECKING state
+      // 3. Execution Readiness Check (Remove premature QUEUED creation)
+      let initialStatus: BookingStatus = BookingStatus.PENDING;
+      let matchedTimeSlot: string | null = null;
+      let shouldCreateExecutionJob = false;
+
+      // Only attempt immediate execution dispatch if account is already confirmed VERIFIED
+      if (!isNewAccountCredentials && accountId) {
+        const availableOpp = await tx.availabilityOpportunity.findFirst({
+          where: {
+            date: rawDateStr,
+            route: {
+              contains: dto.route.split(' ')[0],
+              mode: 'insensitive',
+            },
+            status: 'AVAILABLE',
+          },
+        });
+
+        if (availableOpp) {
+          const isLocked = await this.accountLockService.isLocked(accountId);
+          if (!isLocked) {
+            await this.accountLockService.acquireLock(accountId, bookingCode);
+            await tx.availabilityOpportunity.update({
+              where: { id: availableOpp.id },
+              data: {
+                status: 'MATCHED',
+              },
+            });
+            initialStatus = BookingStatus.EXECUTION_QUEUED;
+            matchedTimeSlot = availableOpp.timeSlot;
+            shouldCreateExecutionJob = true;
+          }
+        }
+      }
+
+      // 4. Create Booking Request with verified pilgrims and nominee details
       const booking = await tx.bookingRequest.create({
         data: {
           bookingCode,
@@ -140,44 +296,57 @@ export class BookingsService {
           requestedDate: canonicalDate,
           requestedDateStr: rawDateStr,
           route: dto.route,
-          pilgrimCount: dto.pilgrims?.length || 1,
+          pilgrimCount: (dto.pilgrims && dto.pilgrims.length > 0) ? dto.pilgrims.length : 1,
           timeSlot: dto.timeSlot || 'Any Slot',
+          selectedTime: matchedTimeSlot || undefined,
+          nomineeName: resolvedNominee.nomineeName.trim(),
+          nomineeAge: resolvedNominee.nomineeAge,
+          nomineeRelationship: resolvedNominee.nomineeRelationship.trim(),
+          nomineePhone: resolvedNominee.nomineePhone?.trim() || null,
           preferences: {
             ...(dto.preferences || {}),
+            nominees: dto.nominees || (resolvedNominee ? [resolvedNominee] : []),
             termsAccepted: true,
             termsAcceptedAt: new Date().toISOString(),
           },
-          status: BookingStatus.AVAILABILITY_CHECKING,
-          pilgrims: dto.pilgrims && dto.pilgrims.length > 0
-            ? {
-                create: dto.pilgrims.map((p) => ({
-                  fullName: p.fullName,
-                  age: p.age,
-                  gender: p.gender,
-                  idType: p.idType,
-                  idNumber: p.idNumber,
-                  photoUrl: p.photoUrl,
-                })),
-              }
-            : undefined,
-        },
+          status: initialStatus,
+          pilgrims: (dto.pilgrims && dto.pilgrims.length > 0) ? {
+            create: dto.pilgrims.map((p) => ({
+              fullName: p.fullName.trim(),
+              age: p.age,
+              gender: p.gender.toUpperCase(),
+              idType: p.idType.toUpperCase(),
+              idNumber: p.idNumber.trim(),
+              photoUrl: p.photoUrl || null,
+              nomineeName: (p.nomineeName || resolvedNominee.nomineeName).trim(),
+              nomineeAge: p.nomineeAge || resolvedNominee.nomineeAge,
+              nomineeRelationship: (p.nomineeRelationship || resolvedNominee.nomineeRelationship).trim(),
+              nomineePhone: p.nomineePhone?.trim() || resolvedNominee.nomineePhone?.trim() || null,
+            })),
+          } : undefined,
+        } as any,
         include: {
           pilgrims: true,
           account: { select: { id: true, username: true, status: true } },
         },
       });
 
-      // 4. Create immediate BookingJob for worker immediate availability check & fast booking
-      await tx.bookingJob.create({
-        data: {
-          jobType: JobType.BOOKING_EXECUTION,
-          bookingRequestId: booking.id,
-          accountId: accountId || null,
-          status: BookingStatus.QUEUED,
-        },
-      });
+      // 5. Create BOOKING_EXECUTION job ONLY if date is available and account is verified
+      if (shouldCreateExecutionJob) {
+        await tx.bookingJob.create({
+          data: {
+            jobType: JobType.BOOKING_EXECUTION,
+            bookingRequestId: booking.id,
+            accountId: accountId || null,
+            status: BookingStatus.QUEUED,
+          },
+        });
+        this.logger.log(`[BOOKING] Availability confirmed. Executable job queued for #${booking.bookingCode}`);
+      } else {
+        this.logger.log(`[BOOKING] Waiting in availability queue (PENDING) for date: ${rawDateStr} #${booking.bookingCode}`);
+      }
 
-      // 5. Reserve configured service fee in wallet hold ledger
+      // 6. Reserve configured service fee in wallet hold ledger
       await tx.wallet.update({
         where: { userId },
         data: {
@@ -198,8 +367,6 @@ export class BookingsService {
           idempotencyKey: dto.idempotencyKey || `res_${booking.id}`,
         },
       });
-
-      this.logger.log(`[BOOKING] New request: #${booking.bookingCode}${isSuperAdmin ? ' (by Super Admin)' : ''}`);
 
       return booking;
     });
@@ -375,19 +542,31 @@ export class BookingsService {
       await this.accountLockService.releaseLock(booking.accountId, booking.id);
     }
 
-    const updated = await this.prisma.bookingRequest.update({
-      where: { id },
-      data: {
-        status: BookingStatus.CANCELLED,
-        assignedMachineId: null,
-      },
+    const transitionRes = await this.stateMachine.transition({
+      bookingId: id,
+      targetStatus: BookingStatus.CANCELLED,
+      targetExecutionStatus: 'IDLE',
+      targetFinancialStatus: 'RELEASED',
+      expectedVersion: booking.version,
+      note: 'Cancelled by operator',
+      force: user.role === Role.SUPER_ADMIN,
     });
+    const updated = transitionRes.booking;
 
-    // Also cancel any pending jobs
+    // Also cancel any pending or errored jobs
     await this.prisma.bookingJob.updateMany({
       where: {
         bookingRequestId: id,
-        status: { in: [BookingStatus.QUEUED, BookingStatus.WORKER_ASSIGNED, BookingStatus.CHECKING_AVAILABILITY, BookingStatus.WATCHING] },
+        status: { in: [
+          BookingStatus.QUEUED,
+          BookingStatus.WORKER_ASSIGNED,
+          BookingStatus.CHECKING_AVAILABILITY,
+          BookingStatus.WATCHING,
+          BookingStatus.CLAIMED,
+          BookingStatus.EXECUTING,
+          BookingStatus.WORKER_ERROR,
+          BookingStatus.HOLD_INVALID_NOMINEE,
+        ] },
       },
       data: { status: BookingStatus.CANCELLED },
     });
@@ -420,9 +599,9 @@ export class BookingsService {
     }
 
     if (dto.action === 'SUCCESS_CONFIRMED') {
-      const ref = dto.officialReference?.trim();
-      if (!ref || ref.length < 5 || ref.startsWith('SAB-2026-') || ref === 'SAB-2026-VERIFIED') {
-        throw new BadRequestException('Authoritative official booking reference is required. Synthetic or mock references are rejected.');
+      const ref = (dto.officialBookingReference || dto.officialReference)?.trim();
+      if (!ref || ref.length < 5 || ref.startsWith('SAB-2026-') || ref === 'SAB-2026-VERIFIED' || /^\d{8,12}$/.test(ref)) {
+        throw new BadRequestException('Authoritative official booking reference (e.g. IVQ...) is required. Cart ID or synthetic references are rejected as booking references.');
       }
 
       const reserveTx = await this.prisma.walletTransaction.findFirst({
@@ -442,25 +621,31 @@ export class BookingsService {
         idempotencyKey: `man_cap_${booking.id}`,
       });
 
-      const updated = await this.prisma.bookingRequest.update({
-        where: { id },
-        data: {
-          status: BookingStatus.SUCCESS,
-          officialReference: dto.officialReference,
-          requiresHumanNote: dto.notes ? `Manually confirmed: ${dto.notes}` : 'Manually confirmed by operator',
-        },
+      const transitionRes = await this.stateMachine.transition({
+        bookingId: id,
+        targetStatus: BookingStatus.SUCCESS,
+        targetExecutionStatus: 'COMPLETED',
+        targetFinancialStatus: 'CAPTURED',
+        expectedVersion: booking.version,
+        officialReference: ref,
+        officialBookingReference: ref,
+        cartId: dto.cartId,
+        portalTransactionReference: dto.portalTransactionReference,
+        confirmedAt: new Date(),
+        note: dto.notes ? `Manually confirmed: ${dto.notes}` : 'Manually confirmed by operator',
       });
+      const updated = transitionRes.booking;
 
       return { message: 'Booking manually confirmed and funds captured', booking: updated };
     } else if (dto.action === 'RETRY_QUEUE') {
-      const updated = await this.prisma.bookingRequest.update({
-        where: { id },
-        data: {
-          status: BookingStatus.QUEUED,
-          assignedMachineId: null,
-          requiresHumanNote: null,
-        },
+      const transitionRes = await this.stateMachine.transition({
+        bookingId: id,
+        targetStatus: BookingStatus.QUEUED,
+        targetExecutionStatus: 'ASSIGNED',
+        expectedVersion: booking.version,
+        note: 'Returned to queue by operator',
       });
+      const updated = transitionRes.booking;
 
       // Create new retry job
       await this.prisma.bookingJob.create({

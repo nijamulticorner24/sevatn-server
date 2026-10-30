@@ -109,7 +109,7 @@ async function bootstrap() {
     SwaggerModule.setup('api/docs', app, document);
   }
 
-  const port = process.env.PORT || 4000;
+  const port = process.env.PORT || 5000;
   await app.listen(port);
   logger.log(`🚀 SevaTN API server running at: http://localhost:${port}`);
   logger.log(`📚 Documentation available at: http://localhost:${port}/api/docs`);

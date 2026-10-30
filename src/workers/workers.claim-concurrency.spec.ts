@@ -41,6 +41,9 @@ describe('WorkersService Concurrency & Financial Quarantine Invariants', () => {
         accountId: 'acc-1',
         pilgrimCount: 1,
         pilgrims: [{ fullName: 'Devotee A' }],
+        nomineeName: 'Test Nominee',
+        nomineeAge: 35,
+        nomineeRelationship: 'Brother',
       }
     ];
     mockBookingJobs = [
@@ -81,13 +84,34 @@ describe('WorkersService Concurrency & Financial Quarantine Invariants', () => {
           });
           return found ? { ...found } : null;
         }),
+        findMany: jest.fn().mockImplementation(({ where }) => {
+          const list = mockBookingJobs.filter(j => {
+            if (where.jobType && j.jobType !== where.jobType) return false;
+            if (where.status && j.status !== where.status) return false;
+            if (where.OR) {
+              const matchesOr = where.OR.some((clause: any) => {
+                if (clause.status?.in) return clause.status.in.includes(j.status);
+                if (clause.status) return clause.status === j.status;
+                return false;
+              });
+              if (!matchesOr) return false;
+            }
+            return true;
+          });
+          return list.map(j => ({ ...j }));
+        }),
         findUnique: jest.fn().mockImplementation(({ where }) => {
           return mockBookingJobs.find(j => j.id === where.id) || null;
         }),
         updateMany: jest.fn().mockImplementation(({ where, data }) => {
           const job = mockBookingJobs.find(j => {
             if (j.id !== where.id) return false;
-            if (j.status !== where.status) return false;
+            if (where.status) {
+              if (where.status.not && j.status === where.status.not) return false;
+              if (!where.status.not && j.status !== where.status) return false;
+            }
+            if (where.workerId && j.workerId !== where.workerId) return false;
+            if (where.leaseGeneration !== undefined && j.leaseGeneration !== where.leaseGeneration) return false;
             if (where.OR) {
               const now = new Date();
               const matchesOwner = where.OR.some((clause: any) => {

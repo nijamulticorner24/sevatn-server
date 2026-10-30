@@ -73,7 +73,7 @@ export class RefundsService {
         });
 
         // Record refund ledger transaction
-        await tx.walletTransaction.create({
+        const refundTx = await tx.walletTransaction.create({
           data: {
             walletId: refund.user.wallet.id,
             userId: refund.userId,
@@ -91,6 +91,35 @@ export class RefundsService {
             },
           },
         });
+
+        // Immutable Double-Entry Ledger Postings: DEBIT Centre Available, CREDIT Refund Escrow
+        const txAny = tx as any;
+        if (txAny.walletLedgerEntry) {
+          await txAny.walletLedgerEntry.createMany({
+            data: [
+              {
+                walletId: refund.user.wallet.id,
+                userId: refund.userId,
+                transactionId: refundTx.id,
+                account: 'CENTRE_AVAILABLE',
+                entryType: 'DEBIT',
+                amount: new Prisma.Decimal(amount),
+                reference: `LEDGER-REFUND-DEBIT-${refund.id.slice(0, 8)}`,
+                idempotencyKey: `refund_${refund.id}_debit`,
+              },
+              {
+                walletId: refund.user.wallet.id,
+                userId: refund.userId,
+                transactionId: refundTx.id,
+                account: 'REFUND_ESCROW',
+                entryType: 'CREDIT',
+                amount: new Prisma.Decimal(amount),
+                reference: `LEDGER-REFUND-CREDIT-${refund.id.slice(0, 8)}`,
+                idempotencyKey: `refund_${refund.id}_credit`,
+              },
+            ],
+          });
+        }
 
         // Update refund request status
         await tx.refundRequest.update({

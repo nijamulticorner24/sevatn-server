@@ -52,6 +52,7 @@ enum AccountStatus {
   INVALID
   REQUIRES_HUMAN
   DISABLED
+  ACCOUNT_PREVIOUS_BOOKING_RESTRICTED
 }
 
 enum JobType {
@@ -92,13 +93,34 @@ enum BookingStatus {
   DATE_VERIFICATION_FAILED
   DATE_AVAILABILITY_TIMEOUT
   SELECTING_ROUTE
+  DATE_VERIFIED
+  ROUTE_VERIFIED
+  SLOT_VERIFIED
   OPENING_PILGRIM_SELECTION
   SELECTING_EXISTING_PILGRIMS
+  PILGRIMS_VERIFIED
   SUBMITTING_PILGRIMS
+  NOMINEE_VERIFIED
   SELECTING_RELIEF_FUND_NO
+  RELIEF_VERIFIED
   ADDING_TO_WISHLIST
   VERIFYING_RESULT
   WISHLIST_ADDED
+  WISHLIST_VERIFIED
+  PROCEEDING_TO_CHECKOUT
+  CHECKOUT_VERIFIED
+  WISHLIST_MISMATCH
+  PREVIOUS_BOOKING_RESTRICTION
+  ACCOUNT_PREVIOUS_BOOKING_RESTRICTED
+  LOADER_TIMEOUT
+  PAYMENT_INITIALIZED
+  PAYMENT_PENDING
+  PAYMENT_SUCCESS
+  PAYMENT_FAILED
+  ZERO_COST_CONFIRMATION_PENDING
+  CONFIRMATION_PENDING
+  DISCOVERING
+  HOLD_INVALID_NOMINEE
   CHECKING_AVAILABILITY
   WATCHING
   WAITING
@@ -124,6 +146,11 @@ enum BookingStatus {
   SITE_UNAVAILABLE
   UNKNOWN
   UNKNOWN_RESULT
+  UNKNOWN_OUTCOME
+  BOOKING_FAILED
+  PAYMENT_UNKNOWN
+  RECONCILIATION_REQUIRED
+  RETRYABLE_FAILURE
   CANCELLED
   EXPIRED
   REQUIRES_HUMAN
@@ -177,6 +204,38 @@ enum PayoutStatus {
   REQUESTED
   SETTLED
   REJECTED
+}
+
+enum FinancialStatus {
+  NOT_RESERVED
+  RESERVED
+  CAPTURED
+  RELEASED
+  REFUNDED
+}
+
+enum ExecutionStatus {
+  IDLE
+  ASSIGNED
+  CLAIMED
+  RUNNING
+  SUBMISSION_PENDING
+  COMPLETED
+  FAILED
+  QUARANTINED
+}
+
+enum LedgerAccount {
+  CENTRE_AVAILABLE
+  CENTRE_RESERVED
+  YUKTRON_REVENUE
+  WORKER_INCENTIVE
+  REFUND_ESCROW
+}
+
+enum LedgerEntryType {
+  DEBIT
+  CREDIT
 }
 
 model User {
@@ -269,6 +328,7 @@ model Wallet {
   updatedAt        DateTime     @updatedAt
 
   transactions     WalletTransaction[]
+  ledgerEntries    WalletLedgerEntry[]
 
   @@index([userId])
 }
@@ -311,6 +371,11 @@ model BookingRequest {
   selectedTime      String?         // Discovered & confirmed official time slot
   preferences       Json?
   status            BookingStatus   @default(PENDING)
+  version           Int             @default(1)
+  financialStatus   FinancialStatus @default(NOT_RESERVED)
+  executionStatus   ExecutionStatus @default(IDLE)
+  reconciliationStatus String?
+  lastMilestone     String?
   assignedMachineId String?
   assignedMachine   WorkerMachine?  @relation(fields: [assignedMachineId], references: [id], onDelete: SetNull)
   
@@ -322,12 +387,24 @@ model BookingRequest {
   checkCount        Int             @default(0)
   
   // Verification & Confirmation
-  officialReference String?
-  confirmationData  Json?
-  failureReason     String?
-  requiresHumanNote String?
-  matchedAt         DateTime?
-  completedAt       DateTime?
+  officialReference           String?
+  cartId                      String?
+  officialBookingReference    String?
+  officialReceiptReference    String?
+  portalTransactionReference  String?
+  confirmationEvidence        Json?
+  confirmedAt                 DateTime?
+  confirmationData            Json?
+  failureReason               String?
+  requiresHumanNote           String?
+  matchedAt                   DateTime?
+  completedAt                 DateTime?
+
+  // Nominee Details (Mandatory for pilgrim insurance)
+  nomineeName         String?
+  nomineeAge          Int?
+  nomineeRelationship String?
+  nomineePhone        String?
 
   createdAt         DateTime        @default(now())
   updatedAt         DateTime        @updatedAt
@@ -336,6 +413,9 @@ model BookingRequest {
   attempts          BookingAttempt[]
   jobs              BookingJob[]
   transactions      WalletTransaction[]
+  ledgerEntries     WalletLedgerEntry[]
+  reconciliationRecord BookingReconciliation?
+  milestones        BookingMilestone[]
 
   @@index([userId, status])
   @@index([status, nextCheckAt])
@@ -356,6 +436,11 @@ model BookingJob {
   workerId          String?
   worker            WorkerMachine?  @relation(fields: [workerId], references: [id], onDelete: SetNull)
   status            BookingStatus   @default(QUEUED)
+  version           Int             @default(1)
+  leaseGeneration   Int             @default(1)
+  leaseId           String?
+  fencingToken      String?
+  lastMilestone     String?
   attempt           Int             @default(0)
   maxAttempts       Int             @default(3)
   startedAt         DateTime?
@@ -364,6 +449,7 @@ model BookingJob {
   leaseExpiresAt    DateTime?
   errorCode         String?
   errorMessage      String?
+
   createdAt         DateTime        @default(now())
   updatedAt         DateTime        @updatedAt
 
@@ -386,6 +472,13 @@ model BookingPilgrim {
   idNumber         String
   photoUrl         String?
   metadata         Json?
+
+  // Nominee Details for Pilgrim Insurance
+  nomineeName         String?
+  nomineeAge          Int?
+  nomineeRelationship String?
+  nomineePhone        String?
+
   createdAt        DateTime       @default(now())
 
   @@index([bookingRequestId])
@@ -615,13 +708,32 @@ model AvailabilityOpportunity {
 }
 
 model AccountLock {
-  accountId   String   @id
-  bookingId   String
-  workerId    String?
-  lockedAt    DateTime @default(now())
-  expiresAt   DateTime
+  accountId       String   @id
+  bookingId       String
+  workerId        String?
+  leaseGeneration Int      @default(1)
+  lockedAt        DateTime @default(now())
+  expiresAt       DateTime
 
   @@index([expiresAt])
+}
+
+model DiscoverySchedule {
+  demandKey         String    @id // Normalized discovery key: e.g. 2026-11-27:PAMBA
+  date              String    // YYYY-MM-DD
+  route             String    // Route name
+  status            String    @default("UNKNOWN") // AVAILABLE, UNAVAILABLE, ERROR, UNKNOWN
+  lastCheckedAt     DateTime?
+  nextCheckAt       DateTime  @default(now())
+  lockedBy          String?   // Worker machine / lease owner
+  lockedAt          DateTime?
+  lockExpiresAt     DateTime?
+  consecutiveErrors Int       @default(0)
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@index([nextCheckAt])
+  @@index([lockExpiresAt])
 }
 
 model Partner {
@@ -735,6 +847,77 @@ model InstantServiceQuery {
 
   @@index([userId, createdAt])
   @@index([applicationNumber])
+}
+
+model BookingMilestone {
+  id               String          @id @default(uuid())
+  bookingRequestId String
+  bookingRequest   BookingRequest  @relation(fields: [bookingRequestId], references: [id], onDelete: Cascade)
+  milestone        String          // LOGIN_STARTED, AUTHENTICATED, DATE_SELECTED, PILGRIMS_SELECTED, NOMINEE_VALIDATED, SUBMISSION_STARTED, CONFIRMATION_PENDING, REFERENCE_OBSERVED, CONFIRMED
+  attemptId        Int             @default(1)
+  workerId         String?
+  metadata         Json?
+  timestamp        DateTime        @default(now())
+  completedAt      DateTime?
+  durationMs       Int?
+  errorCode        String?
+  outcome          String?
+  startedAt        DateTime?
+
+  @@index([bookingRequestId, timestamp])
+  @@index([milestone])
+}
+
+model OutboxEvent {
+  id            String          @id @default(uuid())
+  aggregateType String          // "BookingRequest", "WorkerMachine", "Wallet"
+  aggregateId   String
+  eventType     String          // "booking.created", "booking.assigned", "booking.succeeded", etc.
+  payload       Json
+  status        String          @default("PENDING") // PENDING, PUBLISHED, FAILED
+  retryCount    Int             @default(0)
+  lastError     String?
+  createdAt     DateTime        @default(now())
+  publishedAt   DateTime?
+
+  @@index([status, createdAt])
+  @@index([aggregateType, aggregateId])
+}
+
+model WalletLedgerEntry {
+  id             String            @id @default(uuid())
+  walletId       String
+  wallet         Wallet            @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  userId         String
+  bookingId      String?
+  booking        BookingRequest?   @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  transactionId  String?
+  account        LedgerAccount
+  entryType      LedgerEntryType   // DEBIT or CREDIT
+  amount         Decimal
+  idempotencyKey String?
+  reference      String?
+  metadata       Json?
+  createdAt      DateTime          @default(now())
+
+  @@index([walletId, createdAt])
+  @@index([bookingId])
+  @@index([idempotencyKey])
+}
+
+model BookingReconciliation {
+  id               String          @id @default(uuid())
+  bookingRequestId String          @unique
+  bookingRequest   BookingRequest  @relation(fields: [bookingRequestId], references: [id], onDelete: Cascade)
+  status           String          @default("PENDING") // PENDING, RECONCILED_SUCCESS, RECONCILED_FAILED, HUMAN_REVIEW
+  lastMilestone    String?
+  investigationNote String?
+  resolvedReference String?
+  resolvedByUserId String?
+  createdAt        DateTime        @default(now())
+  resolvedAt       DateTime?
+
+  @@index([status])
 }
 
 

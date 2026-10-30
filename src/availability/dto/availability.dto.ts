@@ -9,9 +9,9 @@ export class PublishAvailabilityDto {
   @IsNotEmpty()
   route: string;
 
+  @IsOptional()
   @IsString()
-  @IsNotEmpty()
-  timeSlot: string;
+  timeSlot?: string;
 
   @IsOptional()
   @IsString()
@@ -21,4 +21,35 @@ export class PublishAvailabilityDto {
 export class BulkPublishAvailabilityDto {
   @IsNotEmpty()
   opportunities: PublishAvailabilityDto[];
+}
+
+export class ClaimDemandDto {
+  @IsString()
+  @IsNotEmpty()
+  demandKey: string;
+
+  @IsString()
+  @IsNotEmpty()
+  workerId: string;
+}
+
+export class ReleaseDemandDto {
+  @IsString()
+  @IsNotEmpty()
+  demandKey: string;
+
+  @IsString()
+  @IsNotEmpty()
+  workerId: string;
+
+  @IsString()
+  @IsNotEmpty()
+  status: 'AVAILABLE' | 'UNAVAILABLE' | 'ERROR';
+
+  @IsOptional()
+  durationMs?: number;
+
+  @IsOptional()
+  @IsString()
+  errorMessage?: string;
 }

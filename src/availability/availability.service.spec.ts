@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { AvailabilityService } from './availability.service';
 import { SmartMatcherService } from './smart-matcher.service';
 import { AccountLockService } from './account-lock.service';
+import { DiscoverySchedulerService } from './discovery-scheduler.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { BookingStatus } from '@prisma/client';
 
@@ -42,12 +43,33 @@ describe('AvailabilityService - Date Demand Index & Reconciliation', () => {
       isLocked: jest.fn().mockResolvedValue(false),
     };
 
+    const mockDiscoveryScheduler = {
+      ensureSchedule: jest.fn().mockImplementation((date: string, route: string) =>
+        Promise.resolve({
+          demandKey: `${date}:PAMBA`,
+          date,
+          route,
+          status: 'UNKNOWN',
+          nextCheckAt: new Date(),
+          lockedBy: null,
+          lockExpiresAt: null,
+          lastCheckedAt: null,
+        }),
+      ),
+      claimDemandScan: jest.fn().mockResolvedValue({ claimed: true }),
+      releaseDemandScan: jest.fn().mockResolvedValue(undefined),
+      getMetrics: jest.fn().mockReturnValue({}),
+      recordBookingsMatched: jest.fn(),
+      recordJobCreated: jest.fn(),
+    };
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         AvailabilityService,
         { provide: PrismaService, useValue: mockPrisma },
         { provide: SmartMatcherService, useValue: mockSmartMatcher },
         { provide: AccountLockService, useValue: mockAccountLock },
+        { provide: DiscoverySchedulerService, useValue: mockDiscoveryScheduler },
       ],
     }).compile();
 
@@ -101,10 +123,10 @@ describe('AvailabilityService - Date Demand Index & Reconciliation', () => {
     const demandGroups = await availabilityService.getDemandDates();
 
     expect(demandGroups).toHaveLength(4);
-    expect(demandGroups[0]).toEqual({ date: '2026-11-22', route: 'Pamba', pendingCount: 40 });
-    expect(demandGroups[1]).toEqual({ date: '2026-11-23', route: 'Pamba', pendingCount: 25 });
-    expect(demandGroups[2]).toEqual({ date: '2026-11-24', route: 'Pamba', pendingCount: 20 });
-    expect(demandGroups[3]).toEqual({ date: '2026-11-25', route: 'Pamba', pendingCount: 15 });
+    expect(demandGroups[0]).toEqual(expect.objectContaining({ date: '2026-11-22', route: 'Pamba', pendingCount: 40 }));
+    expect(demandGroups[1]).toEqual(expect.objectContaining({ date: '2026-11-23', route: 'Pamba', pendingCount: 25 }));
+    expect(demandGroups[2]).toEqual(expect.objectContaining({ date: '2026-11-24', route: 'Pamba', pendingCount: 20 }));
+    expect(demandGroups[3]).toEqual(expect.objectContaining({ date: '2026-11-25', route: 'Pamba', pendingCount: 15 }));
   });
 
   it('TEST 10: Unavailable date (22 Nov) keeps pending demand registered while monitoring continues', async () => {

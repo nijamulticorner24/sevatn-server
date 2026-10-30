@@ -221,6 +221,18 @@ export class UpdateJobStatusDto {
   note?: string;
 
   @IsOptional()
+  @IsNumber()
+  leaseGeneration?: number;
+
+  @IsOptional()
+  @IsString()
+  fencingToken?: string;
+
+  @IsOptional()
+  @IsString()
+  protocolVersion?: string;
+
+  @IsOptional()
   @IsString()
   requiresHumanNote?: string;
 
@@ -233,8 +245,42 @@ export class ReportJobResultDto {
   status: BookingStatus; // SUCCESS, FAILED, UNKNOWN, REQUIRES_HUMAN
 
   @IsOptional()
+  @IsNumber()
+  leaseGeneration?: number;
+
+  @IsOptional()
+  @IsString()
+  fencingToken?: string;
+
+  @IsOptional()
+  @IsString()
+  protocolVersion?: string;
+
+  @IsOptional()
   @IsString()
   officialReference?: string;
+
+  @IsOptional()
+  @IsString()
+  cartId?: string;
+
+  @IsOptional()
+  @IsString()
+  officialBookingReference?: string;
+
+  @IsOptional()
+  @IsString()
+  officialReceiptReference?: string;
+
+  @IsOptional()
+  @IsString()
+  portalTransactionReference?: string;
+
+  @IsOptional()
+  confirmationEvidence?: any;
+
+  @IsOptional()
+  confirmedAt?: string | Date;
 
   @IsOptional()
   confirmationData?: any;
@@ -253,4 +299,65 @@ export class ReportJobResultDto {
   @IsOptional()
   @IsString()
   idempotencyKey?: string;
+}
+
+export class WorkerJobActionDto {
+  @IsOptional()
+  @IsNumber()
+  leaseGeneration?: number;
+
+  @IsOptional()
+  @IsString()
+  fencingToken?: string;
+
+  @IsOptional()
+  @IsString()
+  protocolVersion?: string;
+
+  @IsOptional()
+  @IsString()
+  officialReference?: string;
+
+  @IsOptional()
+  @IsString()
+  cartId?: string;
+
+  @IsOptional()
+  @IsString()
+  officialBookingReference?: string;
+
+  @IsOptional()
+  @IsString()
+  officialReceiptReference?: string;
+
+  @IsOptional()
+  @IsString()
+  portalTransactionReference?: string;
+
+  @IsOptional()
+  confirmationEvidence?: any;
+
+  @IsOptional()
+  confirmedAt?: string | Date;
+
+  @IsOptional()
+  confirmationData?: any;
+
+  @IsOptional()
+  @IsString()
+  note?: string;
+
+  @IsOptional()
+  status?: any;
+
+  @IsOptional()
+  @IsString()
+  errorCode?: string;
+
+  @IsOptional()
+  @IsString()
+  errorMessage?: string;
+
+  @IsOptional()
+  logs?: any;
 }

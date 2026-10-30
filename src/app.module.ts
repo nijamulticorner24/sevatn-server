@@ -17,6 +17,7 @@ import { PartnersModule } from './partners/partners.module';
 import { ServicesRegistryModule } from './services-registry/services-registry.module';
 import { InstantServiceModule } from './instant-service/instant-service.module';
 import { EventsModule } from './events/events.module';
+import { OutboxModule } from './common/outbox/outbox.module';
 
 @Module({
   imports: [
@@ -25,6 +26,7 @@ import { EventsModule } from './events/events.module';
     PrismaModule,
     AuditModule,
     EventsModule,
+    OutboxModule,
     NotificationsModule,
     AuthModule,
     CentresModule,

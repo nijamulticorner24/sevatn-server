@@ -9,7 +9,7 @@ import {
 import { AvailabilityService } from './availability.service';
 import { MachineAuthGuard, JwtAuthGuard, RolesGuard } from '../common/guards';
 import { Roles } from '../common/decorators';
-import { PublishAvailabilityDto, BulkPublishAvailabilityDto } from './dto/availability.dto';
+import { PublishAvailabilityDto, BulkPublishAvailabilityDto, ClaimDemandDto, ReleaseDemandDto } from './dto/availability.dto';
 import { Role } from '@prisma/client';
 
 @Controller('availability')
@@ -23,6 +23,38 @@ export class AvailabilityController {
   @UseGuards(MachineAuthGuard)
   async getDemandDates() {
     return this.availabilityService.getDemandDates();
+  }
+
+  /**
+   * Worker atomically claims a discovery scan for a normalized demand key
+   */
+  @Post('claim-demand')
+  @UseGuards(MachineAuthGuard)
+  async claimDemand(@Body() dto: ClaimDemandDto) {
+    return this.availabilityService.claimDemandScan(dto.demandKey, dto.workerId);
+  }
+
+  /**
+   * Worker releases a discovery scan and updates scheduling interval policy
+   */
+  @Post('release-demand')
+  @UseGuards(MachineAuthGuard)
+  async releaseDemand(@Body() dto: ReleaseDemandDto) {
+    return this.availabilityService.releaseDemandScan(
+      dto.demandKey,
+      dto.workerId,
+      dto.status,
+      dto.durationMs,
+    );
+  }
+
+  /**
+   * Discovery Engine runtime telemetry & observability metrics
+   */
+  @Get('metrics')
+  @UseGuards(MachineAuthGuard)
+  async getMetrics() {
+    return this.availabilityService.getDiscoveryMetrics();
   }
 
   /**

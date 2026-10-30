@@ -422,6 +422,37 @@ export class WalletService {
         },
       });
 
+      // Immutable Double-Entry Ledger Postings: DEBIT CENTRE_AVAILABLE, CREDIT CENTRE_RESERVED
+      const txAny = tx as any;
+      if (txAny.walletLedgerEntry) {
+        await txAny.walletLedgerEntry.createMany({
+          data: [
+            {
+              walletId: wallet.id,
+              userId,
+              bookingId,
+              transactionId: transaction.id,
+              account: 'CENTRE_AVAILABLE',
+              entryType: 'DEBIT',
+              amount: new Prisma.Decimal(amount),
+              reference: `LEDGER-RES-DEBIT-${bookingId.slice(0, 8)}`,
+              idempotencyKey: idempotencyKey ? `${idempotencyKey}_res_debit` : undefined,
+            },
+            {
+              walletId: wallet.id,
+              userId,
+              bookingId,
+              transactionId: transaction.id,
+              account: 'CENTRE_RESERVED',
+              entryType: 'CREDIT',
+              amount: new Prisma.Decimal(amount),
+              reference: `LEDGER-RES-CREDIT-${bookingId.slice(0, 8)}`,
+              idempotencyKey: idempotencyKey ? `${idempotencyKey}_res_credit` : undefined,
+            },
+          ],
+        });
+      }
+
       return { message: 'Funds reserved successfully', wallet: updatedWallet, transaction };
     });
   }
@@ -501,6 +532,37 @@ export class WalletService {
           },
         },
       });
+
+      // Immutable Double-Entry Ledger Postings: DEBIT Centre Reserved, CREDIT Yuktron Platform
+      const txAny = tx as any;
+      if (txAny.walletLedgerEntry) {
+        await txAny.walletLedgerEntry.createMany({
+          data: [
+            {
+              walletId: wallet.id,
+              userId,
+              bookingId,
+              transactionId: transaction.id,
+              account: 'CENTRE_RESERVED',
+              entryType: 'DEBIT',
+              amount: new Prisma.Decimal(amount),
+              reference: `LEDGER-CAP-DEBIT-${bookingId.slice(0, 8)}`,
+              idempotencyKey: idempotencyKey ? `${idempotencyKey}_debit` : undefined,
+            },
+            {
+              walletId: wallet.id,
+              userId,
+              bookingId,
+              transactionId: transaction.id,
+              account: 'YUKTRON_REVENUE',
+              entryType: 'CREDIT',
+              amount: new Prisma.Decimal(amount),
+              reference: `LEDGER-CAP-CREDIT-${bookingId.slice(0, 8)}`,
+              idempotencyKey: idempotencyKey ? `${idempotencyKey}_credit` : undefined,
+            },
+          ],
+        });
+      }
 
       // Update worker machine success count if machine known
       if (workerMachineId) {
@@ -584,6 +646,37 @@ export class WalletService {
           metadata: { reason: reason || 'Booking terminated without capture' },
         },
       });
+
+      // Immutable Double-Entry Ledger Postings: DEBIT CENTRE_RESERVED, CREDIT CENTRE_AVAILABLE
+      const txAny = tx as any;
+      if (txAny.walletLedgerEntry && releaseAmount > 0) {
+        await txAny.walletLedgerEntry.createMany({
+          data: [
+            {
+              walletId: wallet.id,
+              userId,
+              bookingId,
+              transactionId: transaction.id,
+              account: 'CENTRE_RESERVED',
+              entryType: 'DEBIT',
+              amount: new Prisma.Decimal(releaseAmount),
+              reference: `LEDGER-REL-DEBIT-${bookingId.slice(0, 8)}`,
+              idempotencyKey: idempotencyKey ? `${idempotencyKey}_rel_debit` : undefined,
+            },
+            {
+              walletId: wallet.id,
+              userId,
+              bookingId,
+              transactionId: transaction.id,
+              account: 'CENTRE_AVAILABLE',
+              entryType: 'CREDIT',
+              amount: new Prisma.Decimal(releaseAmount),
+              reference: `LEDGER-REL-CREDIT-${bookingId.slice(0, 8)}`,
+              idempotencyKey: idempotencyKey ? `${idempotencyKey}_rel_credit` : undefined,
+            },
+          ],
+        });
+      }
 
       await this.audit.log({
         actorId: userId,
