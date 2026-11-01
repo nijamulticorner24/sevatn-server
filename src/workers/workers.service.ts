@@ -1421,6 +1421,16 @@ export class WorkersService {
 
       if (preAllocatedJob.bookingRequestId) {
         if (this.stateMachine) {
+          // If booking is in PENDING or WAITING_FOR_ACCOUNT, first bridge to QUEUED before EXECUTING
+          if (preAllocBr?.status === BookingStatus.PENDING || preAllocBr?.status === BookingStatus.WAITING_FOR_ACCOUNT) {
+            await this.stateMachine.transition({
+              bookingId: preAllocatedJob.bookingRequestId,
+              targetStatus: BookingStatus.QUEUED,
+              milestone: 'PRE_CLAIM_QUEUED',
+              operator: `Worker:${machineId}`,
+            }).catch(() => {});
+          }
+
           await this.stateMachine.transition({
             bookingId: preAllocatedJob.bookingRequestId,
             targetStatus: BookingStatus.EXECUTING,
@@ -1765,6 +1775,16 @@ export class WorkersService {
 
         // Successfully and exclusively claimed! Update booking request and attempt log.
         if (this.stateMachine) {
+          // If booking is in PENDING or WAITING_FOR_ACCOUNT, bridge to QUEUED first
+          if (br.status === BookingStatus.PENDING || br.status === BookingStatus.WAITING_FOR_ACCOUNT) {
+            await this.stateMachine.transition({
+              bookingId: br.id,
+              targetStatus: BookingStatus.QUEUED,
+              milestone: 'PRE_CLAIM_QUEUED',
+              operator: `Worker:${machineId}`,
+            }, tx).catch(() => {});
+          }
+
           await this.stateMachine.transition({
             bookingId: br.id,
             targetStatus: BookingStatus.EXECUTING,

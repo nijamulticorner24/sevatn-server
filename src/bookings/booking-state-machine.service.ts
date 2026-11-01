@@ -65,6 +65,7 @@ export class BookingStateMachineService {
       BookingStatus.QUEUED,
       BookingStatus.FAST_BOOKING_QUEUED,
       BookingStatus.EXECUTION_QUEUED,
+      BookingStatus.EXECUTING,
       BookingStatus.MATCHING,
       BookingStatus.ASSIGNED,
       BookingStatus.WORKER_ASSIGNED,
@@ -74,6 +75,8 @@ export class BookingStateMachineService {
     [BookingStatus.WAITING_FOR_ACCOUNT]: [
       BookingStatus.PENDING,
       BookingStatus.CLAIMED,
+      BookingStatus.QUEUED,
+      BookingStatus.EXECUTING,
       BookingStatus.CANCELLED,
     ],
     [BookingStatus.QUEUED]: [
