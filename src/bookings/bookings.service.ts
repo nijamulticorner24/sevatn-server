@@ -14,6 +14,7 @@ import { SmartMatcherService } from '../availability/smart-matcher.service';
 import { AccountLockService } from '../availability/account-lock.service';
 import { CreateBookingDto, ResolveHumanActionDto } from './dto/booking.dto';
 import { BookingStatus, JobType, AccountStatus, Role, Prisma } from '@prisma/client';
+import { calculateHaversineDistanceKm } from '../common/utils/geo';
 
 import { EventsGateway } from '../events/events.gateway';
 import { SmartAllocatorService } from '../workers/smart-allocator.service';
@@ -116,12 +117,33 @@ export class BookingsService {
       }
     }
 
-    // Verify user role
+    // Verify user role & registered centre location
     const callingUser = await this.prisma.user.findUnique({
       where: { id: userId },
-      select: { id: true, role: true },
+      select: { id: true, role: true, registeredLocation: true },
     });
     const isSuperAdmin = callingUser?.role === Role.SUPER_ADMIN;
+
+    // 2b. Location 5 KM Geofence Enforcement (defence-in-depth)
+    if (!isSuperAdmin && callingUser?.role !== Role.WORKER && callingUser?.role !== Role.PARTNER) {
+      if (callingUser?.registeredLocation) {
+        if (dto.latitude !== undefined && dto.longitude !== undefined) {
+          const distanceKm = calculateHaversineDistanceKm(
+            { latitude: dto.latitude, longitude: dto.longitude },
+            {
+              latitude: callingUser.registeredLocation.latitude,
+              longitude: callingUser.registeredLocation.longitude,
+            },
+          );
+          if (distanceKm > 5.0) {
+            throw new ForbiddenException(
+              `Access Denied: You are ${distanceKm} KM away from your registered centre. ` +
+                `Access is permitted strictly within a 5.0 KM radius under SevaTN security policy.`,
+            );
+          }
+        }
+      }
+    }
 
     // 3. Official Devotee Account Validation & Ownership
     let accountId = dto.accountId;

@@ -110,20 +110,20 @@ export class ServiceAccessGuard implements CanActivate {
       );
     }
 
-    // 5. Extract Current Location from Request Headers or Body
+    // 5. Extract Current Location from Request Body, Headers, or Query (Body takes priority)
     const currentLat = this.extractCoordinate(
-      request.headers['x-user-latitude'],
       request.body?.latitude,
+      request.headers['x-user-latitude'],
       request.query?.latitude,
     );
     const currentLon = this.extractCoordinate(
-      request.headers['x-user-longitude'],
       request.body?.longitude,
+      request.headers['x-user-longitude'],
       request.query?.longitude,
     );
     const currentAccuracy = this.extractCoordinate(
-      request.headers['x-user-accuracy'],
       request.body?.accuracy,
+      request.headers['x-user-accuracy'],
       request.query?.accuracy,
     );
 
