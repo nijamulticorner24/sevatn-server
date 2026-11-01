@@ -331,7 +331,7 @@ export class BookingsService {
         },
       });
 
-      // 5. Create BOOKING_EXECUTION job ONLY if date is available and account is verified
+      // 5. Create BOOKING_EXECUTION job for worker pickup
       if (shouldCreateExecutionJob) {
         await tx.bookingJob.create({
           data: {
@@ -343,7 +343,16 @@ export class BookingsService {
         });
         this.logger.log(`[BOOKING] Availability confirmed. Executable job queued for #${booking.bookingCode}`);
       } else {
-        this.logger.log(`[BOOKING] Waiting in availability queue (PENDING) for date: ${rawDateStr} #${booking.bookingCode}`);
+        // Also queue execution job in QUEUED status so worker Booking Engine can pick it up or monitor date
+        await tx.bookingJob.create({
+          data: {
+            jobType: JobType.BOOKING_EXECUTION,
+            bookingRequestId: booking.id,
+            accountId: accountId || null,
+            status: BookingStatus.QUEUED,
+          },
+        });
+        this.logger.log(`[BOOKING] Created job in QUEUED state for #${booking.bookingCode} on requested date: ${rawDateStr}`);
       }
 
       // 6. Reserve configured service fee in wallet hold ledger

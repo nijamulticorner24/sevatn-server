@@ -167,7 +167,7 @@ async function runSafeSchemaSync() {
   // 8. Live Synchronization (Only reached if additive-only check AND production approval passed)
   console.log('\n⚙️  Applying validated additive schema updates (prisma db push)...');
   try {
-    const pushOutput = execSync('npx prisma db push --skip-generate', {
+    const pushOutput = execSync('npx prisma db push', {
       encoding: 'utf8',
       env: {
         ...process.env,
@@ -179,6 +179,23 @@ async function runSafeSchemaSync() {
     console.log('\n=== Prisma Engine Output ===');
     console.log(pushOutput.trim());
     console.log('============================');
+
+    // NEW: Verify Prisma client delegates are available
+    console.log('\n🔍 Verifying Prisma Client delegates...');
+    try {
+      const verifyOutput = execSync(
+        `node -e "const { PrismaClient } = require('@prisma/client'); const p = new PrismaClient(); console.log('outboxEvent:', typeof p.outboxEvent, '| discoverySchedule:', typeof p.discoverySchedule);"`,
+        { encoding: 'utf8', env: process.env }
+      );
+      console.log(verifyOutput.trim());
+      if (verifyOutput.includes('undefined')) {
+        throw new Error('Prisma client delegates are undefined after schema sync!');
+      }
+      console.log('✅ Prisma Client verification passed.');
+    } catch (verifyErr: any) {
+      console.error('❌ Prisma Client verification failed:', verifyErr.message);
+      process.exit(1);
+    }
 
     console.log('\n✅ Database schema synchronized successfully with zero data loss.');
   } catch (pushErr: any) {

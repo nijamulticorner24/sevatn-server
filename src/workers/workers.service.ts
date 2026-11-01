@@ -1629,6 +1629,7 @@ export class WorkersService {
       const eligibleStatuses = [
         BookingStatus.QUEUED,
         BookingStatus.EXECUTION_QUEUED,
+        BookingStatus.PENDING,
         ((BookingStatus as any).FAST_BOOKING_QUEUED || 'FAST_BOOKING_QUEUED') as any,
       ];
 
