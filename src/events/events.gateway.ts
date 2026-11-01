@@ -163,6 +163,18 @@ export class EventsGateway
   }
 
   /**
+   * Specific event: Booking Confirmed (Instant Broadcast)
+   */
+  notifyBookingConfirmed(payload: any) {
+    this.emitToAdmins('booking.confirmed', payload);
+    this.emitToAdmins('admin:booking_updated', payload);
+    if (payload.userId) {
+      this.emitToUser(payload.userId, 'booking:updated', payload);
+    }
+    this.emitToAll('booking.confirmed', payload);
+  }
+
+  /**
    * Specific event: Booking Status Updated
    */
   notifyBookingUpdated(bookingId: string, userId: string, payload: any) {

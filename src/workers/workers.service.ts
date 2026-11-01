@@ -1874,6 +1874,135 @@ export class WorkersService {
         };
       }
 
+      // 3. Fallback: If no explicit bookingJob exists in queue, check for eligible unassigned BookingRequests
+      const pendingBooking = typeof tx.bookingRequest?.findFirst === 'function'
+        ? await tx.bookingRequest.findFirst({
+            where: {
+              status: { in: [BookingStatus.PENDING, BookingStatus.QUEUED, BookingStatus.EXECUTION_QUEUED] },
+              assignedMachineId: null,
+            },
+            include: {
+              pilgrims: true,
+              account: true,
+            },
+            orderBy: { createdAt: 'asc' },
+          })
+        : null;
+
+      if (pendingBooking) {
+        const br = pendingBooking;
+        const nomineeCheck = validateNominee(br);
+        if (!nomineeCheck.valid) {
+          this.logger.warn(`[CLAIM] Booking Request #${br.id} has invalid nominee: ${nomineeCheck.errors.join('; ')}`);
+          await tx.bookingRequest.update({
+            where: { id: br.id },
+            data: { status: BookingStatus.HOLD_INVALID_NOMINEE, requiresHumanNote: `HOLD_INVALID_NOMINEE: ${nomineeCheck.errors.join('; ')}` },
+          });
+          return { hasJob: false };
+        }
+
+        const account = br.account;
+        if (account?.id && this.accountLockService) {
+          const lockAcquired = await this.accountLockService.acquireLock(account.id, br.id, machineId);
+          if (!lockAcquired) {
+            this.logger.warn(`[CLAIM] Booking Request #${br.bookingCode} skipped: Account (${account.username}) is locked.`);
+            return { hasJob: false };
+          }
+        }
+
+        // Create on-demand bookingJob
+        const newJob = await tx.bookingJob.create({
+          data: {
+            jobType: JobType.BOOKING_EXECUTION,
+            bookingRequestId: br.id,
+            accountId: br.accountId || null,
+            workerId: machineId,
+            startedAt: now,
+            heartbeatAt: now,
+            leaseExpiresAt: leaseExpiry,
+            status: BookingStatus.EXECUTING,
+            attempt: 1,
+          },
+        });
+
+        // Transition booking status
+        if (this.stateMachine) {
+          if (br.status === BookingStatus.PENDING || br.status === BookingStatus.WAITING_FOR_ACCOUNT) {
+            await this.stateMachine.transition({
+              bookingId: br.id,
+              targetStatus: BookingStatus.QUEUED,
+              milestone: 'PRE_CLAIM_QUEUED',
+              operator: `Worker:${machineId}`,
+            }, tx).catch(() => {});
+          }
+          await this.stateMachine.transition({
+            bookingId: br.id,
+            targetStatus: BookingStatus.EXECUTING,
+            milestone: 'CLAIMED_BY_WORKER',
+            operator: `Worker:${machineId}`,
+            workerId: machineId,
+          }, tx).catch(() => {});
+        } else {
+          await tx.bookingRequest.update({
+            where: { id: br.id },
+            data: {
+              status: BookingStatus.EXECUTING,
+              assignedMachineId: machineId,
+              leaseStartedAt: now,
+              leaseExpiresAt: leaseExpiry,
+            },
+          });
+        }
+
+        const dateOnlyStr = br.requestedDateStr || (br.requestedDate instanceof Date ? br.requestedDate.toISOString().split('T')[0] : String(br.requestedDate).split('T')[0]);
+
+        await tx.workerMachine.update({
+          where: { id: machineId },
+          data: {
+            status: WorkerStatus.BUSY,
+            currentJobId: newJob.id,
+            currentBookingId: br.id,
+            currentActiveJobs: { increment: 1 },
+            lastJobAt: now,
+            currentActivity: 'PROCESSING_JOB',
+            activityDetails: `Executing booking #${br.bookingCode} for ${dateOnlyStr}`,
+            activityStartedAt: now,
+            lastActivityAt: now,
+          },
+        });
+
+        return {
+          hasJob: true,
+          jobType: JobType.BOOKING_EXECUTION,
+          job: {
+            id: newJob.id,
+            bookingRequestId: br.id,
+            bookingCode: br.bookingCode,
+            requestedDate: dateOnlyStr,
+            route: br.route,
+            pilgrimCount: br.pilgrimCount,
+            timeSlot: br.timeSlot,
+            selectedTime: br.selectedTime || undefined,
+            preferences: br.preferences,
+            pilgrims: br.pilgrims,
+            nominee: nomineeCheck.resolvedNominee,
+            nominees: (br.preferences as any)?.nominees || (nomineeCheck.resolvedNominee ? [nomineeCheck.resolvedNominee] : []),
+            account: account
+              ? {
+                  id: account.id,
+                  username: account.username,
+                  encryptedPassword: account.encryptedPassword,
+                  encryptionIv: account.encryptionIv,
+                  encryptionTag: account.encryptionTag,
+                }
+              : null,
+            leaseExpiresAt: leaseExpiry,
+            leaseGeneration: newJob.leaseGeneration,
+            fencingToken: newJob.fencingToken,
+          },
+        };
+      }
+
       return { hasJob: false, message: 'No pending jobs in queue' };
     });
   }
@@ -2342,6 +2471,20 @@ export class WorkersService {
           confirmationData: dto.confirmationData,
         },
       });
+
+      // Realtime WebSocket broadcast to Admin Dashboard and user
+      if (this.eventsGateway) {
+        this.eventsGateway.notifyBookingConfirmed({
+          bookingId: br.id,
+          userId: br.userId,
+          bookingCode: br.bookingCode,
+          officialBookingReference: officialBookingRef,
+          officialReference: officialBookingRef,
+          status: BookingStatus.SUCCESS,
+          route: br.route,
+          requestedDate: br.requestedDate,
+        });
+      }
 
       if (this.smartAllocator) {
         await this.smartAllocator.releaseJobCapacity(machineId, jobId, br.id);

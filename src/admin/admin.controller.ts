@@ -12,7 +12,7 @@ import { AdminService } from './admin.service';
 import { AuditService } from '../audit/audit.service';
 import { JwtAuthGuard, RolesGuard } from '../common/guards';
 import { Roles, CurrentUser } from '../common/decorators';
-import { Role } from '@prisma/client';
+import { Role, BookingStatus } from '@prisma/client';
 
 @Controller('admin')
 @UseGuards(JwtAuthGuard, RolesGuard)
@@ -46,6 +46,21 @@ export class AdminController {
   @Post('queues/clear-all')
   async clearAllQueues(@CurrentUser() user: any) {
     return this.adminService.clearAllQueues(user);
+  }
+
+  @Get('bookings')
+  async getAdminBookings(
+    @Query('status') status?: BookingStatus,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+    @Query('search') search?: string,
+  ) {
+    return this.adminService.getAdminBookings({
+      status,
+      page: page ? parseInt(page, 10) : 1,
+      limit: limit ? parseInt(limit, 10) : 50,
+      search,
+    });
   }
 
   // --- Dedicated Financial Ledger & Payments Collection APIs ---

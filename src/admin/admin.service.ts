@@ -409,6 +409,51 @@ export class AdminService {
     };
   }
 
+  async getAdminBookings(query: { status?: BookingStatus; page?: number; limit?: number; search?: string }) {
+    const page = Number(query.page) || 1;
+    const limit = Number(query.limit) || 50;
+    const skip = (page - 1) * limit;
+
+    const where: any = {};
+    if (query.status && (query.status as any) !== 'ALL') {
+      where.status = query.status;
+    }
+    if (query.search) {
+      where.OR = [
+        { bookingCode: { contains: query.search, mode: 'insensitive' } },
+        { route: { contains: query.search, mode: 'insensitive' } },
+        { officialReference: { contains: query.search, mode: 'insensitive' } },
+        { user: { name: { contains: query.search, mode: 'insensitive' } } },
+      ];
+    }
+
+    const [bookings, total] = await Promise.all([
+      this.prisma.bookingRequest.findMany({
+        where,
+        skip,
+        take: limit,
+        orderBy: { createdAt: 'desc' },
+        include: {
+          pilgrims: true,
+          account: { select: { id: true, label: true, username: true, status: true } as any },
+          assignedMachine: { select: { machineCode: true, machineName: true, status: true } },
+          user: {
+            select: {
+              name: true,
+              email: true,
+              mobile: true,
+              partnerId: true,
+              centre: { select: { centreName: true, district: true } },
+            },
+          },
+        },
+      }),
+      this.prisma.bookingRequest.count({ where }),
+    ]);
+
+    return { bookings, total, page, totalPages: Math.ceil(total / limit) };
+  }
+
   /**
    * Comprehensive Financial Ledger Overview & Collection Metrics
    */
