@@ -374,6 +374,8 @@ model BookingRequest {
   version           Int             @default(1)
   financialStatus   FinancialStatus @default(NOT_RESERVED)
   executionStatus   ExecutionStatus @default(IDLE)
+  isWatching        Boolean         @default(false)
+  isAutoGrab        Boolean         @default(false)
   reconciliationStatus String?
   lastMilestone     String?
   assignedMachineId String?
@@ -455,6 +457,7 @@ model BookingJob {
 
   attempts          BookingAttempt[]
 
+  @@unique([bookingRequestId])
   @@index([status, leaseExpiresAt])
   @@index([workerId])
   @@index([bookingRequestId])

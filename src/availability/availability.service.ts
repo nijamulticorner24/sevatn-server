@@ -46,6 +46,7 @@ export class AvailabilityService {
             BookingStatus.QUEUED,
             BookingStatus.TEMPORARY_SLOT_LOST,
             BookingStatus.WAITING_FOR_ACCOUNT,
+            BookingStatus.WAITING_FOR_DATE_AVAILABILITY,
           ],
         },
       },

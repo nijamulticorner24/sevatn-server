@@ -334,6 +334,48 @@ export class WorkersController {
   }
 
   /**
+   * Date-First Discovery: retrieves unique dates with pending bookings
+   */
+  @Get('pending-dates')
+  @UseGuards(MachineAuthGuard)
+  async getPendingDates() {
+    return this.workersService.getPendingDates();
+  }
+
+  /**
+   * Cancellation Sniping: atomically match and assign the oldest pending booking for a newly available date
+   * using FOR UPDATE SKIP LOCKED.
+   */
+  @Post('match-pending')
+  @UseGuards(MachineAuthGuard)
+  async matchPending(
+    @CurrentMachine() machine: any,
+    @Body() dto: { date: string; route?: string },
+  ) {
+    return this.workersService.matchPendingBooking(machine.id, dto.date, dto.route);
+  }
+
+  /**
+   * Watchlist: Admin adds a target date to auto-monitor and snipe
+   */
+  @Post('watchlist')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN, Role.CENTRE)
+  async createWatchlist(@Body() dto: { date: string; route?: string }) {
+    return this.workersService.createWatchlistEntry(dto.date, dto.route);
+  }
+
+  /**
+   * Watchlist: View all actively watched dates
+   */
+  @Get('watchlist')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN, Role.CENTRE)
+  async getWatchlist() {
+    return this.workersService.getWatchlist();
+  }
+
+  /**
    * Worker reports granular Playwright progress update
    */
   @Post('jobs/:id/progress')

@@ -1375,6 +1375,21 @@ export class WorkersService {
     const now = new Date();
     const leaseExpiry = new Date(now.getTime() + 180 * 1000); // 3 min lease
 
+    // Authoritative eligible and excluded statuses for worker claiming
+    const eligibleBookingStatuses = [
+      BookingStatus.PENDING,
+      BookingStatus.QUEUED,
+      BookingStatus.WAITING_FOR_DATE_AVAILABILITY,
+      BookingStatus.WAITING_FOR_ACCOUNT,
+    ];
+    const excludedBookingStatuses = [
+      BookingStatus.CANCELLED,
+      BookingStatus.COMPLETED,
+      BookingStatus.FAILED,
+      BookingStatus.SUCCESS,
+      'BOOKING_CONFIRMED' as any,
+    ];
+
     // 1. First priority: Check if a job was already reserved specifically for this worker by the central SmartAllocator
     const preAllocatedJob = await this.prisma.bookingJob.findFirst({
       where: {
@@ -1384,6 +1399,25 @@ export class WorkersService {
           {
             status: BookingStatus.EXECUTING,
             leaseExpiresAt: { lt: now }, // Only crashed/lease-expired executing jobs can be reclaimed for recovery
+          },
+        ],
+        AND: [
+          {
+            OR: [
+              { jobType: JobType.ACCOUNT_VERIFICATION },
+              {
+                bookingRequest: {
+                  status: {
+                    in: eligibleBookingStatuses,
+                    notIn: excludedBookingStatuses,
+                  },
+                  OR: [
+                    { nextCheckAt: null },
+                    { nextCheckAt: { lte: now } },
+                  ],
+                },
+              },
+            ],
           },
         ],
       },
@@ -1397,15 +1431,36 @@ export class WorkersService {
     });
 
     if (preAllocatedJob) {
-      // Guard: Existing confirmed bookings are not resubmitted
+      // Guard: Existing confirmed, cancelled, completed, failed bookings or jobs in backoff are not executed
       const preAllocBr = preAllocatedJob.bookingRequest as any;
-      if (preAllocBr && (preAllocBr.status === BookingStatus.SUCCESS || preAllocBr.status === 'BOOKING_CONFIRMED' || preAllocBr.officialBookingReference)) {
-        this.logger.log(`[CLAIM-JOB] Pre-allocated Job #${preAllocatedJob.id} booking #${preAllocBr.bookingCode} is already confirmed with ref ${preAllocBr.officialBookingReference || preAllocBr.officialReference}. Skipping execution.`);
-        await this.prisma.bookingJob.update({
-          where: { id: preAllocatedJob.id },
-          data: { status: BookingStatus.SUCCESS, completedAt: now },
-        });
-        return { hasJob: false };
+      if (preAllocBr) {
+        if (
+          excludedBookingStatuses.includes(preAllocBr.status) ||
+          preAllocBr.status === BookingStatus.CANCELLED ||
+          preAllocBr.status === BookingStatus.COMPLETED ||
+          preAllocBr.status === BookingStatus.FAILED ||
+          preAllocBr.status === BookingStatus.SUCCESS ||
+          preAllocBr.officialBookingReference
+        ) {
+          this.logger.log(`[CLAIM-JOB] Pre-allocated Job #${preAllocatedJob.id} booking #${preAllocBr.bookingCode} is in terminal/excluded status (${preAllocBr.status}). Skipping execution.`);
+          await Promise.resolve(
+            this.prisma.bookingJob.update({
+              where: { id: preAllocatedJob.id },
+              data: { status: preAllocBr.status, completedAt: now },
+            }),
+          ).catch(() => {});
+          return { hasJob: false };
+        }
+
+        if (!eligibleBookingStatuses.includes(preAllocBr.status)) {
+          this.logger.log(`[CLAIM-JOB] Pre-allocated Job #${preAllocatedJob.id} booking #${preAllocBr.bookingCode} status (${preAllocBr.status}) is not eligible for execution.`);
+          return { hasJob: false };
+        }
+
+        if (preAllocBr.nextCheckAt && new Date(preAllocBr.nextCheckAt).getTime() > now.getTime()) {
+          this.logger.log(`[CLAIM-JOB] Pre-allocated Job #${preAllocatedJob.id} booking #${preAllocBr.bookingCode} is in backoff until ${preAllocBr.nextCheckAt}. Skipping.`);
+          return { hasJob: false };
+        }
       }
 
       // Worker is retrieving its assigned job. Ensure lease is fresh and state transitions to EXECUTING.
@@ -1636,28 +1691,18 @@ export class WorkersService {
       }
 
       // 2. Second priority: Booking Execution Jobs
-      const eligibleStatuses = [
-        BookingStatus.QUEUED,
-        BookingStatus.EXECUTION_QUEUED,
-        BookingStatus.PENDING,
-        ((BookingStatus as any).FAST_BOOKING_QUEUED || 'FAST_BOOKING_QUEUED') as any,
-      ];
-
       const candidateJobs = typeof tx.bookingJob.findMany === 'function'
         ? await tx.bookingJob.findMany({
             where: {
               jobType: JobType.BOOKING_EXECUTION,
-              OR: [
-                { status: { in: eligibleStatuses } },
-                {
-                  status: BookingStatus.WATCHING,
-                  leaseExpiresAt: { lte: now },
-                },
-                {
-                  status: BookingStatus.CHECKING_AVAILABILITY,
-                  leaseExpiresAt: { lte: now },
-                },
-              ],
+              status: { in: eligibleBookingStatuses, notIn: excludedBookingStatuses },
+              bookingRequest: {
+                status: { in: eligibleBookingStatuses, notIn: excludedBookingStatuses },
+                OR: [
+                  { nextCheckAt: null },
+                  { nextCheckAt: { lte: now } },
+                ],
+              },
             },
             include: {
               account: true,
@@ -1674,17 +1719,14 @@ export class WorkersService {
         : [await tx.bookingJob.findFirst({
             where: {
               jobType: JobType.BOOKING_EXECUTION,
-              OR: [
-                { status: { in: eligibleStatuses } },
-                {
-                  status: BookingStatus.WATCHING,
-                  leaseExpiresAt: { lte: now },
-                },
-                {
-                  status: BookingStatus.CHECKING_AVAILABILITY,
-                  leaseExpiresAt: { lte: now },
-                },
-              ],
+              status: { in: eligibleBookingStatuses, notIn: excludedBookingStatuses },
+              bookingRequest: {
+                status: { in: eligibleBookingStatuses, notIn: excludedBookingStatuses },
+                OR: [
+                  { nextCheckAt: null },
+                  { nextCheckAt: { lte: now } },
+                ],
+              },
             },
             include: {
               account: true,
@@ -1700,12 +1742,27 @@ export class WorkersService {
 
       this.logger.log(`[CLAIM] Worker ${machine.machineCode} poll: Found ${candidateJobs.length} eligible queued execution job(s) in queue.`);
 
-      // Guard: Existing confirmed bookings are not resubmitted
+      // Guard: Existing confirmed, cancelled, completed, failed bookings or jobs in backoff are not resubmitted
       const unconfirmedCandidates = candidateJobs.filter((cj) => {
         const br = cj.bookingRequest;
-        if (!br) return true;
-        if (br.status === BookingStatus.SUCCESS || (br.status as any) === 'BOOKING_CONFIRMED' || br.officialBookingReference) {
-          this.logger.log(`[CLAIM] Skipping Job #${cj.id}: Booking #${br.bookingCode} is already confirmed with ref ${br.officialBookingReference || br.officialReference}.`);
+        if (!br) return false;
+        if (
+          excludedBookingStatuses.includes(br.status) ||
+          br.status === BookingStatus.CANCELLED ||
+          br.status === BookingStatus.COMPLETED ||
+          br.status === BookingStatus.FAILED ||
+          br.status === BookingStatus.SUCCESS ||
+          br.officialBookingReference
+        ) {
+          this.logger.log(`[CLAIM] Skipping Job #${cj.id}: Booking #${br.bookingCode} is in excluded status ${br.status}.`);
+          return false;
+        }
+        if (!eligibleBookingStatuses.includes(br.status)) {
+          this.logger.log(`[CLAIM] Skipping Job #${cj.id}: Booking #${br.bookingCode} status ${br.status} is not eligible.`);
+          return false;
+        }
+        if (br.nextCheckAt && new Date(br.nextCheckAt).getTime() > now.getTime()) {
+          this.logger.log(`[CLAIM] Skipping Job #${cj.id}: Booking #${br.bookingCode} is in backoff until ${br.nextCheckAt}.`);
           return false;
         }
         return true;
@@ -1874,18 +1931,52 @@ export class WorkersService {
         };
       }
 
-      // 3. Fallback: If no explicit bookingJob exists in queue, check for eligible unassigned BookingRequests
-      const pendingBooking = typeof tx.bookingRequest?.findFirst === 'function'
-        ? await tx.bookingRequest.findFirst({
-            where: {
-              status: { in: [BookingStatus.PENDING, BookingStatus.QUEUED, BookingStatus.EXECUTION_QUEUED] },
-              assignedMachineId: null,
-            },
+      // 3. Fallback: If no explicit bookingJob exists in queue, check for eligible unassigned BookingRequests using raw SQL with row-level locking
+      let pendingBookingId: string | null = null;
+      try {
+        const rawCandidates: Array<{ id: string }> = await tx.$queryRaw`
+          SELECT id FROM "BookingRequest"
+          WHERE status IN ('PENDING', 'QUEUED', 'WAITING_FOR_DATE_AVAILABILITY', 'WAITING_FOR_ACCOUNT')
+            AND status NOT IN ('CANCELLED', 'COMPLETED', 'FAILED', 'BOOKING_CONFIRMED', 'SUCCESS')
+            AND "assignedMachineId" IS NULL
+            AND ("nextCheckAt" IS NULL OR "nextCheckAt" <= ${now})
+          ORDER BY "createdAt" ASC
+          LIMIT 1
+          FOR UPDATE SKIP LOCKED;
+        `;
+        if (rawCandidates && rawCandidates.length > 0) {
+          pendingBookingId = rawCandidates[0].id;
+        }
+      } catch (rawErr: any) {
+        this.logger.warn(`[CLAIM] Raw SQL query fallback: ${rawErr.message}`);
+        const candidate = typeof tx.bookingRequest?.findFirst === 'function'
+          ? await tx.bookingRequest.findFirst({
+              where: {
+                status: {
+                  in: eligibleBookingStatuses,
+                  notIn: excludedBookingStatuses,
+                },
+                assignedMachineId: null,
+                OR: [
+                  { nextCheckAt: null },
+                  { nextCheckAt: { lte: now } },
+                ],
+              },
+              orderBy: { createdAt: 'asc' },
+            })
+          : null;
+        if (candidate) {
+          pendingBookingId = candidate.id;
+        }
+      }
+
+      const pendingBooking = pendingBookingId && typeof tx.bookingRequest?.findUnique === 'function'
+        ? await tx.bookingRequest.findUnique({
+            where: { id: pendingBookingId },
             include: {
               pilgrims: true,
               account: true,
             },
-            orderBy: { createdAt: 'asc' },
           })
         : null;
 
@@ -1910,20 +2001,46 @@ export class WorkersService {
           }
         }
 
-        // Create on-demand bookingJob
-        const newJob = await tx.bookingJob.create({
-          data: {
-            jobType: JobType.BOOKING_EXECUTION,
-            bookingRequestId: br.id,
-            accountId: br.accountId || null,
-            workerId: machineId,
-            startedAt: now,
-            heartbeatAt: now,
-            leaseExpiresAt: leaseExpiry,
-            status: BookingStatus.EXECUTING,
-            attempt: 1,
-          },
+        // Re-check backoff on candidate BookingRequest
+        if (br.nextCheckAt && new Date(br.nextCheckAt).getTime() > now.getTime()) {
+          this.logger.log(`[CLAIM] Booking #${br.bookingCode} is in backoff until ${br.nextCheckAt}. Skipping execution.`);
+          return { hasJob: false };
+        }
+
+        // Reuse existing BookingJob or create if none exists (One Job Per Booking)
+        let existingJob = await tx.bookingJob.findFirst({
+          where: { bookingRequestId: br.id },
         });
+
+        let targetJob;
+        if (existingJob) {
+          this.logger.log(`[CLAIM] Reusing existing BookingJob #${existingJob.id} for Booking #${br.bookingCode}. Updating attempt & status.`);
+          targetJob = await tx.bookingJob.update({
+            where: { id: existingJob.id },
+            data: {
+              workerId: machineId,
+              startedAt: now,
+              heartbeatAt: now,
+              leaseExpiresAt: leaseExpiry,
+              status: BookingStatus.EXECUTING,
+              attempt: { increment: 1 },
+            },
+          });
+        } else {
+          targetJob = await tx.bookingJob.create({
+            data: {
+              jobType: JobType.BOOKING_EXECUTION,
+              bookingRequestId: br.id,
+              accountId: br.accountId || null,
+              workerId: machineId,
+              startedAt: now,
+              heartbeatAt: now,
+              leaseExpiresAt: leaseExpiry,
+              status: BookingStatus.EXECUTING,
+              attempt: 1,
+            },
+          });
+        }
 
         // Transition booking status
         if (this.stateMachine) {
@@ -1960,7 +2077,7 @@ export class WorkersService {
           where: { id: machineId },
           data: {
             status: WorkerStatus.BUSY,
-            currentJobId: newJob.id,
+            currentJobId: targetJob.id,
             currentBookingId: br.id,
             currentActiveJobs: { increment: 1 },
             lastJobAt: now,
@@ -1975,7 +2092,7 @@ export class WorkersService {
           hasJob: true,
           jobType: JobType.BOOKING_EXECUTION,
           job: {
-            id: newJob.id,
+            id: targetJob.id,
             bookingRequestId: br.id,
             bookingCode: br.bookingCode,
             requestedDate: dateOnlyStr,
@@ -1997,13 +2114,713 @@ export class WorkersService {
                 }
               : null,
             leaseExpiresAt: leaseExpiry,
-            leaseGeneration: newJob.leaseGeneration,
-            fencingToken: newJob.fencingToken,
+            leaseGeneration: targetJob.leaseGeneration,
+            fencingToken: targetJob.fencingToken,
           },
         };
       }
 
       return { hasJob: false, message: 'No pending jobs in queue' };
+    });
+  }
+
+  /**
+   * Date-First Discovery: Get all unique dates with active pending or waiting bookings
+   */
+  async getPendingDates(): Promise<{ dates: string[] }> {
+    const eligibleBookingStatuses = [
+      BookingStatus.PENDING,
+      BookingStatus.QUEUED,
+      BookingStatus.WAITING_FOR_DATE_AVAILABILITY,
+      BookingStatus.WAITING_FOR_ACCOUNT,
+      BookingStatus.WATCHING,
+    ];
+    const excludedBookingStatuses = [
+      BookingStatus.CANCELLED,
+      BookingStatus.COMPLETED,
+      BookingStatus.FAILED,
+      BookingStatus.SUCCESS,
+      'BOOKING_CONFIRMED' as any,
+    ];
+
+    const pendingBookings = await this.prisma.bookingRequest.findMany({
+      where: {
+        OR: [
+          {
+            status: {
+              in: eligibleBookingStatuses,
+              notIn: excludedBookingStatuses,
+            },
+          },
+          { isWatching: true },
+        ],
+        status: { notIn: excludedBookingStatuses },
+        assignedMachineId: null,
+        AND: [
+          {
+            OR: [
+              { nextCheckAt: null },
+              { nextCheckAt: { lte: new Date() } },
+            ],
+          },
+        ],
+      },
+      select: {
+        requestedDate: true,
+        requestedDateStr: true,
+      },
+    });
+
+    const datesSet = new Set<string>();
+    for (const b of pendingBookings) {
+      const dateStr =
+        b.requestedDateStr ||
+        (b.requestedDate instanceof Date ? b.requestedDate.toISOString().split('T')[0] : String(b.requestedDate).split('T')[0]);
+      if (dateStr && dateStr.trim().length > 0) {
+        datesSet.add(dateStr.trim());
+      }
+    }
+
+    return { dates: Array.from(datesSet).sort() };
+  }
+
+  /**
+   * Cancellation Sniping: Atomically claim oldest pending booking for an available date
+   * using FOR UPDATE SKIP LOCKED to guarantee safe multi-worker concurrency.
+   */
+  async matchPendingBooking(machineId: string, dateInput: string, routeInput?: string) {
+    const machine = await this.prisma.workerMachine.findUnique({
+      where: { id: machineId },
+    });
+
+    if (
+      !machine ||
+      !machine.active ||
+      (machine as any).adminStatus === 'REVOKED' ||
+      (machine as any).adminStatus === 'RETIRED'
+    ) {
+      throw new UnauthorizedException('Worker machine is not approved, active, or credentials have been revoked');
+    }
+
+    if ((machine as any).adminStatus === 'DISABLED') {
+      return {
+        hasJob: false,
+        job: null,
+        stopped: true,
+        desiredState: 'STOPPED',
+        message: 'Worker is administratively disabled. Job claiming prohibited.',
+      };
+    }
+
+    // Capacity enforcement
+    const maxCapacity = (machine as any).maxConcurrentJobs ?? 1;
+    let currentActive = (machine as any).currentActiveJobs ?? 0;
+    if (currentActive >= maxCapacity && this.smartAllocator) {
+      currentActive = await this.smartAllocator.reconcileWorkerCapacity(machineId);
+    }
+    if (currentActive >= maxCapacity) {
+      return {
+        hasJob: false,
+        job: null,
+        message: `Worker is at max concurrency capacity (${currentActive}/${maxCapacity})`,
+      };
+    }
+
+    const targetDateStr = dateInput ? dateInput.trim() : '';
+    if (!targetDateStr) {
+      throw new BadRequestException('Target date is required for cancellation sniping match');
+    }
+
+    const eligibleBookingStatuses = [
+      BookingStatus.PENDING,
+      BookingStatus.QUEUED,
+      BookingStatus.WAITING_FOR_DATE_AVAILABILITY,
+      BookingStatus.WAITING_FOR_ACCOUNT,
+    ];
+    const excludedBookingStatuses = [
+      BookingStatus.CANCELLED,
+      BookingStatus.COMPLETED,
+      BookingStatus.FAILED,
+      BookingStatus.SUCCESS,
+      'BOOKING_CONFIRMED' as any,
+    ];
+
+    const now = new Date();
+    const leaseExpiry = new Date(now.getTime() + 15 * 60 * 1000); // 15-minute lease
+
+    return await this.prisma.$transaction(async (tx) => {
+      let bookingId: string | null = null;
+
+      try {
+        const candidates: Array<{ id: string }> =
+          routeInput && routeInput.trim().length > 0
+            ? await tx.$queryRaw`
+                SELECT id FROM "BookingRequest"
+                WHERE status IN ('PENDING', 'QUEUED', 'WAITING_FOR_DATE_AVAILABILITY', 'WAITING_FOR_ACCOUNT')
+                  AND status NOT IN ('CANCELLED', 'COMPLETED', 'FAILED', 'BOOKING_CONFIRMED', 'SUCCESS')
+                  AND ("requestedDateStr" = ${targetDateStr} OR "requestedDate"::date = ${targetDateStr}::date)
+                  AND "route" = ${routeInput.trim()}
+                  AND "assignedMachineId" IS NULL
+                  AND ("nextCheckAt" IS NULL OR "nextCheckAt" <= ${now})
+                ORDER BY "createdAt" ASC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED;
+              `
+            : await tx.$queryRaw`
+                SELECT id FROM "BookingRequest"
+                WHERE status IN ('PENDING', 'QUEUED', 'WAITING_FOR_DATE_AVAILABILITY', 'WAITING_FOR_ACCOUNT')
+                  AND status NOT IN ('CANCELLED', 'COMPLETED', 'FAILED', 'BOOKING_CONFIRMED', 'SUCCESS')
+                  AND ("requestedDateStr" = ${targetDateStr} OR "requestedDate"::date = ${targetDateStr}::date)
+                  AND "assignedMachineId" IS NULL
+                  AND ("nextCheckAt" IS NULL OR "nextCheckAt" <= ${now})
+                ORDER BY "createdAt" ASC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED;
+              `;
+
+        if (candidates && candidates.length > 0) {
+          bookingId = candidates[0].id;
+        }
+      } catch (rawErr: any) {
+        this.logger.warn(`[SNIPER] Raw SQL FOR UPDATE SKIP LOCKED query fallback: ${rawErr.message}`);
+        const candidate = typeof tx.bookingRequest?.findFirst === 'function'
+          ? await tx.bookingRequest.findFirst({
+              where: {
+                status: { in: eligibleBookingStatuses, notIn: excludedBookingStatuses },
+                OR: [{ requestedDateStr: targetDateStr }, { requestedDate: new Date(targetDateStr) }],
+                assignedMachineId: null,
+                AND: [
+                  {
+                    OR: [
+                      { nextCheckAt: null },
+                      { nextCheckAt: { lte: now } },
+                    ],
+                  },
+                ],
+                ...(routeInput && routeInput.trim().length > 0 ? { route: routeInput.trim() } : {}),
+              },
+              orderBy: { createdAt: 'asc' },
+            })
+          : null;
+        if (candidate) {
+          bookingId = candidate.id;
+        }
+      }
+
+      // STAGE 2: If NO regular customer booking was found, check for a generic "Watchlist" booking
+      if (!bookingId) {
+        try {
+          const watchlistCandidates: Array<{ id: string }> =
+            routeInput && routeInput.trim().length > 0
+              ? await tx.$queryRaw`
+                  SELECT id FROM "BookingRequest"
+                  WHERE (status = 'WATCHING' OR "isWatching" = true)
+                    AND status NOT IN ('CANCELLED', 'COMPLETED', 'FAILED', 'BOOKING_CONFIRMED', 'SUCCESS')
+                    AND ("requestedDateStr" = ${targetDateStr} OR "requestedDate"::date = ${targetDateStr}::date)
+                    AND "route" = ${routeInput.trim()}
+                    AND "assignedMachineId" IS NULL
+                    AND ("nextCheckAt" IS NULL OR "nextCheckAt" <= ${now})
+                  ORDER BY "createdAt" ASC
+                  LIMIT 1
+                  FOR UPDATE SKIP LOCKED;
+                `
+              : await tx.$queryRaw`
+                  SELECT id FROM "BookingRequest"
+                  WHERE (status = 'WATCHING' OR "isWatching" = true)
+                    AND status NOT IN ('CANCELLED', 'COMPLETED', 'FAILED', 'BOOKING_CONFIRMED', 'SUCCESS')
+                    AND ("requestedDateStr" = ${targetDateStr} OR "requestedDate"::date = ${targetDateStr}::date)
+                    AND "assignedMachineId" IS NULL
+                    AND ("nextCheckAt" IS NULL OR "nextCheckAt" <= ${now})
+                  ORDER BY "createdAt" ASC
+                  LIMIT 1
+                  FOR UPDATE SKIP LOCKED;
+                `;
+
+          if (watchlistCandidates && watchlistCandidates.length > 0) {
+            bookingId = watchlistCandidates[0].id;
+            this.logger.log(`[WATCHLIST-SNIPER] 🎯 Matched WATCHLIST booking #${bookingId} for date: ${targetDateStr}!`);
+          }
+        } catch (watchErr: any) {
+          this.logger.warn(`[WATCHLIST-SNIPER] Raw SQL watchlist query fallback: ${watchErr.message}`);
+          const candidate = typeof tx.bookingRequest?.findFirst === 'function'
+            ? await tx.bookingRequest.findFirst({
+                where: {
+                  OR: [{ status: BookingStatus.WATCHING }, { isWatching: true }],
+                  status: { notIn: excludedBookingStatuses },
+                  AND: [
+                    { OR: [{ requestedDateStr: targetDateStr }, { requestedDate: new Date(targetDateStr) }] },
+                    { assignedMachineId: null },
+                    { OR: [{ nextCheckAt: null }, { nextCheckAt: { lte: now } }] },
+                    ...(routeInput && routeInput.trim().length > 0 ? [{ route: routeInput.trim() }] : []),
+                  ],
+                },
+                orderBy: { createdAt: 'asc' },
+              })
+            : null;
+          if (candidate) {
+            bookingId = candidate.id;
+          }
+        }
+      }
+
+      // STAGE 3: If STILL no bookingId (no customer booking and no watchlist booking), Auto-Grab/Reserve slot!
+      if (!bookingId) {
+        this.logger.log(`[AUTO-GRAB] No pending booking or watchlist found for ${targetDateStr}. Engaging Auto-Grab / Reserved Mode to hold slot!`);
+
+        // Find an available verified BookingAccount
+        const verifiedAccounts = typeof tx.bookingAccount?.findMany === 'function'
+          ? await tx.bookingAccount.findMany({
+              where: { status: AccountStatus.VERIFIED },
+              orderBy: { lastVerifiedAt: 'desc' },
+            })
+          : [];
+
+        let chosenAccount: any = null;
+        for (const acc of verifiedAccounts) {
+          const isBusy = this.accountLockService ? await this.accountLockService.isLocked(acc.id) : false;
+          if (!isBusy) {
+            chosenAccount = acc;
+            break;
+          }
+        }
+
+        if (!chosenAccount && verifiedAccounts.length > 0) {
+          chosenAccount = verifiedAccounts[0]; // fallback
+        }
+
+        if (!chosenAccount) {
+          this.logger.warn(`[AUTO-GRAB] Date ${targetDateStr} is available, but no verified BookingAccount is available to reserve the slot.`);
+          return {
+            hasJob: false,
+            job: null,
+            message: `Date ${targetDateStr} is open, but no verified account is available to auto-grab slot`,
+          };
+        }
+
+        // Acquire account lock
+        if (this.accountLockService) {
+          await this.accountLockService.acquireLock(chosenAccount.id, `grab-${Date.now()}`, machineId);
+        }
+
+        const grabBookingCode = `TA-GRAB-${Date.now().toString().slice(-4)}${Math.floor(100 + Math.random() * 900)}`;
+        const autoGrabBooking = await tx.bookingRequest.create({
+          data: {
+            bookingCode: grabBookingCode,
+            userId: chosenAccount.userId,
+            accountId: chosenAccount.id,
+            requestedDate: new Date(targetDateStr),
+            requestedDateStr: targetDateStr,
+            route: routeInput && routeInput.trim().length > 0 ? routeInput.trim() : 'Pamba (Regular Footpath Route)',
+            pilgrimCount: 1,
+            status: BookingStatus.EXECUTING,
+            isWatching: true,
+            isAutoGrab: true,
+            assignedMachineId: machineId,
+            leaseStartedAt: now,
+            leaseExpiresAt: leaseExpiry,
+            nomineeName: 'Temple Seva',
+            nomineeAge: 35,
+            nomineeRelationship: 'Relative',
+            nomineePhone: '9876543210',
+          },
+          include: {
+            account: true,
+            pilgrims: true,
+          },
+        });
+
+        const autoGrabJob = await tx.bookingJob.create({
+          data: {
+            jobType: JobType.BOOKING_EXECUTION,
+            bookingRequestId: autoGrabBooking.id,
+            accountId: chosenAccount.id,
+            workerId: machineId,
+            startedAt: now,
+            heartbeatAt: now,
+            leaseExpiresAt: leaseExpiry,
+            status: BookingStatus.EXECUTING,
+            attempt: 1,
+          },
+        });
+
+        await tx.workerMachine.update({
+          where: { id: machineId },
+          data: {
+            status: WorkerStatus.BUSY,
+            currentJobId: autoGrabJob.id,
+            currentBookingId: autoGrabBooking.id,
+            currentActiveJobs: { increment: 1 },
+            lastJobAt: now,
+            currentActivity: 'PROCESSING_JOB',
+            activityDetails: `Auto-grabbing reserved booking #${grabBookingCode} for ${targetDateStr}`,
+            activityStartedAt: now,
+            lastActivityAt: now,
+          },
+        });
+
+        await this.createActivityLog({
+          workerId: machineId,
+          jobId: autoGrabJob.id,
+          bookingId: autoGrabBooking.id,
+          eventType: 'JOB_CLAIMED',
+          severity: 'INFO',
+          activity: 'PROCESSING_JOB',
+          message: `🎯 [AUTO-GRAB] Sniped and auto-grabbed slot for ${targetDateStr}! Created reserved booking #${grabBookingCode} using account ${chosenAccount.username}`,
+        });
+
+        return {
+          hasJob: true,
+          jobType: JobType.BOOKING_EXECUTION,
+          job: {
+            id: autoGrabJob.id,
+            bookingRequestId: autoGrabBooking.id,
+            bookingCode: grabBookingCode,
+            requestedDate: targetDateStr,
+            route: autoGrabBooking.route,
+            pilgrimCount: 1,
+            timeSlot: autoGrabBooking.timeSlot,
+            selectedTime: autoGrabBooking.selectedTime || undefined,
+            preferences: autoGrabBooking.preferences,
+            pilgrims: [],
+            nominee: {
+              nomineeName: 'Temple Seva',
+              nomineeAge: 35,
+              nomineeRelationship: 'Relative',
+              nomineePhone: '9876543210',
+            },
+            nominees: [
+              {
+                nomineeName: 'Temple Seva',
+                nomineeAge: 35,
+                nomineeRelationship: 'Relative',
+                nomineePhone: '9876543210',
+              },
+            ],
+            account: {
+              id: chosenAccount.id,
+              username: chosenAccount.username,
+              encryptedPassword: chosenAccount.encryptedPassword,
+              encryptionIv: chosenAccount.encryptionIv,
+              encryptionTag: chosenAccount.encryptionTag,
+            },
+            leaseExpiresAt: leaseExpiry,
+            leaseGeneration: autoGrabJob.leaseGeneration,
+            fencingToken: autoGrabJob.fencingToken,
+            verifiedAvailable: true,
+            skipPreflight: true,
+            dispatchSource: 'SNIPER_AUTO_GRAB',
+          },
+        };
+      }
+
+      const br = await tx.bookingRequest.findUnique({
+        where: { id: bookingId },
+        include: {
+          pilgrims: true,
+          account: true,
+        },
+      });
+
+      if (!br) {
+        return { hasJob: false, job: null };
+      }
+
+      // If generic watchlist has no account linked, link an available verified account
+      let account = br.account;
+      if (!account) {
+        const verifiedAccounts = typeof tx.bookingAccount?.findMany === 'function'
+          ? await tx.bookingAccount.findMany({
+              where: { status: AccountStatus.VERIFIED },
+              orderBy: { lastVerifiedAt: 'desc' },
+            })
+          : [];
+        for (const acc of verifiedAccounts) {
+          const isBusy = this.accountLockService ? await this.accountLockService.isLocked(acc.id) : false;
+          if (!isBusy) {
+            account = acc;
+            await tx.bookingRequest.update({
+              where: { id: br.id },
+              data: { accountId: acc.id },
+            });
+            break;
+          }
+        }
+      }
+
+      // Nominee verification: for watchlist items, fill default valid nominee if empty
+      let nomineeCheck = validateNominee(br);
+      if (!nomineeCheck.valid) {
+        if (br.isWatching || (br.status as any) === 'WATCHING') {
+          await tx.bookingRequest.update({
+            where: { id: br.id },
+            data: {
+              nomineeName: 'Temple Seva',
+              nomineeAge: 35,
+              nomineeRelationship: 'Relative',
+              nomineePhone: '9876543210',
+            },
+          });
+          nomineeCheck = {
+            valid: true,
+            errors: [],
+            resolvedNominee: {
+              nomineeName: 'Temple Seva',
+              nomineeAge: 35,
+              nomineeRelationship: 'Relative',
+              nomineePhone: '9876543210',
+            },
+          };
+        } else {
+          this.logger.warn(`[SNIPER] Candidate #${br.id} has invalid nominee: ${nomineeCheck.errors.join('; ')}`);
+          await tx.bookingRequest.update({
+            where: { id: br.id },
+            data: {
+              status: BookingStatus.HOLD_INVALID_NOMINEE,
+              requiresHumanNote: `HOLD_INVALID_NOMINEE: ${nomineeCheck.errors.join('; ')}`,
+            },
+          });
+          return { hasJob: false, job: null, message: 'Invalid nominee on candidate booking' };
+        }
+      }
+
+      // Check account lock
+      if (account?.id && this.accountLockService) {
+        const lockAcquired = await this.accountLockService.acquireLock(account.id, br.id, machineId);
+        if (!lockAcquired) {
+          this.logger.warn(`[SNIPER] Candidate #${br.bookingCode} skipped: Account (${account.username}) is locked by another job.`);
+          return { hasJob: false, job: null, message: 'Account locked' };
+        }
+      }
+
+      // Find or create BookingJob (One Job Per Booking)
+      let job = await tx.bookingJob.findFirst({
+        where: { bookingRequestId: br.id },
+      });
+
+      if (job) {
+        job = await tx.bookingJob.update({
+          where: { id: job.id },
+          data: {
+            workerId: machineId,
+            startedAt: now,
+            heartbeatAt: now,
+            leaseExpiresAt: leaseExpiry,
+            status: BookingStatus.EXECUTING,
+            attempt: { increment: 1 },
+          },
+        });
+      } else {
+        job = await tx.bookingJob.create({
+          data: {
+            jobType: JobType.BOOKING_EXECUTION,
+            bookingRequestId: br.id,
+            accountId: account?.id || br.accountId || null,
+            workerId: machineId,
+            startedAt: now,
+            heartbeatAt: now,
+            leaseExpiresAt: leaseExpiry,
+            status: BookingStatus.EXECUTING,
+            attempt: 1,
+          },
+        });
+      }
+
+      // Transition booking state
+      if (this.stateMachine) {
+        if (
+          br.status === BookingStatus.PENDING ||
+          br.status === BookingStatus.WAITING_FOR_ACCOUNT ||
+          (br.status as any) === 'WATCHING' ||
+          br.status === BookingStatus.WAITING_FOR_DATE_AVAILABILITY
+        ) {
+          if ((br.status as any) === 'WATCHING') {
+            await this.stateMachine.transition(
+              {
+                bookingId: br.id,
+                targetStatus: BookingStatus.PENDING,
+                milestone: 'WATCHLIST_CONVERTED_TO_PENDING',
+                operator: `Worker:${machineId}`,
+              },
+              tx
+            ).catch(() => {});
+          }
+
+          await this.stateMachine.transition(
+            {
+              bookingId: br.id,
+              targetStatus: BookingStatus.QUEUED,
+              milestone: 'PRE_SNIPE_QUEUED',
+              operator: `Worker:${machineId}`,
+            },
+            tx
+          ).catch(() => {});
+        }
+        await this.stateMachine.transition(
+          {
+            bookingId: br.id,
+            targetStatus: BookingStatus.EXECUTING,
+            milestone: 'SNIPED_BY_WORKER',
+            operator: `Worker:${machineId}`,
+            workerId: machineId,
+          },
+          tx
+        ).catch(() => {});
+      } else {
+        await tx.bookingRequest.update({
+          where: { id: br.id },
+          data: {
+            status: BookingStatus.EXECUTING,
+            assignedMachineId: machineId,
+            leaseStartedAt: now,
+            leaseExpiresAt: leaseExpiry,
+          },
+        });
+      }
+
+      const dateOnlyStr =
+        br.requestedDateStr ||
+        (br.requestedDate instanceof Date ? br.requestedDate.toISOString().split('T')[0] : String(br.requestedDate).split('T')[0]);
+
+      // Update worker machine
+      await tx.workerMachine.update({
+        where: { id: machineId },
+        data: {
+          status: WorkerStatus.BUSY,
+          currentJobId: job.id,
+          currentBookingId: br.id,
+          currentActiveJobs: { increment: 1 },
+          lastJobAt: now,
+          currentActivity: 'PROCESSING_JOB',
+          activityDetails: `[SNIPER] Executing sniped booking #${br.bookingCode} for ${dateOnlyStr}`,
+          activityStartedAt: now,
+          lastActivityAt: now,
+        },
+      });
+
+      await this.createActivityLog({
+        workerId: machineId,
+        jobId: job.id,
+        bookingId: br.id,
+        eventType: 'JOB_CLAIMED',
+        severity: 'INFO',
+        activity: 'PROCESSING_JOB',
+        message: `Cancellation sniper claimed booking #${br.bookingCode} for ${dateOnlyStr}`,
+      });
+
+      this.logger.log(`[SNIPER] 🎯 Worker ${machine.machineCode} claimed oldest pending booking #${br.bookingCode} for date ${dateOnlyStr}`);
+
+      return {
+        hasJob: true,
+        jobType: JobType.BOOKING_EXECUTION,
+        job: {
+          id: job.id,
+          bookingRequestId: br.id,
+          bookingCode: br.bookingCode,
+          requestedDate: dateOnlyStr,
+          route: br.route,
+          pilgrimCount: br.pilgrimCount,
+          timeSlot: br.timeSlot,
+          selectedTime: br.selectedTime || undefined,
+          preferences: br.preferences,
+          pilgrims: br.pilgrims,
+          nominee: nomineeCheck.resolvedNominee,
+          nominees: (br.preferences as any)?.nominees || (nomineeCheck.resolvedNominee ? [nomineeCheck.resolvedNominee] : []),
+          account: account
+            ? {
+                id: account.id,
+                username: account.username,
+                encryptedPassword: account.encryptedPassword,
+                encryptionIv: account.encryptionIv,
+                encryptionTag: account.encryptionTag,
+              }
+            : null,
+          leaseExpiresAt: leaseExpiry,
+          leaseGeneration: job.leaseGeneration,
+          fencingToken: job.fencingToken,
+          verifiedAvailable: true,
+          skipPreflight: true,
+          dispatchSource: (br.isWatching || (br.status as any) === 'WATCHING') ? 'SNIPER_WATCHLIST' : 'SNIPER_PENDING',
+        },
+      };
+    });
+  }
+
+  /**
+   * Watchlist / Auto-Grab: Admin adds a date to the active watchlist for auto-sniping
+   */
+  async createWatchlistEntry(dateStr: string, routeStr?: string) {
+    const cleanDate = dateStr.trim();
+    const cleanRoute = routeStr?.trim() || 'Pamba (Regular Footpath Route)';
+
+    // Check if an entry already exists for this date
+    const existing = await this.prisma.bookingRequest.findFirst({
+      where: {
+        AND: [
+          { OR: [{ requestedDateStr: cleanDate }, { requestedDate: new Date(cleanDate) }] },
+          { OR: [{ status: BookingStatus.WATCHING }, { isWatching: true }] },
+        ],
+      },
+    });
+
+    if (existing) {
+      return { message: `Date ${cleanDate} is already on the active Watchlist`, watchlist: existing };
+    }
+
+    const adminUser =
+      (await this.prisma.user.findFirst({ where: { role: 'SUPER_ADMIN' } })) ||
+      (await this.prisma.user.findFirst());
+
+    if (!adminUser) {
+      throw new BadRequestException('No admin or system user found to anchor Watchlist entry');
+    }
+
+    const bookingCode = `TA-WATCH-${Math.floor(10000 + Math.random() * 90000)}`;
+    const watchBooking = await this.prisma.bookingRequest.create({
+      data: {
+        bookingCode,
+        userId: adminUser.id,
+        requestedDate: new Date(cleanDate),
+        requestedDateStr: cleanDate,
+        route: cleanRoute,
+        pilgrimCount: 1,
+        status: BookingStatus.WATCHING,
+        isWatching: true,
+        nomineeName: 'Temple Seva',
+        nomineeAge: 35,
+        nomineeRelationship: 'Relative',
+        nomineePhone: '9876543210',
+      },
+    });
+
+    this.logger.log(`[WATCHLIST] 👁️ Added date ${cleanDate} (${cleanRoute}) to active Watchlist: #${bookingCode}`);
+
+    return {
+      message: `Successfully added ${cleanDate} (${cleanRoute}) to the active Auto-Grab Watchlist!`,
+      watchlist: watchBooking,
+    };
+  }
+
+  /**
+   * Watchlist: Get all active watchlist dates
+   */
+  async getWatchlist() {
+    return this.prisma.bookingRequest.findMany({
+      where: {
+        OR: [{ status: BookingStatus.WATCHING }, { isWatching: true }],
+        status: { notIn: [BookingStatus.CANCELLED, BookingStatus.COMPLETED, BookingStatus.FAILED, BookingStatus.SUCCESS] },
+      },
+      select: {
+        id: true,
+        bookingCode: true,
+        requestedDateStr: true,
+        requestedDate: true,
+        route: true,
+        status: true,
+        isWatching: true,
+        isAutoGrab: true,
+        createdAt: true,
+      },
+      orderBy: { requestedDate: 'asc' },
     });
   }
 
@@ -2547,6 +3364,25 @@ export class WorkersService {
       );
     }
 
+    // Backoff on BookingRequest: Update BookingRequest.nextCheckAt = NOW() + 5 minutes whenever failJob is called
+    if (job.bookingRequestId) {
+      const fiveMinutesFromNow = new Date(Date.now() + 5 * 60 * 1000);
+      try {
+        await this.prisma.bookingRequest.update({
+          where: { id: job.bookingRequestId },
+          data: {
+            nextCheckAt: fiveMinutesFromNow,
+            lastCheckedAt: new Date(),
+            checkCount: { increment: 1 },
+            assignedMachineId: null,
+            leaseExpiresAt: null,
+          },
+        });
+      } catch (err: any) {
+        this.logger.warn(`Failed setting 5m backoff on BookingRequest #${job.bookingRequestId}: ${err?.message}`);
+      }
+    }
+
     // Check if slot loss or date unavailable -> transition to PENDING
     if (
       (dto.status === BookingStatus.TEMPORARY_SLOT_LOST ||
@@ -2578,6 +3414,25 @@ export class WorkersService {
         completedAt: new Date(),
       },
     });
+
+    // Backoff logic: Ensure any failed booking gets 5-minute backoff so the worker doesn't loop on it
+    if (job.bookingRequestId) {
+      const fiveMinutesFromNow = new Date(Date.now() + 5 * 60 * 1000);
+      try {
+        await this.prisma.bookingRequest.update({
+          where: { id: job.bookingRequestId },
+          data: {
+            nextCheckAt: fiveMinutesFromNow,
+            lastCheckedAt: new Date(),
+            checkCount: { increment: 1 },
+            assignedMachineId: null,
+            leaseExpiresAt: null,
+          },
+        });
+      } catch {
+        // safe fallback
+      }
+    }
 
     // Specific Handling for Official Portal PREVIOUS_BOOKING_RESTRICTION
     const isPreviousBookingRestricted =

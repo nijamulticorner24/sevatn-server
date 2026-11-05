@@ -79,7 +79,7 @@ export class BookingsService {
       }
     }
 
-    // 2. Mandatory Nominee Validation (Required for Pilgrim Insurance)
+    // 2. Nominee Details (Optional in backend; validate if provided)
     const resolvedNominee = (dto.nominees && dto.nominees[0]) || dto.nominee || (dto.nomineeName ? {
       nomineeName: dto.nomineeName,
       nomineeAge: dto.nomineeAge,
@@ -92,27 +92,32 @@ export class BookingsService {
       nomineePhone: dto.pilgrims[0].nomineePhone,
     } : null);
 
-    if (!resolvedNominee || !resolvedNominee.nomineeName || resolvedNominee.nomineeName.trim().length < 2) {
-      throw new BadRequestException('Nominee name is required for pilgrim insurance.');
-    }
-    if (!resolvedNominee.nomineeAge || typeof resolvedNominee.nomineeAge !== 'number' || resolvedNominee.nomineeAge < 18 || resolvedNominee.nomineeAge > 120) {
-      throw new BadRequestException('Nominee must be an adult with a valid age (minimum 18 years).');
-    }
-    if (!resolvedNominee.nomineeRelationship || resolvedNominee.nomineeRelationship.trim().length < 2) {
-      throw new BadRequestException('Nominee relationship is required.');
+    // If nominee was provided with a non-empty name, validate required format
+    if (resolvedNominee && resolvedNominee.nomineeName && resolvedNominee.nomineeName.trim().length > 0) {
+      if (resolvedNominee.nomineeName.trim().length < 2) {
+        throw new BadRequestException('Nominee name must be at least 2 characters long.');
+      }
+      if (!resolvedNominee.nomineeAge || typeof resolvedNominee.nomineeAge !== 'number' || resolvedNominee.nomineeAge < 18 || resolvedNominee.nomineeAge > 120) {
+        throw new BadRequestException('Nominee must be an adult with a valid age (minimum 18 years).');
+      }
+      if (!resolvedNominee.nomineeRelationship || resolvedNominee.nomineeRelationship.trim().length < 2) {
+        throw new BadRequestException('Nominee relationship is required.');
+      }
     }
 
     if (dto.nominees && Array.isArray(dto.nominees)) {
       for (let i = 0; i < dto.nominees.length; i++) {
         const n = dto.nominees[i];
-        if (!n.nomineeName || n.nomineeName.trim().length < 2) {
-          throw new BadRequestException(`Nominee #${i + 1}: Name is required.`);
-        }
-        if (!n.nomineeAge || typeof n.nomineeAge !== 'number' || n.nomineeAge < 18 || n.nomineeAge > 120) {
-          throw new BadRequestException(`Nominee #${i + 1}: Must be an adult (minimum 18 years).`);
-        }
-        if (!n.nomineeRelationship || n.nomineeRelationship.trim().length < 2) {
-          throw new BadRequestException(`Nominee #${i + 1}: Relationship is required.`);
+        if (n && n.nomineeName && n.nomineeName.trim().length > 0) {
+          if (n.nomineeName.trim().length < 2) {
+            throw new BadRequestException(`Nominee #${i + 1}: Name must be at least 2 characters.`);
+          }
+          if (!n.nomineeAge || typeof n.nomineeAge !== 'number' || n.nomineeAge < 18 || n.nomineeAge > 120) {
+            throw new BadRequestException(`Nominee #${i + 1}: Must be an adult (minimum 18 years).`);
+          }
+          if (!n.nomineeRelationship || n.nomineeRelationship.trim().length < 2) {
+            throw new BadRequestException(`Nominee #${i + 1}: Relationship is required.`);
+          }
         }
       }
     }
@@ -202,7 +207,14 @@ export class BookingsService {
     const config = await this.prisma.systemConfig.findUnique({
       where: { id: 'default' },
     });
-    const feeAmount = Number(config?.serviceFee ?? 20);
+    const baseServiceFee = Number(config?.serviceFee ?? 20);
+
+    const rawPilgrimCount = Number(dto.pilgrimCount) || (dto.pilgrims && dto.pilgrims.length > 0 ? dto.pilgrims.length : 1);
+    if (rawPilgrimCount > 10) {
+      throw new BadRequestException('Sabarimala portal allows a maximum of 10 pilgrims per booking.');
+    }
+    const pilgrimCount = Math.max(1, rawPilgrimCount);
+    const feeAmount = baseServiceFee * pilgrimCount;
 
     const result = await this.prisma.$transaction(async (tx) => {
       // 1. Verify and reserve funds from wallet (Super Admin auto-funded/exempted)
@@ -229,7 +241,7 @@ export class BookingsService {
 
       if (!wallet || Number(wallet.availableBalance) < feeAmount) {
         throw new BadRequestException(
-          `Insufficient wallet balance. Required: ₹${feeAmount}, Available: ₹${wallet?.availableBalance || 0}`,
+          `Insufficient wallet balance. Required: ₹${feeAmount} (₹${baseServiceFee} × ${pilgrimCount} pilgrim${pilgrimCount > 1 ? 's' : ''}), Available: ₹${wallet?.availableBalance || 0}`,
         );
       }
 
@@ -318,13 +330,13 @@ export class BookingsService {
           requestedDate: canonicalDate,
           requestedDateStr: rawDateStr,
           route: dto.route,
-          pilgrimCount: (dto.pilgrims && dto.pilgrims.length > 0) ? dto.pilgrims.length : 1,
+          pilgrimCount,
           timeSlot: dto.timeSlot || 'Any Slot',
           selectedTime: matchedTimeSlot || undefined,
-          nomineeName: resolvedNominee.nomineeName.trim(),
-          nomineeAge: resolvedNominee.nomineeAge,
-          nomineeRelationship: resolvedNominee.nomineeRelationship.trim(),
-          nomineePhone: resolvedNominee.nomineePhone?.trim() || null,
+          nomineeName: resolvedNominee?.nomineeName ? resolvedNominee.nomineeName.trim() : null,
+          nomineeAge: resolvedNominee?.nomineeAge ? Number(resolvedNominee.nomineeAge) : null,
+          nomineeRelationship: resolvedNominee?.nomineeRelationship ? resolvedNominee.nomineeRelationship.trim() : null,
+          nomineePhone: resolvedNominee?.nomineePhone ? resolvedNominee.nomineePhone.trim() : null,
           preferences: {
             ...(dto.preferences || {}),
             nominees: dto.nominees || (resolvedNominee ? [resolvedNominee] : []),
@@ -340,10 +352,10 @@ export class BookingsService {
               idType: p.idType.toUpperCase(),
               idNumber: p.idNumber.trim(),
               photoUrl: p.photoUrl || null,
-              nomineeName: (p.nomineeName || resolvedNominee.nomineeName).trim(),
-              nomineeAge: p.nomineeAge || resolvedNominee.nomineeAge,
-              nomineeRelationship: (p.nomineeRelationship || resolvedNominee.nomineeRelationship).trim(),
-              nomineePhone: p.nomineePhone?.trim() || resolvedNominee.nomineePhone?.trim() || null,
+              nomineeName: (p.nomineeName || resolvedNominee?.nomineeName || null)?.trim() || null,
+              nomineeAge: p.nomineeAge || resolvedNominee?.nomineeAge || null,
+              nomineeRelationship: (p.nomineeRelationship || resolvedNominee?.nomineeRelationship || null)?.trim() || null,
+              nomineePhone: p.nomineePhone?.trim() || resolvedNominee?.nomineePhone?.trim() || null,
             })),
           } : undefined,
         } as any,

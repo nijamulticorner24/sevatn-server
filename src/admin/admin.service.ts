@@ -409,6 +409,100 @@ export class AdminService {
     };
   }
 
+  async purgeAllBookings(adminUser: any) {
+    this.logger.warn(`[PURGE] Admin ${adminUser?.email || adminUser?.id || 'SUPER_ADMIN'} initiated complete database booking purge.`);
+
+    // 1. Release held wallet funds for any active/pending bookings
+    const activeRequests = await this.prisma.bookingRequest.findMany({
+      where: {
+        status: {
+          notIn: [BookingStatus.SUCCESS, BookingStatus.CANCELLED, BookingStatus.FAILED, BookingStatus.COMPLETED],
+        },
+      },
+      select: { id: true, userId: true },
+    });
+
+    let releasedHoldsCount = 0;
+    for (const b of activeRequests) {
+      try {
+        const wallet = await this.prisma.wallet.findUnique({ where: { userId: b.userId } });
+        if (wallet && Number(wallet.reservedBalance) > 0) {
+          const holdToRelease = Math.min(Number(wallet.reservedBalance), 100);
+          await this.prisma.wallet.update({
+            where: { id: wallet.id },
+            data: {
+              availableBalance: { increment: holdToRelease },
+              reservedBalance: { decrement: holdToRelease },
+            },
+          });
+          releasedHoldsCount++;
+        }
+      } catch (err: any) {
+        this.logger.warn(`Could not release wallet hold for booking ${b.id}: ${err.message}`);
+      }
+    }
+
+    // 2. Reset all worker machines
+    const workers = await this.prisma.workerMachine.findMany();
+    const now = Date.now();
+    for (const worker of workers) {
+      const isOnline = worker.active && worker.lastHeartbeat && (now - new Date(worker.lastHeartbeat).getTime() < 60000);
+      await this.prisma.workerMachine.update({
+        where: { id: worker.id },
+        data: {
+          currentBookingId: null,
+          currentJobId: null,
+          currentActiveJobs: 0,
+          currentActivity: 'IDLE',
+          activityDetails: 'Idle',
+          status: isOnline ? WorkerStatus.ONLINE : WorkerStatus.IDLE,
+        },
+      });
+    }
+
+    // 3. Delete locks & logs
+    const clearedLocks = await this.prisma.accountLock.deleteMany({});
+    await this.prisma.jobAllocationLog.deleteMany({});
+    await this.prisma.workerActivityLog.deleteMany({});
+
+    // 4. Reset opportunities
+    await this.prisma.availabilityOpportunity.updateMany({
+      data: { matchedBookingId: null },
+    });
+
+    // 5. Delete dependent booking records
+    await this.prisma.bookingReconciliation.deleteMany({});
+    await this.prisma.bookingMilestone.deleteMany({});
+    await this.prisma.bookingAttempt.deleteMany({});
+    const deletedJobs = await this.prisma.bookingJob.deleteMany({});
+    const deletedPilgrims = await this.prisma.bookingPilgrim.deleteMany({});
+
+    // 6. Unlink wallet transactions and ledger entries
+    await this.prisma.walletTransaction.updateMany({
+      where: { bookingId: { not: null } },
+      data: { bookingId: null },
+    });
+    await this.prisma.walletLedgerEntry.updateMany({
+      where: { bookingId: { not: null } },
+      data: { bookingId: null },
+    });
+
+    // 7. Delete all BookingRequests
+    const deletedBookings = await this.prisma.bookingRequest.deleteMany({});
+
+    this.logger.log(`[PURGE] Purged ${deletedBookings.count} bookings, ${deletedJobs.count} jobs, ${deletedPilgrims.count} pilgrims.`);
+
+    return {
+      message: 'All bookings and associated jobs have been permanently purged from the database.',
+      deletedBookings: deletedBookings.count,
+      deletedJobs: deletedJobs.count,
+      deletedPilgrims: deletedPilgrims.count,
+      releasedHolds: releasedHoldsCount,
+      resetWorkers: workers.length,
+      clearedLocks: clearedLocks.count,
+    };
+  }
+
   async getAdminBookings(query: { status?: BookingStatus; page?: number; limit?: number; search?: string }) {
     const page = Number(query.page) || 1;
     const limit = Number(query.limit) || 50;

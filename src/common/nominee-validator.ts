@@ -17,16 +17,19 @@ export interface NomineeValidationResult {
  * 3. Legitimate relationship (>= 2 characters, e.g. Father, Mother, Spouse, Brother, etc.)
  * 4. Pilgrim-to-nominee association
  */
-export function validateNominee(bookingOrDto: {
-  nominee?: any;
-  nominees?: any[];
-  nomineeName?: string;
-  nomineeAge?: number;
-  nomineeRelationship?: string;
-  nomineePhone?: string;
-  pilgrims?: any[];
-  preferences?: any;
-}): NomineeValidationResult {
+export function validateNominee(
+  bookingOrDto: {
+    nominee?: any;
+    nominees?: any[];
+    nomineeName?: string | null;
+    nomineeAge?: number | null;
+    nomineeRelationship?: string | null;
+    nomineePhone?: string | null;
+    pilgrims?: any[];
+    preferences?: any;
+  },
+  options: { allowOptional?: boolean } = { allowOptional: true },
+): NomineeValidationResult {
   const errors: string[] = [];
 
   // Extract resolved primary nominee
@@ -34,7 +37,7 @@ export function validateNominee(bookingOrDto: {
     bookingOrDto.nominee ||
     (Array.isArray(bookingOrDto.nominees) && bookingOrDto.nominees[0]) ||
     (Array.isArray(bookingOrDto.preferences?.nominees) && bookingOrDto.preferences.nominees[0]) ||
-    (bookingOrDto.nomineeName
+    (bookingOrDto.nomineeName !== undefined && bookingOrDto.nomineeName !== null
       ? {
           nomineeName: bookingOrDto.nomineeName,
           nomineeAge: bookingOrDto.nomineeAge,
@@ -53,11 +56,18 @@ export function validateNominee(bookingOrDto: {
       : null);
 
   if (!primaryNominee) {
+    if (options.allowOptional) {
+      return { valid: true, errors: [], resolvedNominee: undefined };
+    }
     errors.push('Mandatory nominee information is missing for this booking.');
     return { valid: false, errors };
   }
 
   const name = primaryNominee.nomineeName?.trim();
+  if (!name && !primaryNominee.nomineeAge && !primaryNominee.nomineeRelationship && options.allowOptional) {
+    return { valid: true, errors: [], resolvedNominee: undefined };
+  }
+
   if (!name || name.length < 2) {
     errors.push('Nominee name must be at least 2 characters long.');
   }

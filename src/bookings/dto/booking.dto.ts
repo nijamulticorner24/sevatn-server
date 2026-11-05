@@ -112,6 +112,11 @@ export class CreateBookingDto {
   route: string; // e.g. Pamba (Regular Footpath Route)
 
   @IsOptional()
+  @IsInt()
+  @Min(1)
+  pilgrimCount?: number;
+
+  @IsOptional()
   @IsString()
   timeSlot?: string;
 

@@ -454,6 +454,9 @@ export class SmartMatcherService {
       await this.accountLockService.releaseLock(booking.accountId, booking.id);
     }
 
+    // Backoff logic: Enforce 5-minute backoff so the worker doesn't immediately re-poll
+    const nextCheckAt = new Date(Date.now() + 5 * 60 * 1000);
+
     // Reset BookingRequest to PENDING (requestedDate stays intact!) via State Machine
     if (this.stateMachine) {
       try {
@@ -486,6 +489,20 @@ export class SmartMatcherService {
           failureReason: reason || 'Temporary slot unavailable on portal; returned to pending queue',
         },
       });
+    }
+
+    // Apply backoff timestamp and increment attempt/check count
+    try {
+      await this.prisma.bookingRequest.update({
+        where: { id: bookingId },
+        data: {
+          nextCheckAt,
+          lastCheckedAt: new Date(),
+          checkCount: { increment: 1 },
+        },
+      });
+    } catch {
+      // safe fallback
     }
 
     // Reset BookingJob

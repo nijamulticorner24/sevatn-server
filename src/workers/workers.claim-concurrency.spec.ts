@@ -71,7 +71,11 @@ describe('WorkersService Concurrency & Financial Quarantine Invariants', () => {
         findFirst: jest.fn().mockImplementation(({ where }) => {
           const found = mockBookingJobs.find(j => {
             if (where.jobType && j.jobType !== where.jobType) return false;
-            if (where.status && j.status !== where.status) return false;
+            if (where.status) {
+              if (where.status.in && !where.status.in.includes(j.status)) return false;
+              if (where.status.notIn && where.status.notIn.includes(j.status)) return false;
+              if (typeof where.status === 'string' && j.status !== where.status) return false;
+            }
             if (where.OR) {
               const matchesOr = where.OR.some((clause: any) => {
                 if (clause.status?.in) return clause.status.in.includes(j.status);
@@ -87,7 +91,11 @@ describe('WorkersService Concurrency & Financial Quarantine Invariants', () => {
         findMany: jest.fn().mockImplementation(({ where }) => {
           const list = mockBookingJobs.filter(j => {
             if (where.jobType && j.jobType !== where.jobType) return false;
-            if (where.status && j.status !== where.status) return false;
+            if (where.status) {
+              if (where.status.in && !where.status.in.includes(j.status)) return false;
+              if (where.status.notIn && where.status.notIn.includes(j.status)) return false;
+              if (typeof where.status === 'string' && j.status !== where.status) return false;
+            }
             if (where.OR) {
               const matchesOr = where.OR.some((clause: any) => {
                 if (clause.status?.in) return clause.status.in.includes(j.status);

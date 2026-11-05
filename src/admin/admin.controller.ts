@@ -48,6 +48,12 @@ export class AdminController {
     return this.adminService.clearAllQueues(user);
   }
 
+  @Post('bookings/purge-all')
+  @Roles(Role.SUPER_ADMIN, Role.CENTRE)
+  async purgeAllBookings(@CurrentUser() user: any) {
+    return this.adminService.purgeAllBookings(user);
+  }
+
   @Get('bookings')
   async getAdminBookings(
     @Query('status') status?: BookingStatus,

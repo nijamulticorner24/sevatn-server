@@ -69,7 +69,7 @@ async function main() {
   console.log('🔑 Login Credentials (all use same password):');
   console.log('   Password : Admin@123456');
   console.log('   ─────────────────────────────────────────────');
-  console.log('   Super Admin : superadmin@ticketassist.in');
+  console.log('   Super Admin :   ');
   console.log('   Demo User   : demo@gmail.com');
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 }

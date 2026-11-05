@@ -66,6 +66,7 @@ describe('BookingsService - Booking Readiness & Queue Protection', () => {
           nomineeName: data.nomineeName,
           nomineeAge: data.nomineeAge,
           nomineeRelationship: data.nomineeRelationship,
+          pilgrimCount: data.pilgrimCount,
         })),
       },
       bookingPilgrim: {
@@ -200,17 +201,38 @@ describe('BookingsService - Booking Readiness & Queue Protection', () => {
       expect(mockPrisma.bookingRequest.create).not.toHaveBeenCalled();
     });
 
-    it('TEST 5: Rejects booking when nominee details are missing', async () => {
+    it('TEST 5: Accepts booking when nominee details are missing (optional in backend)', async () => {
       const dto: any = {
         ...validDto,
         nominee: undefined,
         nomineeName: undefined,
+        nominees: undefined,
       };
 
-      await expect(bookingsService.createBooking('user-1', dto)).rejects.toThrow(
-        new BadRequestException('Nominee name is required for pilgrim insurance.'),
+      const result = await bookingsService.createBooking('user-1', dto);
+      expect(result).toBeDefined();
+      expect(result.bookingCode).toBe('TA-10101');
+      expect(result.nomineeName).toBeNull();
+      expect(mockPrisma.bookingRequest.create).toHaveBeenCalled();
+    });
+
+    it('TEST 5B: Calculates pricing based on serviceFee * pilgrimCount and enforces max 10 pilgrims', async () => {
+      // 2 pilgrims = ₹40 fee
+      const dto2: any = {
+        ...validDto,
+        pilgrimCount: 2,
+      };
+      const result2 = await bookingsService.createBooking('user-1', dto2);
+      expect(result2.pilgrimCount).toBe(2);
+
+      // 11 pilgrims = rejects with max 10 error
+      const dto11: any = {
+        ...validDto,
+        pilgrimCount: 11,
+      };
+      await expect(bookingsService.createBooking('user-1', dto11)).rejects.toThrow(
+        new BadRequestException('Sabarimala portal allows a maximum of 10 pilgrims per booking.'),
       );
-      expect(mockPrisma.bookingRequest.create).not.toHaveBeenCalled();
     });
 
     it('TEST 6: Rejects booking when nominee is underage (< 18)', async () => {
