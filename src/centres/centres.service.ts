@@ -3,9 +3,12 @@ import {
   NotFoundException,
   ConflictException,
   BadRequestException,
+  ForbiddenException,
+  Optional,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
+import { EventsGateway } from '../events/events.gateway';
 import { CreateCentreDto, UpdateCentreDto } from './dto/centre.dto';
 import { Role, UserStatus, CentreStatus, Prisma } from '@prisma/client';
 import { isValidCoordinate } from '../common/utils/geo';
@@ -16,6 +19,7 @@ export class CentresService {
   constructor(
     private prisma: PrismaService,
     private audit: AuditService,
+    @Optional() private readonly eventsGateway?: EventsGateway,
   ) {}
 
   async getMyCentre(userId: string) {
@@ -128,9 +132,41 @@ export class CentresService {
     };
   }
 
-  async createCentre(adminUser: any, dto: CreateCentreDto) {
+  async createCentre(actorUser: any, dto: CreateCentreDto) {
     const cleanEmail = dto.email.toLowerCase().trim();
     const cleanMobile = dto.mobile.trim();
+
+    // 0. Resolve partnerId & distributorId based on actor role
+    let partnerId: string | null = null;
+    let distributorId: string | null = null;
+
+    if (actorUser.role === Role.DISTRIBUTOR) {
+      const distProfile = await this.prisma.distributor.findFirst({
+        where: { OR: [{ userId: actorUser.id }, { id: actorUser.distributorId }] },
+      });
+      if (!distProfile || distProfile.status !== 'ACTIVE') {
+        throw new ForbiddenException('Only active Distributors can create Centre accounts.');
+      }
+      distributorId = distProfile.id;
+      partnerId = distProfile.partnerId;
+    } else if (actorUser.role === Role.PARTNER) {
+      const partnerProfile = await this.prisma.partner.findFirst({
+        where: { OR: [{ userId: actorUser.id }, { id: actorUser.partnerId }] },
+      });
+      if (!partnerProfile || partnerProfile.status !== 'ACTIVE') {
+        throw new ForbiddenException('Only active Partners can create Centre accounts.');
+      }
+      partnerId = partnerProfile.id;
+      if (dto.distributorId) {
+        const dist = await this.prisma.distributor.findFirst({
+          where: { id: dto.distributorId, partnerId: partnerProfile.id },
+        });
+        if (dist) distributorId = dist.id;
+      }
+    } else if (actorUser.role === Role.SUPER_ADMIN) {
+      partnerId = dto.partnerId || null;
+      distributorId = dto.distributorId || null;
+    }
 
     // 1. Verify User uniqueness (Email / Mobile)
     const existingUser = await this.prisma.user.findFirst({
@@ -187,6 +223,8 @@ export class CentresService {
           passwordHash,
           role: Role.CENTRE, // FORCED strictly to CENTRE role
           status: userInitialStatus,
+          partnerId,
+          distributorId,
           registrationDate,
           expiryDate,
           mustChangePassword: true, // First-login password change required
@@ -196,6 +234,7 @@ export class CentresService {
       const centre = await tx.centre.create({
         data: {
           userId: user.id,
+          distributorId,
           centreName: dto.centreName.trim(),
           centreCode,
           address: dto.address?.trim() || `${dto.taluk}, ${dto.district}`,
@@ -204,7 +243,7 @@ export class CentresService {
           pincode: dto.pincode?.trim() || null,
           feePaid: true,
           registrationFee: new Prisma.Decimal(249),
-          feeTransactionId: `ADMIN-ONBOARDING-${Date.now()}`,
+          feeTransactionId: `${actorUser.role}-ONBOARDING-${Date.now()}`,
           status: initialStatus,
         },
       });
@@ -244,10 +283,28 @@ export class CentresService {
       return { user, centre, wallet };
     });
 
-    // 6. Record Audit Event (Never log passwords!)
+    // 6. Broadcast Real-time WebSocket activation
+    if (this.eventsGateway) {
+      this.eventsGateway.notifyCentreActivated(partnerId || undefined, {
+        centreCode: result.centre.centreCode || '',
+        centreName: result.centre.centreName,
+        district: result.centre.district,
+        taluk: result.centre.taluk,
+        timestamp: new Date().toISOString(),
+      });
+      this.eventsGateway.emitToAdmins('centre:activated', {
+        centreCode: result.centre.centreCode || '',
+        centreName: result.centre.centreName,
+        district: result.centre.district,
+        partnerId,
+        distributorId,
+      });
+    }
+
+    // 7. Record Audit Event (Never log passwords!)
     await this.audit.log({
-      actorId: adminUser.id,
-      actorType: 'ADMIN',
+      actorId: actorUser.id,
+      actorType: actorUser.role === Role.SUPER_ADMIN ? 'ADMIN' : 'USER',
       action: 'CENTRE_CREATED',
       entity: 'Centre',
       entityId: result.centre.id,
@@ -256,16 +313,19 @@ export class CentresService {
         centreName: result.centre.centreName,
         district: result.centre.district,
         email: cleanEmail,
-        createdBy: adminUser.email,
+        createdBy: actorUser.email,
+        actorRole: actorUser.role,
+        partnerId,
+        distributorId,
       },
     });
 
     return {
-      message: 'Centre created and activated successfully by administrator',
+      message: 'Centre created and activated successfully',
       centre: result.centre,
       user: this.sanitizeUser(result.user),
       wallet: result.wallet,
-      temporaryPassword, // Provided strictly on initial creation response for admin handoff
+      temporaryPassword, // Provided strictly on initial creation response for handoff
     };
   }
 

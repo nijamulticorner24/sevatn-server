@@ -12,6 +12,7 @@ enum Role {
   CENTRE
   WORKER
   PARTNER
+  DISTRIBUTOR
 }
 
 enum PartnerStatus {
@@ -266,6 +267,10 @@ model User {
   partner             Partner?            @relation("PartnerRegisteredUsers", fields: [partnerId], references: [id], onDelete: SetNull)
   partnerProfile      Partner?            @relation("PartnerUserAccount")
   redeemedInvitation  PartnerInvitation?  @relation("InvitationRedeemedUser")
+  distributorId       String?
+  distributor         Distributor?        @relation("DistributorRegisteredUsers", fields: [distributorId], references: [id], onDelete: SetNull)
+  distributorProfile  Distributor?        @relation("DistributorUserAccount")
+  redeemedDistributorInvitation DistributorInvitation? @relation("DistributorInvitationRedeemedUser")
   registeredLocation  RegisteredLocation?
   instantServiceQueries InstantServiceQuery[]
 
@@ -273,12 +278,15 @@ model User {
   @@index([email])
   @@index([role, status])
   @@index([partnerId])
+  @@index([distributorId])
 }
 
 model Centre {
   id               String       @id @default(uuid())
   userId           String       @unique
   user             User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  distributorId    String?
+  distributor      Distributor? @relation(fields: [distributorId], references: [id], onDelete: SetNull)
   centreName       String
   centreCode       String?      @unique
   address          String
@@ -295,6 +303,7 @@ model Centre {
 
   @@index([district])
   @@index([status])
+  @@index([distributorId])
 }
 
 model BookingAccount {
@@ -407,6 +416,16 @@ model BookingRequest {
   nomineeAge          Int?
   nomineeRelationship String?
   nomineePhone        String?
+
+  // Three-Level Ticket Pricing Snapshot
+  baseTicketPrice      Decimal?        @default(10.00)
+  partnerMarkup        Decimal?        @default(0.00)
+  distributorMarkup    Decimal?        @default(0.00)
+  finalTicketPrice     Decimal?        @default(10.00)
+  ticketQuantity       Int?            @default(1)
+  totalTicketAmount    Decimal?        @default(10.00)
+  pricingConfigVersion Int?            @default(1)
+  pricingSnapshot      Json?
 
   createdAt         DateTime        @default(now())
   updatedAt         DateTime        @updatedAt
@@ -692,6 +711,19 @@ model SystemConfig {
   offlineIfscCode        String?  @default("HDFC0001234")
   offlinePaymentInstructions String? @default("Scan the official QR code or pay via UPI. Enter your 12-digit UTR/Reference ID for instant validation.")
 
+  // Hero Section Customization
+  heroTitle              String?
+  heroSubtitle           String?
+  heroShowText           Boolean? @default(true)
+  heroButtonText         String?
+  heroButtonLink         String?
+  heroShowButton         Boolean? @default(true)
+  heroSecondaryButtonText String?
+  heroSecondaryButtonLink String?
+  heroShowSecondaryButton Boolean? @default(true)
+  heroEyebrow            String?
+  heroBannerLink         String?
+
   updatedAt              DateTime @updatedAt
 }
 
@@ -758,6 +790,8 @@ model Partner {
   commissionRate       Decimal             @default(20.00)
   commissionPercentage Decimal             @default(20.00)
   commissionSlab       String?             @default("STANDARD")
+  markup               Decimal             @default(0.00) // Independent Partner ticket markup
+  distributors         Distributor[]
   invitations          PartnerInvitation[]
   registeredUsers  User[]              @relation("PartnerRegisteredUsers")
   payouts          PartnerPayout[]
@@ -804,6 +838,54 @@ model PartnerInvitation {
 
   @@index([token])
   @@index([partnerId, status])
+}
+
+model Distributor {
+  id                   String                  @id @default(uuid())
+  distributorCode      String                  @unique // e.g. DT-001
+  partnerId            String
+  partner              Partner                 @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  userId               String?                 @unique
+  user                 User?                   @relation("DistributorUserAccount", fields: [userId], references: [id], onDelete: SetNull)
+  name                 String
+  businessName         String?
+  mobile               String
+  email                String?
+  address              String?
+  district             String?
+  taluk                String?
+  status               String                  @default("ACTIVE") // ACTIVE | INACTIVE | SUSPENDED
+  commissionRate       Decimal                 @default(0.00)
+  commissionPercentage Decimal                 @default(10.00)
+  commissionSlab       String?                 @default("STANDARD")
+  markup               Decimal                 @default(0.00) // Independent Distributor ticket markup
+  invitations          DistributorInvitation[]
+  centres              Centre[]
+  registeredUsers      User[]                  @relation("DistributorRegisteredUsers")
+  createdAt            DateTime                @default(now())
+  updatedAt            DateTime                @updatedAt
+
+  @@index([partnerId])
+  @@index([status])
+  @@index([distributorCode])
+}
+
+model DistributorInvitation {
+  id            String           @id @default(uuid())
+  distributorId String
+  distributor   Distributor      @relation(fields: [distributorId], references: [id], onDelete: Cascade)
+  token         String           @unique // non-guessable secure token
+  status        InvitationStatus @default(ACTIVE)
+  expiresAt     DateTime?
+  usedAt        DateTime?
+  usedByUserId  String?          @unique
+  usedByUser    User?            @relation("DistributorInvitationRedeemedUser", fields: [usedByUserId], references: [id], onDelete: SetNull)
+  metadata      Json?
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+
+  @@index([token])
+  @@index([distributorId, status])
 }
 
 model RegisteredLocation {
@@ -922,5 +1004,33 @@ model BookingReconciliation {
 
   @@index([status])
 }
+
+model PricingConfig {
+  id                   String   @id @default("default")
+  baseTicketPrice      Decimal  @default(10.00)
+  maxPartnerMarkup     Decimal  @default(2.00)
+  maxDistributorMarkup Decimal  @default(2.00)
+  isActive             Boolean  @default(true)
+  version              Int      @default(1)
+  updatedBy            String?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+}
+
+model PricingAuditLog {
+  id           String   @id @default(uuid())
+  actorId      String?
+  actorRole    String?
+  action       String   // CONFIG_UPDATED, PARTNER_MARKUP_CHANGED, DISTRIBUTOR_MARKUP_CHANGED
+  targetEntity String   // PricingConfig, Partner, Distributor
+  targetId     String?
+  oldValues    Json?
+  newValues    Json?
+  createdAt    DateTime @default(now())
+
+  @@index([targetEntity, targetId])
+  @@index([createdAt])
+}
+
 
 

@@ -684,57 +684,108 @@ export class PartnersService {
    * Get all invitations generated for a partner
    */
   async getPartnerInvitations(partnerId: string) {
-    const invitations = await this.prisma.partnerInvitation.findMany({
-      where: { partnerId },
-      include: {
-        usedByUser: {
-          include: {
-            centre: true,
+    const [invitations, distributorInvitations] = await Promise.all([
+      this.prisma.partnerInvitation.findMany({
+        where: { partnerId },
+        include: {
+          usedByUser: {
+            include: {
+              centre: true,
+            },
           },
         },
-      },
-      orderBy: { createdAt: 'desc' },
-      take: 50,
-    });
+        orderBy: { createdAt: 'desc' },
+        take: 50,
+      }),
+      this.prisma.distributorInvitation.findMany({
+        where: {
+          distributor: {
+            partnerId,
+          },
+        },
+        include: {
+          distributor: {
+            select: {
+              id: true,
+              distributorCode: true,
+              name: true,
+              businessName: true,
+            },
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 50,
+      }),
+    ]);
 
     const now = new Date();
     // Exclude partner onboarding tokens so only centre invites created by partner are shown
-    const centreInvitations = invitations.filter((inv) => {
+    const directCentreInvitations = invitations.filter((inv) => {
       const meta = (inv.metadata as any) || {};
       if (meta.type === 'PARTNER_ONBOARDING') return false;
-      // If it has no metadata and no shopName and no usedByUser, it was an initial partner onboarding token
       if (!meta.shopName && !meta.type && !inv.usedByUserId) return false;
       return true;
+    }).map((inv) => {
+      const isExpired = inv.status === 'ACTIVE' && inv.expiresAt && new Date(inv.expiresAt) < now;
+      const isActivated = !!(inv.usedByUserId && inv.usedByUser?.centre);
+
+      return {
+        id: inv.id,
+        token: inv.token,
+        type: 'DIRECT_PARTNER',
+        sourceName: 'Partner (Direct)',
+        distributor: null,
+        registrationUrl: `/service/register/${inv.token}`,
+        status: isActivated ? 'USED' : isExpired ? 'EXPIRED' : inv.status,
+        isActivated,
+        activatedCentre: inv.usedByUser?.centre
+          ? {
+              centreCode: inv.usedByUser.centre.centreCode,
+              centreName: inv.usedByUser.centre.centreName,
+              district: inv.usedByUser.centre.district,
+              taluk: inv.usedByUser.centre.taluk,
+              feePaid: inv.usedByUser.centre.feePaid,
+              status: inv.usedByUser.centre.status,
+            }
+          : null,
+        expiresAt: inv.expiresAt,
+        usedAt: inv.usedAt,
+        createdAt: inv.createdAt,
+        metadata: inv.metadata,
+      };
     });
 
-    return {
-      invitations: centreInvitations.map((inv) => {
-        const isExpired = inv.status === 'ACTIVE' && inv.expiresAt && new Date(inv.expiresAt) < now;
-        // Only mark as activated if an actual centre user registered via this invitation
-        const isActivated = !!(inv.usedByUserId && inv.usedByUser?.centre);
+    const mappedDistributorInvitations = distributorInvitations.map((inv) => {
+      const isExpired = inv.status === 'ACTIVE' && inv.expiresAt && new Date(inv.expiresAt) < now;
+      const isActivated = !!inv.usedAt;
 
-        return {
-          id: inv.id,
-          token: inv.token,
-          registrationUrl: `/service/register/${inv.token}`,
-          status: isActivated ? 'USED' : isExpired ? 'EXPIRED' : inv.status,
-          isActivated,
-          activatedCentre: inv.usedByUser?.centre
-            ? {
-                centreCode: inv.usedByUser.centre.centreCode,
-                centreName: inv.usedByUser.centre.centreName,
-                district: inv.usedByUser.centre.district,
-                taluk: inv.usedByUser.centre.taluk,
-                feePaid: inv.usedByUser.centre.feePaid,
-                status: inv.usedByUser.centre.status,
-              }
-            : null,
-          expiresAt: inv.expiresAt,
-          usedAt: inv.usedAt,
-          createdAt: inv.createdAt,
-          metadata: inv.metadata,
-        };
-      }),
+      return {
+        id: inv.id,
+        token: inv.token,
+        type: 'DISTRIBUTOR_INVITE',
+        sourceName: `${inv.distributor.name} (${inv.distributor.distributorCode})`,
+        distributor: inv.distributor,
+        registrationUrl: `/service/register/${inv.token}`,
+        status: isActivated ? 'USED' : isExpired ? 'EXPIRED' : inv.status,
+        isActivated,
+        activatedCentre: null,
+        expiresAt: inv.expiresAt,
+        usedAt: inv.usedAt,
+        createdAt: inv.createdAt,
+        metadata: {
+          invitedByDistributorId: inv.distributorId,
+          distributorName: inv.distributor.name,
+          distributorCode: inv.distributor.distributorCode,
+        },
+      };
+    });
+
+    const combined = [...directCentreInvitations, ...mappedDistributorInvitations].sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+    );
+
+    return {
+      invitations: combined,
     };
   }
 
@@ -846,6 +897,7 @@ export class PartnersService {
     district?: string,
     status?: string,
     search?: string,
+    distributorId?: string,
   ) {
     const skip = (page - 1) * limit;
     const where: any = {
@@ -854,6 +906,14 @@ export class PartnersService {
         role: Role.CENTRE,
       },
     };
+
+    if (distributorId && distributorId !== 'ALL') {
+      if (distributorId === 'DIRECT') {
+        where.distributorId = null;
+      } else {
+        where.distributorId = distributorId;
+      }
+    }
 
     if (district && district !== 'ALL') {
       where.district = { equals: district, mode: 'insensitive' };
@@ -883,6 +943,16 @@ export class PartnersService {
         orderBy: { createdAt: 'desc' },
         include: {
           user: true,
+          distributor: {
+            select: {
+              id: true,
+              distributorCode: true,
+              name: true,
+              businessName: true,
+              markup: true,
+              status: true,
+            },
+          },
         },
       }),
       this.prisma.centre.count({ where }),
@@ -890,6 +960,16 @@ export class PartnersService {
 
     const sanitizedCentres = centres.map((c) => ({
       ...c,
+      distributor: c.distributor
+        ? {
+            id: c.distributor.id,
+            distributorCode: c.distributor.distributorCode,
+            name: c.distributor.name,
+            businessName: c.distributor.businessName,
+            markup: Number(c.distributor.markup || 0),
+            status: c.distributor.status,
+          }
+        : null,
       user: {
         id: c.user.id,
         name: c.user.name,

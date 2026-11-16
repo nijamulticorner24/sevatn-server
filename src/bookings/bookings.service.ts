@@ -19,6 +19,7 @@ import { calculateHaversineDistanceKm } from '../common/utils/geo';
 import { EventsGateway } from '../events/events.gateway';
 import { SmartAllocatorService } from '../workers/smart-allocator.service';
 import { BookingStateMachineService } from './booking-state-machine.service';
+import { TicketPricingService } from '../pricing/ticket-pricing.service';
 import { Optional } from '@nestjs/common';
 
 @Injectable()
@@ -34,6 +35,7 @@ export class BookingsService {
     private accountLockService: AccountLockService,
     private eventsGateway: EventsGateway,
     private stateMachine: BookingStateMachineService,
+    private pricingService: TicketPricingService,
     @Optional() private smartAllocator?: SmartAllocatorService,
   ) {}
 
@@ -216,6 +218,12 @@ export class BookingsService {
     const pilgrimCount = Math.max(1, rawPilgrimCount);
     const feeAmount = baseServiceFee * pilgrimCount;
 
+    // Calculate immutable 3-level ticket price breakdown snapshot
+    const priceCalculation = await this.pricingService.calculateBookingPrice({
+      userId,
+      quantity: pilgrimCount,
+    });
+
     const result = await this.prisma.$transaction(async (tx) => {
       // 1. Verify and reserve funds from wallet (Super Admin auto-funded/exempted)
       let wallet = await tx.wallet.findUnique({ where: { userId } });
@@ -344,6 +352,15 @@ export class BookingsService {
             termsAcceptedAt: new Date().toISOString(),
           },
           status: initialStatus,
+          // Three-Level Ticket Pricing Immutable Snapshot
+          baseTicketPrice: new Prisma.Decimal(priceCalculation.baseTicketPrice),
+          partnerMarkup: new Prisma.Decimal(priceCalculation.partnerMarkup),
+          distributorMarkup: new Prisma.Decimal(priceCalculation.distributorMarkup),
+          finalTicketPrice: new Prisma.Decimal(priceCalculation.finalTicketPrice),
+          ticketQuantity: priceCalculation.ticketQuantity,
+          totalTicketAmount: new Prisma.Decimal(priceCalculation.totalTicketAmount),
+          pricingConfigVersion: priceCalculation.pricingConfigVersion,
+          pricingSnapshot: priceCalculation.pricingSnapshot,
           pilgrims: (dto.pilgrims && dto.pilgrims.length > 0) ? {
             create: dto.pilgrims.map((p) => ({
               fullName: p.fullName.trim(),

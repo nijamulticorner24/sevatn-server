@@ -18,6 +18,8 @@ import { ServicesRegistryModule } from './services-registry/services-registry.mo
 import { InstantServiceModule } from './instant-service/instant-service.module';
 import { EventsModule } from './events/events.module';
 import { OutboxModule } from './common/outbox/outbox.module';
+import { PricingModule } from './pricing/pricing.module';
+import { DistributorModule } from './distributor/distributor.module';
 
 @Module({
   imports: [
@@ -40,6 +42,8 @@ import { OutboxModule } from './common/outbox/outbox.module';
     PartnersModule,
     ServicesRegistryModule,
     InstantServiceModule,
+    PricingModule,
+    DistributorModule,
   ],
 })
 export class AppModule {}

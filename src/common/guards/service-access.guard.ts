@@ -51,8 +51,13 @@ export class ServiceAccessGuard implements CanActivate {
       throw new ForbiddenException('Authentication required');
     }
 
-    // Explicit documented exceptions: Super Admin, Worker, Partner franchise managers
-    if (user.role === Role.SUPER_ADMIN || user.role === Role.WORKER || user.role === Role.PARTNER) {
+    // Explicit documented exceptions: Super Admin, Worker, Partner franchise managers, Distributor managers
+    if (
+      user.role === Role.SUPER_ADMIN ||
+      user.role === Role.WORKER ||
+      user.role === Role.PARTNER ||
+      user.role === Role.DISTRIBUTOR
+    ) {
       return true;
     }
 

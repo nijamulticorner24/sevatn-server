@@ -49,9 +49,9 @@ export class CentresController {
   }
 
   @Post()
-  @Roles(Role.SUPER_ADMIN)
-  async createCentre(@CurrentUser() adminUser: any, @Body() dto: CreateCentreDto) {
-    return this.centresService.createCentre(adminUser, dto);
+  @Roles(Role.SUPER_ADMIN, Role.PARTNER, Role.DISTRIBUTOR)
+  async createCentre(@CurrentUser() user: any, @Body() dto: CreateCentreDto) {
+    return this.centresService.createCentre(user, dto);
   }
 
   @Get(':id')

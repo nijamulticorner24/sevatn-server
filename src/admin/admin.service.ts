@@ -28,8 +28,8 @@ export class AdminService {
   ) {}
 
   async getDashboardMetrics() {
-    const TARGET_BOOKINGS = 5000;
-    const TARGET_CENTRES = 356;
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
 
     const [
       totalCentres,
@@ -43,6 +43,14 @@ export class AdminService {
       financials,
       systemConfig,
       walletsSum,
+      totalPartners,
+      activePartners,
+      totalDistributors,
+      activeDistributors,
+      todayBookingsCount,
+      recentBookings,
+      recentCentres,
+      workerList,
     ] = await Promise.all([
       this.prisma.centre.count(),
       this.prisma.centre.count({ where: { status: 'ACTIVE' } }),
@@ -61,6 +69,81 @@ export class AdminService {
         _sum: {
           availableBalance: true,
           reservedBalance: true,
+        },
+      }),
+      this.prisma.partner.count(),
+      this.prisma.partner.count({ where: { status: PartnerStatus.ACTIVE } }),
+      this.prisma.distributor.count(),
+      this.prisma.distributor.count({ where: { status: 'ACTIVE' } }),
+      this.prisma.bookingRequest.count({ where: { createdAt: { gte: startOfToday } } }),
+      this.prisma.bookingRequest.findMany({
+        take: 8,
+        orderBy: { createdAt: 'desc' },
+        select: {
+          id: true,
+          bookingCode: true,
+          status: true,
+          requestedDate: true,
+          requestedDateStr: true,
+          pilgrimCount: true,
+          timeSlot: true,
+          totalTicketAmount: true,
+          createdAt: true,
+          user: {
+            select: {
+              name: true,
+              mobile: true,
+              centre: {
+                select: {
+                  centreName: true,
+                  centreCode: true,
+                  district: true,
+                },
+              },
+            },
+          },
+          pilgrims: {
+            take: 1,
+            select: {
+              fullName: true,
+            },
+          },
+        },
+      }),
+      this.prisma.centre.findMany({
+        take: 6,
+        orderBy: { createdAt: 'desc' },
+        select: {
+          id: true,
+          centreName: true,
+          centreCode: true,
+          district: true,
+          taluk: true,
+          status: true,
+          createdAt: true,
+          user: {
+            select: {
+              name: true,
+              mobile: true,
+            },
+          },
+        },
+      }),
+      this.prisma.workerMachine.findMany({
+        take: 8,
+        orderBy: [{ status: 'asc' }, { lastHeartbeat: 'desc' }],
+        select: {
+          id: true,
+          machineCode: true,
+          machineName: true,
+          status: true,
+          active: true,
+          currentJobId: true,
+          lastHeartbeat: true,
+          version: true,
+          ipAddress: true,
+          jobsCompleted: true,
+          successCount: true,
         },
       }),
     ]);
@@ -89,32 +172,84 @@ export class AdminService {
       (statusCounts.WISHLIST_ADDED || 0) +
       (statusCounts.COMPLETED || 0) +
       (statusCounts.BOOKING_CONFIRMED || 0);
-    const commercialProgressPercent = Number(((successCount / TARGET_BOOKINGS) * 100).toFixed(1));
-    const avgBookingsPerActiveCentre =
-      activeCentres > 0 ? Number((successCount / activeCentres).toFixed(1)) : 0;
+
+    const totalResolved =
+      (statusCounts.SUCCESS || 0) + (statusCounts.FAILED || 0) + (statusCounts.CANCELLED || 0);
+    const successRate =
+      totalResolved > 0
+        ? Number(((successCount / totalResolved) * 100).toFixed(1))
+        : successCount > 0
+        ? 100
+        : 0;
 
     return {
+      hierarchy: {
+        partners: {
+          total: totalPartners,
+          active: activePartners,
+          inactive: Math.max(0, totalPartners - activePartners),
+        },
+        distributors: {
+          total: totalDistributors,
+          active: activeDistributors,
+          inactive: Math.max(0, totalDistributors - activeDistributors),
+        },
+        centres: {
+          total: totalCentres,
+          active: activeCentres,
+          expired: expiredCentres,
+          inactive: Math.max(0, totalCentres - activeCentres),
+          activeRate:
+            totalCentres > 0 ? Number(((activeCentres / totalCentres) * 100).toFixed(1)) : 0,
+        },
+      },
       centres: {
         total: totalCentres,
         active: activeCentres,
         expired: expiredCentres,
-        networkTarget: TARGET_CENTRES,
-        penetrationPercent: Number(((totalCentres / TARGET_CENTRES) * 100).toFixed(1)),
+        inactive: Math.max(0, totalCentres - activeCentres),
+        penetrationPercent:
+          totalCentres > 0 ? Number(((activeCentres / totalCentres) * 100).toFixed(1)) : 0,
       },
       workers: {
         total: totalWorkers,
         online: onlineWorkers,
         busy: busyWorkers,
         offline: Math.max(0, totalWorkers - onlineWorkers - busyWorkers),
+        units: workerList,
       },
-      bookings: statusCounts,
-      commercialTarget: {
-        targetBookings: TARGET_BOOKINGS,
-        successfulBookings: successCount,
-        progressPercent: commercialProgressPercent,
-        avgPerActiveCentre: avgBookingsPerActiveCentre,
-        requiredAvgPerCentre: Number((TARGET_BOOKINGS / TARGET_CENTRES).toFixed(1)), // ~14
+      bookings: {
+        ...statusCounts,
+        today: todayBookingsCount,
+        successCount,
+        successRate,
       },
+      recentBookings: recentBookings.map((b) => ({
+        id: b.id,
+        bookingCode: b.bookingCode,
+        status: b.status,
+        requestedDate: b.requestedDate,
+        requestedDateStr: b.requestedDateStr,
+        pilgrimCount: b.pilgrimCount,
+        timeSlot: b.timeSlot,
+        totalTicketAmount: Number(b.totalTicketAmount || 0),
+        createdAt: b.createdAt,
+        centreName: b.user?.centre?.centreName || 'Direct Station',
+        centreCode: b.user?.centre?.centreCode || '—',
+        district: b.user?.centre?.district || '—',
+        customerName: b.pilgrims?.[0]?.fullName || b.user?.name || 'Devotee',
+      })),
+      recentCentres: recentCentres.map((c) => ({
+        id: c.id,
+        centreName: c.centreName,
+        centreCode: c.centreCode,
+        district: c.district,
+        taluk: c.taluk,
+        status: c.status,
+        createdAt: c.createdAt,
+        operatorName: c.user?.name || '—',
+        mobile: c.user?.mobile || '—',
+      })),
       financials: {
         ...financials,
         totalNetworkAvailableBalance: Number(walletsSum._sum.availableBalance || 0),

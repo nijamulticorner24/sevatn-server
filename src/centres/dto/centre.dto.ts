@@ -65,6 +65,14 @@ export class CreateCentreDto {
   @IsOptional()
   @IsNumber()
   accuracy?: number;
+
+  @IsOptional()
+  @IsString()
+  partnerId?: string;
+
+  @IsOptional()
+  @IsString()
+  distributorId?: string;
 }
 
 export class UpdateCentreDto {
@@ -123,4 +131,12 @@ export class UpdateCentreDto {
   @IsOptional()
   @IsNumber()
   accuracy?: number;
+
+  @IsOptional()
+  @IsString()
+  partnerId?: string;
+
+  @IsOptional()
+  @IsString()
+  distributorId?: string;
 }

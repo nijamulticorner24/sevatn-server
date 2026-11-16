@@ -69,15 +69,73 @@ export class AuthService {
   }
 
   /**
-   * Validates invitation token before showing registration form
+   * Validates invitation token before showing registration form.
+   * Supports both Distributor-to-Centre invitations (primary) and Partner-to-Centre invitations (legacy).
    */
   async validateInvitation(token: string) {
     if (!token || token.trim().length < 8) {
       throw new BadRequestException('Invalid invitation token format');
     }
+    const cleanToken = token.trim();
 
+    // 1. Check DistributorInvitation first (Primary hierarchy: PARTNER -> DISTRIBUTOR -> CENTRE)
+    const distInvitation = await this.prisma.distributorInvitation.findUnique({
+      where: { token: cleanToken },
+      include: {
+        distributor: {
+          include: { partner: true },
+        },
+      },
+    });
+
+    if (distInvitation) {
+      if (distInvitation.status === InvitationStatus.REVOKED) {
+        throw new BadRequestException('This invitation has been revoked');
+      }
+      if (
+        distInvitation.status === InvitationStatus.EXPIRED ||
+        (distInvitation.expiresAt && new Date() > distInvitation.expiresAt)
+      ) {
+        throw new BadRequestException('This invitation token has expired');
+      }
+      if (distInvitation.distributor.status !== 'ACTIVE') {
+        throw new BadRequestException(
+          `Authorized Distributor (${distInvitation.distributor.name}) is currently ${distInvitation.distributor.status}`,
+        );
+      }
+      if (distInvitation.distributor.partner.status !== 'ACTIVE') {
+        throw new BadRequestException(
+          `Parent Partner franchise (${distInvitation.distributor.partner.name}) is currently ${distInvitation.distributor.partner.status}`,
+        );
+      }
+
+      return {
+        valid: true,
+        type: 'DISTRIBUTOR',
+        token: distInvitation.token,
+        partner: {
+          id: distInvitation.distributor.partner.id,
+          partnerCode: distInvitation.distributor.partner.partnerCode,
+          name: distInvitation.distributor.partner.name,
+          district: distInvitation.distributor.partner.district,
+          taluk: distInvitation.distributor.partner.taluk,
+        },
+        distributor: {
+          id: distInvitation.distributor.id,
+          distributorCode: distInvitation.distributor.distributorCode,
+          name: distInvitation.distributor.name,
+          businessName: distInvitation.distributor.businessName,
+          district: distInvitation.distributor.district,
+          taluk: distInvitation.distributor.taluk,
+        },
+        metadata: distInvitation.metadata,
+        expiresAt: distInvitation.expiresAt,
+      };
+    }
+
+    // 2. Check PartnerInvitation (Backward-compatible direct Partner-to-Centre flow)
     const invitation = await this.prisma.partnerInvitation.findUnique({
-      where: { token: token.trim() },
+      where: { token: cleanToken },
       include: {
         partner: true,
       },
@@ -101,6 +159,7 @@ export class AuthService {
 
     return {
       valid: true,
+      type: 'PARTNER',
       token: invitation.token,
       partner: {
         id: invitation.partner.id,
@@ -109,6 +168,7 @@ export class AuthService {
         district: invitation.partner.district,
         taluk: invitation.partner.taluk,
       },
+      distributor: null,
       metadata: invitation.metadata,
       expiresAt: invitation.expiresAt,
     };
@@ -122,9 +182,10 @@ export class AuthService {
     const cleanEmail = dto.email.toLowerCase().trim();
     const cleanMobile = dto.mobile.trim();
 
-    // 1. Validate Token & identify partner server-side
+    // 1. Validate Token & identify partner / distributor server-side
     const invitationValidation = await this.validateInvitation(dto.invitationToken);
     const partnerId = invitationValidation.partner.id;
+    const distributorId = invitationValidation.distributor?.id || null;
 
     // 2. Validate coordinates sanity
     // On desktop PCs and broadband connections without hardware GPS, browsers report network/IP accuracy (~50km - 100km).
@@ -171,6 +232,7 @@ export class AuthService {
           role: Role.CENTRE,
           status: UserStatus.PAYMENT_PENDING,
           partnerId,
+          distributorId,
           mustChangePassword: false,
         } as any,
       });
@@ -181,6 +243,7 @@ export class AuthService {
           userId: user.id,
           centreName: dto.centreName.trim(),
           centreCode,
+          distributorId,
           address: dto.address?.trim() || `${dto.taluk}, ${dto.district}`,
           district: dto.district.trim(),
           taluk: dto.taluk.trim(),
@@ -213,15 +276,26 @@ export class AuthService {
         },
       });
 
-      // Mark PartnerInvitation as USED
-      await tx.partnerInvitation.update({
-        where: { token: dto.invitationToken.trim() },
-        data: {
-          status: InvitationStatus.USED,
-          usedAt: new Date(),
-          usedByUserId: user.id,
-        },
-      });
+      // Mark Invitation as USED according to invitation type
+      if (invitationValidation.type === 'DISTRIBUTOR') {
+        await tx.distributorInvitation.update({
+          where: { token: dto.invitationToken.trim() },
+          data: {
+            status: InvitationStatus.USED,
+            usedAt: new Date(),
+            usedByUserId: user.id,
+          },
+        });
+      } else {
+        await tx.partnerInvitation.update({
+          where: { token: dto.invitationToken.trim() },
+          data: {
+            status: InvitationStatus.USED,
+            usedAt: new Date(),
+            usedByUserId: user.id,
+          },
+        });
+      }
 
       return { user, centre, location, wallet };
     });
@@ -234,7 +308,9 @@ export class AuthService {
       entityId: result.user.id,
       metadata: {
         partnerId,
+        distributorId,
         partnerCode: invitationValidation.partner.partnerCode,
+        distributorCode: invitationValidation.distributor?.distributorCode || null,
         centreCode: result.centre.centreCode,
         email: cleanEmail,
       },
@@ -840,7 +916,12 @@ export class AuthService {
    */
   private async sendResendEmail(toEmail: string, subject: string, htmlContent: string) {
     const apiKey = process.env.RESEND_API_KEY?.trim();
-    const fromEmail = process.env.RESEND_FROM_EMAIL?.trim() || 'TicketAssist <onboarding@resend.dev>';
+    let fromEmail = process.env.RESEND_FROM_EMAIL?.trim() || 'SevaTN <noreply@sevatn.online>';
+
+    // Guardrail: Resend domain is sevatn.online. If outdated ticketassist.in is configured, sanitize to sevatn.online.
+    if (!fromEmail || fromEmail.includes('ticketassist.in')) {
+      fromEmail = 'SevaTN <noreply@sevatn.online>';
+    }
 
     if (!apiKey) {
       this.logger.warn(
@@ -922,7 +1003,7 @@ export class AuthService {
     const emailHtml = `
       <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 540px; margin: 0 auto; padding: 28px; background: #ffffff; border-radius: 12px; border: 1px solid #e2e8f0;">
         <div style="text-align: center; margin-bottom: 24px;">
-          <h1 style="color: #172033; font-size: 22px; font-weight: 700; margin: 0;">TicketAssist Portal</h1>
+          <h1 style="color: #172033; font-size: 22px; font-weight: 700; margin: 0;">SevaTN Portal</h1>
           <p style="color: #64748b; font-size: 13px; margin-top: 4px;">Security &amp; Account Recovery</p>
         </div>
         <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 24px; text-align: center; margin-bottom: 24px;">
@@ -934,7 +1015,7 @@ export class AuthService {
         </div>
         <p style="color: #64748b; font-size: 12px; line-height: 1.5; margin: 0;">If you did not request a password reset, you can safely ignore this email. Your existing credentials remain secure.</p>
         <div style="margin-top: 24px; padding-top: 16px; border-top: 1px solid #f1f5f9; text-align: center; color: #94a3b8; font-size: 11px;">
-          &copy; ${new Date().getFullYear()} TicketAssist &bull; Powered by YUKTRON
+          &copy; ${new Date().getFullYear()} SevaTN &bull; Powered by YUKTRON
         </div>
       </div>
     `;
@@ -942,7 +1023,7 @@ export class AuthService {
     try {
       await this.sendResendEmail(
         user.email,
-        'TicketAssist - Password Reset Verification Code',
+        'SevaTN - Password Reset Verification Code',
         emailHtml,
       );
     } catch (err: any) {
@@ -1103,7 +1184,7 @@ export class AuthService {
     const emailHtml = `
       <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 540px; margin: 0 auto; padding: 28px; background: #ffffff; border-radius: 12px; border: 1px solid #e2e8f0;">
         <div style="text-align: center; margin-bottom: 24px;">
-          <h1 style="color: #172033; font-size: 22px; font-weight: 700; margin: 0;">TicketAssist Portal</h1>
+          <h1 style="color: #172033; font-size: 22px; font-weight: 700; margin: 0;">SevaTN Portal</h1>
           <p style="color: #64748b; font-size: 13px; margin-top: 4px;">Email Address Verification</p>
         </div>
         <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 24px; text-align: center; margin-bottom: 24px;">
@@ -1115,7 +1196,7 @@ export class AuthService {
         </div>
         <p style="color: #64748b; font-size: 12px; line-height: 1.5; margin: 0;">If you did not request this email change, please ignore this email or contact platform administrators immediately.</p>
         <div style="margin-top: 24px; padding-top: 16px; border-top: 1px solid #f1f5f9; text-align: center; color: #94a3b8; font-size: 11px;">
-          &copy; ${new Date().getFullYear()} TicketAssist &bull; Powered by YUKTRON
+          &copy; ${new Date().getFullYear()} SevaTN &bull; Powered by YUKTRON
         </div>
       </div>
     `;
@@ -1123,7 +1204,7 @@ export class AuthService {
     try {
       await this.sendResendEmail(
         cleanNewEmail,
-        'TicketAssist - Verify Your New Email Address',
+        'SevaTN - Verify Your New Email Address',
         emailHtml,
       );
     } catch (err: any) {

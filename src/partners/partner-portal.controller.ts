@@ -40,6 +40,7 @@ export class PartnerPortalController {
     @Query('district') district?: string,
     @Query('status') status?: string,
     @Query('search') search?: string,
+    @Query('distributorId') distributorId?: string,
   ) {
     const partnerId = this.resolvePartnerId(req);
     return this.partnersService.getPartnerCentres(
@@ -49,6 +50,7 @@ export class PartnerPortalController {
       district,
       status,
       search,
+      distributorId,
     );
   }
 
