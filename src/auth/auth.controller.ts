@@ -6,8 +6,10 @@ import {
   Param,
   UseGuards,
   Request,
+  BadRequestException,
 } from '@nestjs/common';
 import { AuthService } from './auth.service';
+import { S3StorageService } from '../common/storage/s3-storage.service';
 import {
   LoginDto,
   ChangePasswordDto,
@@ -26,7 +28,20 @@ import { Throttle } from '../common/decorators';
 @Controller('auth')
 @UseGuards(RateLimiterGuard)
 export class AuthController {
-  constructor(private readonly authService: AuthService) {}
+  constructor(
+    private readonly authService: AuthService,
+    private readonly s3Storage: S3StorageService,
+  ) {}
+
+  @Post('upload-proof')
+  @Throttle(15, 60)
+  async uploadProof(@Body() body: { image: string; folder?: string }) {
+    if (!body?.image) {
+      throw new BadRequestException('Image data is required');
+    }
+    const url = await this.s3Storage.uploadProofImage(body.image, body.folder || 'proofs');
+    return { url };
+  }
 
   @Post('register')
   async registerCentre() {

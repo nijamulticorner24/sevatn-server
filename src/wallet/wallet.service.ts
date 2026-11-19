@@ -15,6 +15,7 @@ import {
   ReleaseFundsDto,
   RequestRefundDto,
 } from './dto/wallet.dto';
+import { NotificationsService } from '../notifications/notifications.service';
 
 @Injectable()
 export class WalletService {
@@ -23,6 +24,7 @@ export class WalletService {
   constructor(
     private prisma: PrismaService,
     private audit: AuditService,
+    private notifications: NotificationsService,
   ) {}
 
   /**
@@ -239,6 +241,33 @@ export class WalletService {
           newBalance: updatedWallet.availableBalance,
         },
       });
+
+      // If offline top-up, trigger Telegram Bot alert asynchronously
+      if (isOffline) {
+        this.prisma.user
+          .findUnique({
+            where: { id: userId },
+            include: { centre: true },
+          })
+          .then((u) => {
+            if (u) {
+              this.notifications.sendTelegramPaymentNotification({
+                paymentType: 'WALLET_TOPUP',
+                amount,
+                paymentReference: cleanRef,
+                screenshotUrl: receiptUrl,
+                applicantName: u.name,
+                entityName: u.centre?.centreName,
+                entityCode: u.centre?.centreCode,
+                district: u.centre?.district,
+                mobile: u.mobile,
+                email: u.email,
+                role: u.role,
+              });
+            }
+          })
+          .catch((err) => this.logger.error(`[Telegram Topup Notification] Error: ${err.message}`));
+      }
 
       return {
         message: isOffline
@@ -727,6 +756,30 @@ export class WalletService {
         upiId: dto.upiId?.trim() || null,
       },
     });
+
+    // Fire Telegram Bot notification for pending refund settlement in /admin/ledger
+    this.prisma.user
+      .findUnique({
+        where: { id: userId },
+        include: { centre: true },
+      })
+      .then((u) => {
+        if (u) {
+          this.notifications.sendTelegramPaymentNotification({
+            paymentType: 'REFUND_REQUEST',
+            amount: Number(dto.amount),
+            paymentReference: dto.upiId?.trim() || 'UPI Refund Request',
+            applicantName: u.name,
+            entityName: u.centre?.centreName,
+            entityCode: u.centre?.centreCode,
+            district: u.centre?.district,
+            mobile: u.mobile,
+            email: u.email,
+            role: u.role,
+          });
+        }
+      })
+      .catch((err) => this.logger.error(`[Telegram Refund Notification] Error: ${err.message}`));
 
     return refund;
   }

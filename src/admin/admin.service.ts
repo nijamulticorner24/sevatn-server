@@ -2,6 +2,7 @@ import { Injectable, Logger, Optional } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../wallet/wallet.service';
 import { BookingStateMachineService } from '../bookings/booking-state-machine.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import {
   BookingStatus,
   UserStatus,
@@ -24,6 +25,7 @@ export class AdminService {
   constructor(
     private prisma: PrismaService,
     private walletService: WalletService,
+    private notifications: NotificationsService,
     @Optional() private stateMachine?: BookingStateMachineService,
   ) {}
 
@@ -283,6 +285,8 @@ export class AdminService {
           yuktronShare: 100,
           workerShare: 0,
           registrationFee: 249,
+          franchiseFee: 599,
+          distributorFee: 399,
           accountValidityDays: 365,
           checkingIntervalSeconds: 300,
           leaseTimeoutSeconds: 120,
@@ -318,7 +322,12 @@ export class AdminService {
       serviceFee: Number(config.serviceFee || 100),
       registrationFee: Number(config.registrationFee || 249),
       franchiseFee: Number(config.franchiseFee || 599),
-      partnerMinWithdrawal: Number(config.partnerMinWithdrawal || 100),
+      distributorFee: Number((config as any).distributorFee || 399),
+      partnerMinWithdrawal: Number((config as any).partnerMinWithdrawal || 100),
+      headerMarqueeEnabled: (config as any).headerMarqueeEnabled === undefined || (config as any).headerMarqueeEnabled === null ? false : Boolean((config as any).headerMarqueeEnabled && (config as any).headerMarqueeEnabled !== 'false'),
+      headerMarqueeText: (config as any).headerMarqueeText || null,
+      headerMarqueeSpeed: Number((config as any).headerMarqueeSpeed || 30),
+      headerMarqueeBgColor: (config as any).headerMarqueeBgColor || 'DEFAULT',
     };
   }
 
@@ -330,8 +339,8 @@ export class AdminService {
     try {
       // Ensure 'default' row exists
       await this.prisma.$executeRawUnsafe(`
-        INSERT INTO "SystemConfig" ("id", "serviceFee", "registrationFee", "franchiseFee", "accountValidityDays", "checkingIntervalSeconds", "leaseTimeoutSeconds", "humanAssistedModeOnly", "onlinePaymentEnabled", "onlineGatewayProvider", "offlinePaymentEnabled", "offlineUpiId", "offlineAccountName", "partnerMinWithdrawal", "updatedAt")
-        VALUES ('default', 100, 249, 599, 365, 300, 120, false, true, 'RAZORPAY', true, 'pay.ticketassist@okaxis', 'TicketAssist Services & Network', 100, NOW())
+        INSERT INTO "SystemConfig" ("id", "serviceFee", "registrationFee", "franchiseFee", "distributorFee", "accountValidityDays", "checkingIntervalSeconds", "leaseTimeoutSeconds", "humanAssistedModeOnly", "onlinePaymentEnabled", "onlineGatewayProvider", "offlinePaymentEnabled", "offlineUpiId", "offlineAccountName", "partnerMinWithdrawal", "telegramBotEnabled", "telegramBotToken", "telegramChatId", "headerMarqueeEnabled", "headerMarqueeText", "headerMarqueeSpeed", "headerMarqueeBgColor", "updatedAt")
+        VALUES ('default', 100, 249, 599, 399, 365, 300, 120, false, true, 'RAZORPAY', true, 'pay.ticketassist@okaxis', 'TicketAssist Services & Network', 100, false, null, null, false, null, 30, 'DEFAULT', NOW())
         ON CONFLICT ("id") DO NOTHING
       `);
 
@@ -344,6 +353,7 @@ export class AdminService {
         serviceFee: 'numeric',
         registrationFee: 'numeric',
         franchiseFee: 'numeric',
+        distributorFee: 'numeric',
         partnerMinWithdrawal: 'numeric',
         yuktronShare: 'numeric',
         workerShare: 'numeric',
@@ -363,6 +373,13 @@ export class AdminService {
         offlineAccountNumber: 'text',
         offlineIfscCode: 'text',
         offlinePaymentInstructions: 'text',
+        telegramBotEnabled: 'boolean',
+        telegramBotToken: 'text',
+        telegramChatId: 'text',
+        headerMarqueeEnabled: 'boolean',
+        headerMarqueeText: 'text',
+        headerMarqueeSpeed: 'integer',
+        headerMarqueeBgColor: 'text',
       };
 
       for (const [key, type] of Object.entries(columnMap)) {
@@ -395,6 +412,13 @@ export class AdminService {
       this.logger.error(`Error updating system config: ${err.message}`, err.stack);
       throw err;
     }
+  }
+
+  /**
+   * Test Telegram Payment Notifier Bot
+   */
+  async testTelegramNotification(botToken?: string, chatId?: string) {
+    return this.notifications.testTelegramNotification(botToken, chatId);
   }
 
   /**
@@ -698,6 +722,9 @@ export class AdminService {
       partnersPending,
       approvedPartnersRecent,
       approvedCentresRecent,
+      distributorsPaid,
+      distributorsPending,
+      approvedDistributorsRecent,
       payoutsRequested,
       payoutsSettled,
       refundsRequested,
@@ -766,6 +793,33 @@ export class AdminService {
         include: { user: { select: { id: true, name: true, mobile: true, email: true } } },
       }),
       this.prisma.centre.findMany({
+        where: { feePaid: true },
+        take: 10,
+        orderBy: { updatedAt: 'desc' },
+        include: { user: { select: { id: true, name: true, mobile: true, email: true } } },
+      }),
+      (this.prisma.distributor as any).aggregate({
+        where: { feePaid: true },
+        _sum: { distributorFee: true },
+        _count: { id: true },
+      }),
+      (this.prisma.distributor as any).findMany({
+        where: {
+          feePaid: false,
+          OR: [
+            { paymentReference: { not: null } },
+            { paymentProofUrl: { not: null } },
+            { user: { status: UserStatus.PAYMENT_PENDING } },
+          ],
+        },
+        include: {
+          user: {
+            select: { id: true, name: true, mobile: true, email: true, status: true },
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+      }),
+      (this.prisma.distributor as any).findMany({
         where: { feePaid: true },
         take: 10,
         orderBy: { updatedAt: 'desc' },
@@ -870,8 +924,11 @@ export class AdminService {
     const partnerFeesCollected = Number(partnersPaid._sum.franchiseFee || 0);
     const partnerFeesCount = partnersPaid._count.id || 0;
 
-    const grandTotalCollections = totalTopupsCompleted + centreFeesCollected + partnerFeesCollected;
-    const grandPlatformRevenue = yuktronRevenue + centreFeesCollected + partnerFeesCollected;
+    const distributorFeesCollected = Number((distributorsPaid as any)?._sum?.distributorFee || 0);
+    const distributorFeesCount = (distributorsPaid as any)?._count?.id || (distributorsPaid as any)?._count || 0;
+
+    const grandTotalCollections = totalTopupsCompleted + centreFeesCollected + partnerFeesCollected + distributorFeesCollected;
+    const grandPlatformRevenue = yuktronRevenue + centreFeesCollected + partnerFeesCollected + distributorFeesCollected;
 
     const pendingCentresCount = centresPending.length;
     const pendingCentresFeeSum = centresPending.reduce((acc, c) => acc + Number(c.registrationFee || 249), 0);
@@ -879,14 +936,17 @@ export class AdminService {
     const pendingPartnersCount = partnersPending.length;
     const pendingPartnersFeeSum = partnersPending.reduce((acc, p) => acc + Number(p.franchiseFee || 599), 0);
 
+    const pendingDistributorsCount = distributorsPending.length;
+    const pendingDistributorsFeeSum = distributorsPending.reduce((acc, d: any) => acc + Number((d as any)?.distributorFee || 399), 0);
+
     const pendingPayoutsAmount = Number(payoutsRequested._sum.amount || 0);
     const pendingPayoutsCount = payoutsRequested._count.id || 0;
 
     const pendingRefundsAmount = Number(refundsRequested._sum.amount || 0);
     const pendingRefundsCount = refundsRequested._count.id || 0;
 
-    const totalWaitingItemsCount = topupsCountPending + pendingCentresCount + pendingPartnersCount + pendingPayoutsCount + pendingRefundsCount;
-    const totalWaitingAmount = totalTopupsPending + pendingCentresFeeSum + pendingPartnersFeeSum + pendingPayoutsAmount + pendingRefundsAmount;
+    const totalWaitingItemsCount = topupsCountPending + pendingCentresCount + pendingPartnersCount + pendingDistributorsCount + pendingPayoutsCount + pendingRefundsCount;
+    const totalWaitingAmount = totalTopupsPending + pendingCentresFeeSum + pendingPartnersFeeSum + pendingDistributorsFeeSum + pendingPayoutsAmount + pendingRefundsAmount;
 
     return {
       summary: {
@@ -928,6 +988,12 @@ export class AdminService {
           pendingCount: pendingPartnersCount,
           pendingAmount: pendingPartnersFeeSum,
         },
+        distributorLicense: {
+          collectedAmount: distributorFeesCollected,
+          collectedCount: distributorFeesCount,
+          pendingCount: pendingDistributorsCount,
+          pendingAmount: pendingDistributorsFeeSum,
+        },
       },
       escrowLifecycle: {
         totalTopupsCompleted,
@@ -945,11 +1011,41 @@ export class AdminService {
         pendingCentresAmount: pendingCentresFeeSum,
         pendingPartnersCount,
         pendingPartnersAmount: pendingPartnersFeeSum,
+        pendingDistributorsCount,
+        pendingDistributorsAmount: pendingDistributorsFeeSum,
         pendingPayoutsCount,
         pendingPayoutsAmount,
         pendingRefundsCount,
         pendingRefundsAmount,
         recentWaitingTopups,
+        pendingDistributors: distributorsPending.map((d: any) => ({
+          id: d.id,
+          distributorName: d.businessName || d.name,
+          applicantName: d.name,
+          distributorCode: d.distributorCode,
+          district: d.district,
+          taluk: d.taluk,
+          distributorFee: Number(d.distributorFee || 399),
+          paymentReference: d.paymentReference,
+          paymentProofUrl: d.paymentProofUrl,
+          status: d.status,
+          user: d.user,
+          createdAt: d.createdAt,
+        })),
+        approvedDistributorsRecent: approvedDistributorsRecent.map((d: any) => ({
+          id: d.id,
+          distributorName: d.businessName || d.name,
+          applicantName: d.name,
+          distributorCode: d.distributorCode,
+          district: d.district,
+          taluk: d.taluk,
+          distributorFee: Number(d.distributorFee || 399),
+          paymentReference: d.paymentReference,
+          paymentProofUrl: d.paymentProofUrl,
+          status: d.status,
+          user: d.user,
+          updatedAt: d.updatedAt,
+        })),
         pendingCentres: centresPending.map((c) => ({
           id: c.id,
           centreName: c.centreName,
@@ -1314,6 +1410,117 @@ export class AdminService {
   }
 
   /**
+   * Admin verifies distributor registration fee and activates distributor
+   */
+  async verifyDistributorRegistrationFee(adminUser: any, distributorId: string) {
+    const distributor = await this.prisma.distributor.findUnique({
+      where: { id: distributorId },
+      include: { user: true },
+    });
+    if (!distributor) {
+      throw new NotFoundException(`Distributor '${distributorId}' not found`);
+    }
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const d = await (tx as any).distributor.update({
+        where: { id: distributorId },
+        data: {
+          status: 'ACTIVE',
+          feePaid: true,
+        },
+      });
+
+      if (distributor.userId) {
+        await tx.user.update({
+          where: { id: distributor.userId },
+          data: {
+            status: UserStatus.ACTIVE,
+            registrationDate: new Date(),
+          },
+        });
+      }
+
+      return d;
+    });
+
+    await this.prisma.auditLog.create({
+      data: {
+        actorId: adminUser?.id,
+        actorType: 'ADMIN',
+        action: 'DISTRIBUTOR_REGISTRATION_FEE_VERIFIED',
+        entity: 'Distributor',
+        entityId: distributorId,
+        metadata: {
+          verifiedBy: adminUser?.email,
+          distributorName: distributor.name,
+          paymentReference: (distributor as any).paymentReference,
+        },
+      },
+    });
+
+    return {
+      message: `Distributor '${distributor.name}' registration fee verified and account activated.`,
+      distributor: updated,
+    };
+  }
+
+  /**
+   * Admin rejects distributor registration fee
+   */
+  async rejectDistributorRegistrationFee(adminUser: any, distributorId: string, reason?: string) {
+    const distributor = await this.prisma.distributor.findUnique({
+      where: { id: distributorId },
+      include: { user: true },
+    });
+    if (!distributor) {
+      throw new NotFoundException(`Distributor '${distributorId}' not found`);
+    }
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const d = await (tx as any).distributor.update({
+        where: { id: distributorId },
+        data: {
+          feePaid: false,
+          paymentReference: null,
+          paymentProofUrl: null,
+          status: 'SUSPENDED',
+        },
+      });
+
+      if (distributor.userId) {
+        await tx.user.update({
+          where: { id: distributor.userId },
+          data: {
+            status: UserStatus.PAYMENT_PENDING,
+          },
+        });
+      }
+
+      return d;
+    });
+
+    await this.prisma.auditLog.create({
+      data: {
+        actorId: adminUser?.id,
+        actorType: 'ADMIN',
+        action: 'DISTRIBUTOR_REGISTRATION_FEE_REJECTED',
+        entity: 'Distributor',
+        entityId: distributorId,
+        metadata: {
+          rejectedBy: adminUser?.email,
+          distributorName: distributor.name,
+          reason: reason || 'Invalid payment reference or unverified proof',
+        },
+      },
+    });
+
+    return {
+      message: `Distributor '${distributor.name}' registration fee was rejected.`,
+      distributor: updated,
+    };
+  }
+
+  /**
    * Admin rejects partner franchise fee and disables partner
    */
   async rejectPartnerFranchiseFee(adminUser: any, partnerId: string, reason?: string) {
@@ -1365,6 +1572,19 @@ export class AdminService {
     return {
       message: `Partner ${updated.name} (${updated.partnerCode}) franchise application rejected.`,
       partner: updated,
+    };
+  }
+
+  /**
+   * Dispatches summary of all pending ledger waiting action items to Telegram
+   */
+  async notifyLedgerPendingTelegram() {
+    const overview = await this.getLedgerOverview();
+    const result = await this.notifications.sendTelegramLedgerPendingSummary(overview.waitingActionItems);
+    return {
+      success: result.success !== false,
+      waitingActionItems: overview.waitingActionItems,
+      result,
     };
   }
 }

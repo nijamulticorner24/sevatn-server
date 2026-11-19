@@ -6,6 +6,7 @@ import {
   NotFoundException,
   ConflictException,
   Logger,
+  Optional,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
@@ -23,10 +24,11 @@ import {
   RequestEmailChangeDto,
   VerifyEmailChangeDto,
 } from './dto/auth.dto';
-import { UserStatus, CentreStatus, Role, InvitationStatus, Prisma } from '@prisma/client';
+import { UserStatus, CentreStatus, PartnerStatus, Role, InvitationStatus, Prisma } from '@prisma/client';
 import { isValidCoordinate } from '../common/utils/geo';
-
 import { EventsGateway } from '../events/events.gateway';
+import { NotificationsService } from '../notifications/notifications.service';
+import { S3StorageService } from '../common/storage/s3-storage.service';
 
 interface OtpSession {
   otp: string;
@@ -57,6 +59,8 @@ export class AuthService {
     private jwtService: JwtService,
     private audit: AuditService,
     private eventsGateway: EventsGateway,
+    private notifications: NotificationsService,
+    @Optional() private s3Storage?: S3StorageService,
   ) {}
 
   /**
@@ -355,30 +359,29 @@ export class AuthService {
   async verifyRegistrationPayment(dto: VerifyRegistrationPaymentDto) {
     const user = await this.prisma.user.findUnique({
       where: { id: dto.userId },
-      include: { centre: true, wallet: true },
+      include: { centre: true, wallet: true, distributorProfile: true, partnerProfile: true },
     });
 
     if (!user) {
       throw new NotFoundException('User account not found');
     }
 
-    if (user.status === UserStatus.ACTIVE && user.centre?.feePaid) {
-      return {
-        message: 'Account is already active (idempotent)',
-        user: this.sanitizeUser(user),
-        centre: user.centre,
-      };
-    }
-
-    const registrationFee = Number(user.centre?.registrationFee || 249);
-    const now = new Date();
-    const expiryDate = new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000); // 1-year active license
-    const isOnline = dto.paymentMethod === 'ONLINE' || (!dto.paymentMethod && !dto.screenshotUrl);
-    const paymentRef = dto.paymentReference?.trim() || (dto.screenshotUrl ? 'RECEIPT_PROOF_ATTACHED' : `PAY-${Date.now()}`);
-
     const config = await this.prisma.systemConfig.findUnique({ where: { id: 'default' } });
     const onlineEnabled = config?.onlinePaymentEnabled ?? true;
     const offlineEnabled = config?.offlinePaymentEnabled ?? true;
+
+    // Calculate fee based on role
+    let feeAmount = 249;
+    if (user.role === Role.DISTRIBUTOR) {
+      feeAmount = Number((user.distributorProfile as any)?.distributorFee || (config as any)?.distributorFee || 399);
+    } else if (user.role === Role.PARTNER) {
+      feeAmount = Number(user.partnerProfile?.franchiseFee || config?.franchiseFee || 599);
+    } else {
+      feeAmount = Number(user.centre?.registrationFee || config?.registrationFee || 249);
+    }
+
+    const isOnline = dto.paymentMethod === 'ONLINE' || (!dto.paymentMethod && !dto.screenshotUrl);
+    const paymentRef = dto.paymentReference?.trim() || (dto.screenshotUrl ? 'RECEIPT_PROOF_ATTACHED' : `PAY-${Date.now()}`);
 
     if (isOnline && !onlineEnabled) {
       throw new BadRequestException('Online payment gateway method is currently disabled by administrator.');
@@ -389,6 +392,9 @@ export class AuthService {
     if (!onlineEnabled && !offlineEnabled) {
       throw new BadRequestException('All registration payment methods are currently disabled by administrator.');
     }
+
+    const now = new Date();
+    const expiryDate = new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000);
 
     if (isOnline) {
       // 1. ONLINE GATEWAY: Instant auto-verification & activation
@@ -402,91 +408,205 @@ export class AuthService {
           },
         });
 
-        const updatedCentre = await (tx as any).centre.update({
-          where: { userId: user.id },
-          data: {
-            status: CentreStatus.ACTIVE,
-            feePaid: true,
-            feeTransactionId: paymentRef,
-          },
-        });
+        let updatedEntity: any = null;
+        if (user.role === Role.CENTRE && user.centre) {
+          updatedEntity = await (tx as any).centre.update({
+            where: { id: user.centre.id },
+            data: {
+              status: CentreStatus.ACTIVE,
+              feePaid: true,
+              feeTransactionId: paymentRef,
+            },
+          });
+        } else if (user.role === Role.DISTRIBUTOR && user.distributorProfile) {
+          updatedEntity = await (tx as any).distributor.update({
+            where: { id: user.distributorProfile.id },
+            data: {
+              status: 'ACTIVE',
+              feePaid: true,
+              paymentReference: paymentRef,
+            },
+          });
+        } else if (user.role === Role.PARTNER && user.partnerProfile) {
+          updatedEntity = await (tx as any).partner.update({
+            where: { id: user.partnerProfile.id },
+            data: {
+              status: PartnerStatus.ACTIVE,
+              feePaid: true,
+              paymentReference: paymentRef,
+            },
+          });
+        }
 
-        return { updatedUser, updatedCentre };
+        return { updatedUser, updatedEntity };
       });
 
       await this.audit.log({
         actorId: user.id,
         actorType: 'USER',
         action: 'USER_PAYMENT_VERIFIED',
-        entity: 'Centre',
-        entityId: result.updatedCentre.id,
+        entity: user.role,
+        entityId: user.id,
         metadata: {
           paymentReference: paymentRef,
           paymentMethod: 'ONLINE_AUTO_VERIFIED',
-          amount: registrationFee,
+          amount: feeAmount,
           expiryDate,
         },
       });
 
-      // Broadcast WebSocket Live Event to Partner & Admin
-      this.eventsGateway.notifyCentreActivated(user.partnerId || undefined, {
-        centreCode: result.updatedCentre.centreCode || '',
-        centreName: result.updatedCentre.centreName,
-        district: result.updatedCentre.district,
-        taluk: result.updatedCentre.taluk,
-        timestamp: new Date().toISOString(),
-      });
+      if (user.role === Role.CENTRE && result.updatedEntity) {
+        this.eventsGateway.notifyCentreActivated(user.partnerId || undefined, {
+          centreCode: result.updatedEntity.centreCode || '',
+          centreName: result.updatedEntity.centreName,
+          district: result.updatedEntity.district,
+          taluk: result.updatedEntity.taluk,
+          timestamp: new Date().toISOString(),
+        });
+      }
 
       const token = this.generateToken(result.updatedUser);
 
       return {
         message: 'Payment verified successfully! Account is now ACTIVE.',
         user: this.sanitizeUser(result.updatedUser),
-        centre: result.updatedCentre,
+        entity: result.updatedEntity,
         token,
         isAutoActivated: true,
       };
     } else {
       // 2. OFFLINE PAYMENT (QR / UPI): Proof submitted -> Awaiting Admin / Partner Verification
-      const updatedCentre = await (this.prisma as any).centre.update({
-        where: { userId: user.id },
-        data: {
-          status: CentreStatus.PENDING_VERIFICATION,
-          feePaid: false,
-          feeTransactionId: paymentRef,
-          paymentProofUrl: dto.screenshotUrl?.trim() || null,
-        },
+      await this.prisma.user.update({
+        where: { id: user.id },
+        data: { status: UserStatus.PAYMENT_PENDING },
       });
+
+      // Upload payment proof screenshot to AWS S3 bucket if provided
+      let proofUrl = dto.screenshotUrl?.trim() || null;
+      if (proofUrl && this.s3Storage) {
+        try {
+          const s3UploadedUrl = await this.s3Storage.uploadProofImage(
+            proofUrl,
+            `proofs/${user.role.toLowerCase()}`,
+          );
+          if (s3UploadedUrl) {
+            proofUrl = s3UploadedUrl;
+          }
+        } catch (s3Err: any) {
+          this.logger.warn(`S3 upload skipped, falling back: ${s3Err.message}`);
+        }
+      }
+
+      let updatedEntity: any = null;
+      if (user.role === Role.CENTRE && user.centre) {
+        updatedEntity = await (this.prisma as any).centre.update({
+          where: { id: user.centre.id },
+          data: {
+            status: CentreStatus.PENDING_VERIFICATION,
+            feePaid: false,
+            feeTransactionId: paymentRef,
+            paymentProofUrl: proofUrl,
+          },
+        });
+      } else if (user.role === Role.DISTRIBUTOR && user.distributorProfile) {
+        updatedEntity = await (this.prisma as any).distributor.update({
+          where: { id: user.distributorProfile.id },
+          data: {
+            status: 'PENDING_APPROVAL',
+            feePaid: false,
+            paymentReference: paymentRef,
+            paymentProofUrl: proofUrl,
+          },
+        });
+      } else if (user.role === Role.PARTNER && user.partnerProfile) {
+        updatedEntity = await (this.prisma as any).partner.update({
+          where: { id: user.partnerProfile.id },
+          data: {
+            status: PartnerStatus.PENDING_APPROVAL,
+            feePaid: false,
+            paymentReference: paymentRef,
+            paymentProofUrl: proofUrl,
+          },
+        });
+      }
 
       await this.audit.log({
         actorId: user.id,
         actorType: 'USER',
-        action: 'CENTRE_OFFLINE_PAYMENT_SUBMITTED',
-        entity: 'Centre',
-        entityId: updatedCentre.id,
+        action: 'OFFLINE_REGISTRATION_PAYMENT_SUBMITTED',
+        entity: user.role,
+        entityId: user.id,
         metadata: {
           paymentReference: paymentRef,
-          hasScreenshot: !!dto.screenshotUrl,
-          amount: registrationFee,
+          hasScreenshot: !!proofUrl,
+          paymentProofUrl: proofUrl,
+          amount: feeAmount,
+          role: user.role,
           status: 'PENDING_ADMIN_VERIFICATION',
         },
       });
 
       if (this.eventsGateway) {
-        this.eventsGateway.emitToAdmins('admin:centre_payment_submitted', {
-          centreId: updatedCentre.id,
-          centreCode: updatedCentre.centreCode,
-          centreName: updatedCentre.centreName,
-          district: updatedCentre.district,
+        this.eventsGateway.emitToAdmins('admin:payment_submitted', {
+          userId: user.id,
+          role: user.role,
+          name: user.name,
           paymentReference: paymentRef,
-          hasScreenshot: !!dto.screenshotUrl,
+          amount: feeAmount,
+          hasScreenshot: !!proofUrl,
+          paymentProofUrl: proofUrl,
           timestamp: new Date().toISOString(),
         });
       }
 
+      // Fire Telegram Bot payment notification
+      const entityName =
+        user.role === Role.CENTRE
+          ? user.centre?.centreName
+          : user.role === Role.DISTRIBUTOR
+          ? (user.distributorProfile as any)?.businessName || (user.distributorProfile as any)?.name
+          : user.partnerProfile?.name;
+
+      const entityCode =
+        user.role === Role.CENTRE
+          ? user.centre?.centreCode
+          : user.role === Role.DISTRIBUTOR
+          ? (user.distributorProfile as any)?.distributorCode
+          : user.partnerProfile?.partnerCode;
+
+      const district =
+        user.role === Role.CENTRE
+          ? user.centre?.district
+          : user.role === Role.DISTRIBUTOR
+          ? (user.distributorProfile as any)?.district
+          : user.partnerProfile?.district;
+
+      const paymentType =
+        user.role === Role.CENTRE
+          ? 'CENTRE_ONBOARDING'
+          : user.role === Role.DISTRIBUTOR
+          ? 'DISTRIBUTOR_LICENSE'
+          : 'PARTNER_FRANCHISE';
+
+      this.notifications
+        .sendTelegramPaymentNotification({
+          paymentType,
+          amount: feeAmount,
+          paymentReference: paymentRef,
+          screenshotUrl: proofUrl || dto.screenshotUrl,
+          applicantName: user.name,
+          entityName,
+          entityCode,
+          district,
+          mobile: user.mobile,
+          email: user.email,
+          role: user.role,
+        })
+        .catch((err) => this.logger.error(`[Telegram Notification] Error: ${err.message}`));
+
       return {
-        message: 'Offline registration fee reference and receipt proof submitted successfully. Platform Admin will verify and activate your centre account.',
-        centre: updatedCentre,
+        message: 'Offline registration fee reference and receipt proof submitted successfully. Platform Admin will verify and activate your account.',
+        entity: updatedEntity,
         isAutoActivated: false,
       };
     }
@@ -788,6 +908,21 @@ export class AuthService {
       }
     }
 
+    // Check Distributor status & payment verification
+    if (user.role === Role.DISTRIBUTOR) {
+      const distProfile = (user as any).distributorProfile;
+      if (user.status === UserStatus.PAYMENT_PENDING || (distProfile && !distProfile.feePaid)) {
+        if (distProfile?.paymentReference || distProfile?.paymentProofUrl) {
+          throw new ForbiddenException(
+            'Your distributor license fee payment proof has been submitted and is currently under verification by the platform administrator. Login will be enabled once approved.',
+          );
+        }
+        throw new ForbiddenException(
+          'Your distributor license fee payment is pending. Please complete your license payment to activate and access your account.',
+        );
+      }
+    }
+
     // Check Centre status & payment verification
     if (user.role === Role.CENTRE) {
       if (user.status === UserStatus.PAYMENT_PENDING || (user.centre && !user.centre.feePaid)) {
@@ -796,14 +931,11 @@ export class AuthService {
             'Your centre registration payment proof has been submitted and is currently under verification by the platform administrator. Login will be enabled once approved.',
           );
         }
-        throw new ForbiddenException(
-          'Your centre onboarding registration fee payment is pending. Please complete your registration payment to activate and access your account.',
-        );
-      }
-      if (user.centre && user.centre.status === CentreStatus.PENDING_VERIFICATION && !user.centre.feePaid) {
-        throw new ForbiddenException(
-          'Your centre registration is currently under review and payment verification by the platform administrator.',
-        );
+        if (!user.mustChangePassword) {
+          throw new ForbiddenException(
+            'Your centre onboarding registration fee payment is pending. Please complete your registration payment to activate and access your account.',
+          );
+        }
       }
       if (user.centre && user.centre.status === CentreStatus.SUSPENDED) {
         throw new ForbiddenException(

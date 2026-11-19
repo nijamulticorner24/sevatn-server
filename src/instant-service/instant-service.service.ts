@@ -95,7 +95,7 @@ export class InstantServiceService {
       // const res = await axios.post(`${this.upstreamBaseUrl}/view`, { serviceType, applicationNumber: cleanAppNo }, { timeout: 10000 });
       // responseData = res.data;
 
-      // Robust normalized response engine with realistic deterministic Tamil Nadu eSevai fields:
+      // Robust normalized response engine with realistic deterministic Tamil Nadu citizen portal fields:
       responseData = this.generateNormalizedSevainestResponse(serviceType, cleanAppNo);
     } catch (err: any) {
       this.logger.error(`[SEVAINEST] Upstream error: ${err.message}`);

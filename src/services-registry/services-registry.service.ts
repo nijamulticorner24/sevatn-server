@@ -24,7 +24,7 @@ export class ServicesRegistryService implements OnModuleInit {
         code: 'TICKET_ASSIST',
         name: 'TicketAssist Sabarimala',
         description:
-          'Automated & Assisted Sabarimala Darshan Virtual-Q booking assistance for eSevai / Computer Centres.',
+          'Automated & Assisted Sabarimala Darshan Virtual-Q booking assistance for Booking / Computer Centres.',
         category: 'Pilgrim Booking Services',
         status: 'ACTIVE',
         config: {
@@ -37,7 +37,7 @@ export class ServicesRegistryService implements OnModuleInit {
         code: 'INSTANT_SERVICE',
         name: 'Instant Service (Sevainest View)',
         description:
-          'Official eSevai Certificate & Document status verification for Community, Income, Nativity, Patta/Chitta and Land records.',
+          'Official Certificate & Document status verification for Community, Income, Nativity, Patta/Chitta and Land records.',
         category: 'Citizen e-Governance',
         status: 'ACTIVE',
         config: {

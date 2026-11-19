@@ -5,9 +5,10 @@ import { PartnerDistributorsController } from './partner-distributors.controller
 import { PrismaModule } from '../prisma/prisma.module';
 import { AuditModule } from '../audit/audit.module';
 import { PricingModule } from '../pricing/pricing.module';
+import { EventsModule } from '../events/events.module';
 
 @Module({
-  imports: [PrismaModule, AuditModule, PricingModule],
+  imports: [PrismaModule, AuditModule, PricingModule, EventsModule],
   controllers: [
     DistributorController,
     AdminDistributorsController,

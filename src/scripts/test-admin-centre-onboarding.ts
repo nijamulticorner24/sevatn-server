@@ -16,7 +16,8 @@ async function runSecurityAndFunctionalityTests() {
   const jwtService = new JwtService({ secret: process.env.JWT_SECRET || 'ticketassist-dev-secret-2026' });
   const auditService = new AuditService(prismaService);
   const eventsGateway = { emitBookingStatus: () => {}, broadcastToAdmins: () => {}, emitToUser: () => {} } as any;
-  const authService = new AuthService(prismaService, jwtService, auditService, eventsGateway);
+  const notificationsService = { sendTelegramPaymentNotification: async () => {}, testTelegramNotification: async () => ({ success: true }) } as any;
+  const authService = new AuthService(prismaService, jwtService, auditService, eventsGateway, notificationsService);
   const centresService = new CentresService(prismaService, auditService);
 
   let passed = 0;
@@ -52,7 +53,7 @@ async function runSecurityAndFunctionalityTests() {
       where: { role: Role.SUPER_ADMIN },
     });
     const existingCentreUser = await prisma.user.findFirst({
-      where: { role: Role.CENTRE, email: 'muthu.esevai@gmail.com' },
+      where: { role: Role.CENTRE },
     });
 
     assert(!!adminUser, 'Setup: Admin user found in database');

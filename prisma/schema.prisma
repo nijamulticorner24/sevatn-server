@@ -690,6 +690,7 @@ model SystemConfig {
   workerShare            Decimal  @default(20.00)
   registrationFee        Decimal  @default(249.00)
   franchiseFee           Decimal  @default(599.00)
+  distributorFee         Decimal  @default(399.00)
   accountValidityDays    Int      @default(365)
   checkingIntervalSeconds Int     @default(300) // 5 minutes compliant interval
   leaseTimeoutSeconds    Int      @default(120) // 2 minutes heartbeat lease
@@ -710,6 +711,17 @@ model SystemConfig {
   offlineAccountNumber   String?  @default("50200012345678")
   offlineIfscCode        String?  @default("HDFC0001234")
   offlinePaymentInstructions String? @default("Scan the official QR code or pay via UPI. Enter your 12-digit UTR/Reference ID for instant validation.")
+
+  // Telegram Payment Notification Bot
+  telegramBotEnabled     Boolean  @default(false)
+  telegramBotToken       String?
+  telegramChatId         String?
+
+  // Site Header Top Marquee Announcement Bar
+  headerMarqueeEnabled   Boolean  @default(false)
+  headerMarqueeText      String?
+  headerMarqueeSpeed     Int      @default(30)
+  headerMarqueeBgColor   String?  @default("DEFAULT")
 
   // Hero Section Customization
   heroTitle              String?
@@ -791,6 +803,7 @@ model Partner {
   commissionPercentage Decimal             @default(20.00)
   commissionSlab       String?             @default("STANDARD")
   markup               Decimal             @default(0.00) // Independent Partner ticket markup
+  baseTicketPrice      Decimal?            // Dynamic Base Ticket Price configured for this partner
   distributors         Distributor[]
   invitations          PartnerInvitation[]
   registeredUsers  User[]              @relation("PartnerRegisteredUsers")
@@ -855,11 +868,16 @@ model Distributor {
   district             String?
   taluk                String?
   status               String                  @default("ACTIVE") // ACTIVE | INACTIVE | SUSPENDED
+  distributorFee       Decimal                 @default(399.00)
+  feePaid              Boolean                 @default(false)
+  paymentReference     String?
+  paymentProofUrl      String?
   commissionRate       Decimal                 @default(0.00)
   commissionPercentage Decimal                 @default(10.00)
   commissionSlab       String?                 @default("STANDARD")
   markup               Decimal                 @default(0.00) // Independent Distributor ticket markup
   invitations          DistributorInvitation[]
+  payouts              DistributorPayout[]
   centres              Centre[]
   registeredUsers      User[]                  @relation("DistributorRegisteredUsers")
   createdAt            DateTime                @default(now())
@@ -886,6 +904,26 @@ model DistributorInvitation {
 
   @@index([token])
   @@index([distributorId, status])
+}
+
+model DistributorPayout {
+  id               String       @id @default(uuid())
+  distributorId    String
+  distributor      Distributor  @relation(fields: [distributorId], references: [id], onDelete: Cascade)
+  amount           Decimal
+  upiId            String
+  accountHolder    String?
+  status           PayoutStatus @default(REQUESTED)
+  paymentReference String?      // UTR / Transaction reference ID from bank transfer
+  screenshotUrl    String?      // Proof of settlement (base64 image or screenshot URL)
+  adminNotes       String?
+  requestedAt      DateTime     @default(now())
+  settledAt        DateTime?
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  @@index([distributorId])
+  @@index([status])
 }
 
 model RegisteredLocation {

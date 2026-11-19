@@ -2,14 +2,18 @@ import {
   PrismaClient,
   Role,
   UserStatus,
-  WorkerStatus,
+  Prisma,
 } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
+import * as dotenv from 'dotenv';
+import * as path from 'path';
+
+dotenv.config({ path: path.join(__dirname, '../.env') });
 
 const prisma = new PrismaClient();
 
 async function main() {
-  console.log('🌱 Wiping database & applying minimal seed...');
+  console.log('🌱 Applying clean database state (Only SUPER_ADMIN)...');
 
   // Wipe all existing table data
   try {
@@ -31,7 +35,7 @@ async function main() {
   const passwordHash = await bcrypt.hash('Admin@123456', 10);
 
   // Super Admin (fixed ID prevents token invalidation across dev re-seeds)
-  await prisma.user.create({
+  const superAdmin = await prisma.user.create({
     data: {
       id: 'cb75ce11-ab7b-49dd-9038-be51871f2bb3',
       name: 'Super Admin',
@@ -43,34 +47,64 @@ async function main() {
     },
   });
 
-  // Demo Centre User
-  const demoUser = await prisma.user.create({
-    data: {
-      name: 'Demo User',
-      email: 'demo@gmail.com',
-      mobile: '9876500000',
-      passwordHash,
-      role: Role.CENTRE,
-      status: UserStatus.ACTIVE,
-    },
-  });
-
-  // Wallet for Demo User
+  // Wallet for Super Admin
   await prisma.wallet.create({
     data: {
-      userId: demoUser.id,
-      availableBalance: 5000,
-      reservedBalance: 0,
+      userId: superAdmin.id,
+      availableBalance: new Prisma.Decimal(0),
+      reservedBalance: new Prisma.Decimal(0),
     },
   });
 
-  console.log('✅ Minimal seed done (No pre-seeded workers — register via /admin/fleet)!');
+  // Core Platform Services
+  await prisma.platformService.createMany({
+    data: [
+      {
+        code: 'TICKET_ASSIST',
+        name: 'Sabarimala Virtual Q Booking Assistance',
+        category: 'PILGRIMAGE',
+        status: 'ACTIVE',
+      },
+      {
+        code: 'INSTANT_SERVICE',
+        name: 'Instant E-Governance Verification',
+        category: 'GOVERNMENT',
+        status: 'ACTIVE',
+      },
+    ],
+  });
+
+  // System Configuration Defaults
+  await (prisma.systemConfig as any).create({
+    data: {
+      id: 'default',
+      serviceFee: new Prisma.Decimal(10.0),
+      registrationFee: new Prisma.Decimal(500.0),
+      franchiseFee: new Prisma.Decimal(599.0),
+      distributorFee: new Prisma.Decimal(2500.0),
+      onlinePaymentEnabled: true,
+      offlinePaymentEnabled: true,
+      humanAssistedModeOnly: false,
+    },
+  });
+
+  // Dynamic Pricing Architecture Default
+  await (prisma.pricingConfig as any).create({
+    data: {
+      id: 'default',
+      baseTicketPrice: new Prisma.Decimal(10.0),
+      maxPartnerMarkup: new Prisma.Decimal(2.0),
+      maxDistributorMarkup: new Prisma.Decimal(2.0),
+      isActive: true,
+      version: 1,
+    },
+  });
+
+  console.log('✅ Clean database initialized with Super Admin ONLY!');
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log('🔑 Login Credentials (all use same password):');
-  console.log('   Password : Admin@123456');
-  console.log('   ─────────────────────────────────────────────');
-  console.log('   Super Admin :   ');
-  console.log('   Demo User   : demo@gmail.com');
+  console.log('🔑 Login Credentials:');
+  console.log('   Super Admin : superadmin@ticketassist.in');
+  console.log('   Password    : Admin@123456');
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 }
 

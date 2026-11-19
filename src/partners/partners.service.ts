@@ -20,6 +20,9 @@ import { randomBytes } from 'crypto';
 import * as bcrypt from 'bcrypt';
 
 import { EventsGateway } from '../events/events.gateway';
+import { NotificationsService } from '../notifications/notifications.service';
+import { S3StorageService } from '../common/storage/s3-storage.service';
+import { Optional } from '@nestjs/common';
 
 export type PartnerStatusType = 'PENDING_PAYMENT' | 'PENDING_APPROVAL' | 'ACTIVE' | 'SUSPENDED' | 'DISABLED';
 
@@ -39,6 +42,8 @@ export class PartnersService {
     private prisma: PrismaService,
     private audit: AuditService,
     private eventsGateway: EventsGateway,
+    @Optional() private notifications?: NotificationsService,
+    @Optional() private s3Storage?: S3StorageService,
   ) {}
 
   /**
@@ -120,6 +125,7 @@ export class PartnersService {
         commissionPercentage: new Prisma.Decimal(commissionPercentage),
         commissionRate: new Prisma.Decimal(commissionRate),
         commissionSlab: dto.commissionSlab?.trim() || `${commissionPercentage}%`,
+        baseTicketPrice: dto.baseTicketPrice !== undefined && dto.baseTicketPrice !== null ? new Prisma.Decimal(Number(dto.baseTicketPrice)) : null,
       },
     });
 
@@ -342,6 +348,12 @@ export class PartnersService {
       commissionPercentage: newCommissionPercentage !== undefined ? new Prisma.Decimal(newCommissionPercentage) : undefined,
       commissionRate: newCommissionRate !== undefined ? new Prisma.Decimal(newCommissionRate) : undefined,
       commissionSlab: dto.commissionSlab !== undefined ? dto.commissionSlab?.trim() : undefined,
+      baseTicketPrice:
+        dto.baseTicketPrice !== undefined
+          ? dto.baseTicketPrice !== null && !isNaN(Number(dto.baseTicketPrice)) && Number(dto.baseTicketPrice) >= 0
+            ? new Prisma.Decimal(Number(dto.baseTicketPrice))
+            : null
+          : undefined,
     };
 
     if (dto.status === 'ACTIVE') {
@@ -1021,7 +1033,7 @@ export class PartnersService {
       .reduce((sum: number, p: any) => sum + Number(p.amount), 0);
 
     // Calculate base earnings
-    const baseBalance = Number((partner as any).balance || 3480);
+    const baseBalance = Number((partner as any).balance || 0);
     const availableBalance = Math.max(0, baseBalance - pendingWithdrawal - totalSettled);
     const totalEarned = baseBalance;
 
@@ -1130,6 +1142,24 @@ export class PartnersService {
       });
     }
 
+    // Fire Telegram Bot notification for pending partner payout in /admin/ledger
+    if (this.notifications) {
+      this.notifications
+        .sendTelegramPaymentNotification({
+          paymentType: 'PARTNER_PAYOUT',
+          amount,
+          paymentReference: cleanUpi,
+          applicantName: actorUser?.name || partnerSummary.partner.name,
+          entityName: partnerSummary.partner.name,
+          entityCode: (partnerSummary.partner as any)?.partnerCode,
+          district: (partnerSummary.partner as any)?.district,
+          mobile: actorUser?.mobile,
+          email: actorUser?.email,
+          role: 'PARTNER',
+        })
+        .catch((err) => this.logger.error(`[Telegram Partner Payout Notification] Error: ${err.message}`));
+    }
+
     return {
       message: 'Payout request submitted successfully. Admin will process transfer and upload receipt.',
       payout,
@@ -1195,12 +1225,22 @@ export class PartnersService {
       throw new BadRequestException('This payout has already been settled');
     }
 
+    let s3Screenshot = dto.screenshotUrl?.trim() || null;
+    if (s3Screenshot && this.s3Storage) {
+      try {
+        const uploaded = await this.s3Storage.uploadProofImage(s3Screenshot, 'payouts/partner');
+        if (uploaded) s3Screenshot = uploaded;
+      } catch (err: any) {
+        this.logger.warn(`S3 upload skipped for partner payout: ${err.message}`);
+      }
+    }
+
     const settled = await (this.prisma as any).partnerPayout.update({
       where: { id: payoutId },
       data: {
         status: 'SETTLED',
         paymentReference: dto.paymentReference.trim(),
-        screenshotUrl: dto.screenshotUrl || null,
+        screenshotUrl: s3Screenshot,
         adminNotes: dto.adminNotes?.trim() || existing.adminNotes,
         settledAt: new Date(),
       },
@@ -1424,12 +1464,22 @@ export class PartnersService {
         throw new BadRequestException('Please provide either the UPI UTR reference number or upload the payment receipt screenshot.');
       }
 
+      let s3Proof = dto.screenshotUrl?.trim() || null;
+      if (s3Proof && this.s3Storage) {
+        try {
+          const uploaded = await this.s3Storage.uploadProofImage(s3Proof, 'proofs/partner');
+          if (uploaded) s3Proof = uploaded;
+        } catch (err: any) {
+          this.logger.warn(`S3 upload skipped for partner onboarding: ${err.message}`);
+        }
+      }
+
       const updated = await (this.prisma as any).partner.update({
         where: { id: partnerId },
         data: {
           status: PartnerStatusValues.PENDING_APPROVAL,
           paymentReference: offlineRef,
-          paymentProofUrl: dto.screenshotUrl?.trim() || null,
+          paymentProofUrl: s3Proof,
         },
       });
 

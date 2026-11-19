@@ -43,6 +43,12 @@ export class AllExceptionsFilter implements ExceptionFilter {
       );
     }
 
+    const origin = request.headers.origin;
+    if (origin && !response.getHeader('access-control-allow-origin')) {
+      response.setHeader('Access-Control-Allow-Origin', origin);
+      response.setHeader('Access-Control-Allow-Credentials', 'true');
+    }
+
     response.status(status).json({
       statusCode: status,
       timestamp: new Date().toISOString(),

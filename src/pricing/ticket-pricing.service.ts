@@ -148,9 +148,9 @@ export class TicketPricingService {
    */
   async getPartnerMarkup(partnerId: string) {
     const config = await this.getPricingConfig();
-    const partner = await this.prisma.partner.findUnique({
+    const partner = await (this.prisma.partner as any).findUnique({
       where: { id: partnerId },
-      select: { id: true, partnerCode: true, name: true, markup: true },
+      select: { id: true, partnerCode: true, name: true, markup: true, baseTicketPrice: true },
     });
 
     if (!partner) {
@@ -158,14 +158,20 @@ export class TicketPricingService {
     }
 
     const partnerMarkup = Number(partner.markup || 0);
+    const partnerBasePrice = (partner as any)?.baseTicketPrice;
+    const isCustomRate =
+      partnerBasePrice !== undefined && partnerBasePrice !== null && Number(partnerBasePrice) >= 0;
+    const partnerBase = isCustomRate ? Number(partnerBasePrice) : config.baseTicketPrice;
+
     return {
       partnerId: partner.id,
       partnerCode: partner.partnerCode,
       partnerName: partner.name,
-      baseTicketPrice: config.baseTicketPrice,
+      baseTicketPrice: partnerBase,
+      isCustomRate,
       currentMarkup: partnerMarkup,
       maxAllowedMarkup: config.maxPartnerMarkup,
-      effectivePrice: config.baseTicketPrice + partnerMarkup,
+      effectivePrice: partnerBase + partnerMarkup,
     };
   }
 
@@ -185,8 +191,9 @@ export class TicketPricingService {
       );
     }
 
-    const existingPartner = await this.prisma.partner.findUnique({
+    const existingPartner = await (this.prisma.partner as any).findUnique({
       where: { id: partnerId },
+      select: { id: true, partnerCode: true, name: true, markup: true, baseTicketPrice: true },
     });
     if (!existingPartner) {
       throw new NotFoundException('Partner record not found');
@@ -214,13 +221,19 @@ export class TicketPricingService {
       },
     });
 
+    const partnerBasePrice = (existingPartner as any)?.baseTicketPrice;
+    const isCustomRate =
+      partnerBasePrice !== undefined && partnerBasePrice !== null && Number(partnerBasePrice) >= 0;
+    const partnerBase = isCustomRate ? Number(partnerBasePrice) : config.baseTicketPrice;
+
     return {
       partnerId: updated.id,
       partnerCode: updated.partnerCode,
       currentMarkup: Number(updated.markup),
       maxAllowedMarkup: config.maxPartnerMarkup,
-      baseTicketPrice: config.baseTicketPrice,
-      effectivePrice: config.baseTicketPrice + Number(updated.markup),
+      baseTicketPrice: partnerBase,
+      isCustomRate,
+      effectivePrice: partnerBase + Number(updated.markup),
       message: 'Partner markup successfully updated.',
     };
   }
@@ -230,11 +243,11 @@ export class TicketPricingService {
    */
   async getDistributorMarkup(distributorId: string) {
     const config = await this.getPricingConfig();
-    const distributor = await this.prisma.distributor.findUnique({
+    const distributor = await (this.prisma.distributor as any).findUnique({
       where: { id: distributorId },
       include: {
         partner: {
-          select: { id: true, partnerCode: true, name: true, markup: true },
+          select: { id: true, partnerCode: true, name: true, markup: true, baseTicketPrice: true },
         },
       },
     });
@@ -245,7 +258,14 @@ export class TicketPricingService {
 
     const distributorMarkup = Number(distributor.markup || 0);
     const partnerMarkup = Number(distributor.partner?.markup || 0);
-    const baseTicketPrice = config.baseTicketPrice;
+    const partnerBaseVal = (distributor.partner as any)?.baseTicketPrice;
+    const isCustomPartnerRate =
+      partnerBaseVal !== undefined &&
+      partnerBaseVal !== null &&
+      Number(partnerBaseVal) >= 0;
+    const baseTicketPrice = isCustomPartnerRate
+      ? Number(partnerBaseVal)
+      : config.baseTicketPrice;
     const finalTicketPrice = baseTicketPrice + partnerMarkup + distributorMarkup;
 
     return {
@@ -256,6 +276,7 @@ export class TicketPricingService {
       partnerCode: distributor.partner?.partnerCode,
       partnerName: distributor.partner?.name,
       baseTicketPrice,
+      isCustomPartnerRate,
       partnerMarkup,
       currentMarkup: distributorMarkup,
       maxAllowedMarkup: config.maxDistributorMarkup,
@@ -279,9 +300,13 @@ export class TicketPricingService {
       );
     }
 
-    const existingDistributor = await this.prisma.distributor.findUnique({
+    const existingDistributor = await (this.prisma.distributor as any).findUnique({
       where: { id: distributorId },
-      include: { partner: true },
+      include: {
+        partner: {
+          select: { id: true, partnerCode: true, name: true, markup: true, baseTicketPrice: true },
+        },
+      },
     });
     if (!existingDistributor) {
       throw new NotFoundException('Distributor not found');
@@ -289,7 +314,7 @@ export class TicketPricingService {
 
     const previousMarkup = Number(existingDistributor.markup || 0);
 
-    const updated = await this.prisma.distributor.update({
+    const updated = await (this.prisma.distributor as any).update({
       where: { id: distributorId },
       data: {
         markup: new Prisma.Decimal(markupValue),
@@ -310,7 +335,14 @@ export class TicketPricingService {
     });
 
     const partnerMarkup = Number(existingDistributor.partner?.markup || 0);
-    const baseTicketPrice = config.baseTicketPrice;
+    const partnerBaseVal = (existingDistributor.partner as any)?.baseTicketPrice;
+    const isCustomPartnerRate =
+      partnerBaseVal !== undefined &&
+      partnerBaseVal !== null &&
+      Number(partnerBaseVal) >= 0;
+    const baseTicketPrice = isCustomPartnerRate
+      ? Number(partnerBaseVal)
+      : config.baseTicketPrice;
     const finalTicketPrice = baseTicketPrice + partnerMarkup + markupValue;
 
     return {
@@ -319,6 +351,7 @@ export class TicketPricingService {
       currentMarkup: Number(updated.markup),
       maxAllowedMarkup: config.maxDistributorMarkup,
       baseTicketPrice,
+      isCustomPartnerRate,
       partnerMarkup,
       finalTicketPrice,
       message: 'Distributor markup successfully updated.',
@@ -337,7 +370,7 @@ export class TicketPricingService {
     const ticketQuantity = Math.max(1, Number(quantity) || 1);
 
     const config = await this.getPricingConfig();
-    const baseTicketPrice = config.baseTicketPrice;
+    let baseTicketPrice = config.baseTicketPrice;
 
     // Fetch user and hierarchy relations
     const user = await this.prisma.user.findUnique({
@@ -378,6 +411,14 @@ export class TicketPricingService {
 
     if (activePartner) {
       resolvedPartnerId = activePartner.id;
+      const partnerBaseOverride = (activePartner as any)?.baseTicketPrice;
+      if (
+        partnerBaseOverride !== undefined &&
+        partnerBaseOverride !== null &&
+        Number(partnerBaseOverride) >= 0
+      ) {
+        baseTicketPrice = Number(partnerBaseOverride);
+      }
       // Cap at Super Admin maximum limit
       partnerMarkup = Math.min(Number(activePartner.markup || 0), config.maxPartnerMarkup);
     }

@@ -10,7 +10,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { EventsGateway } from '../events/events.gateway';
 import { CreateCentreDto, UpdateCentreDto } from './dto/centre.dto';
-import { Role, UserStatus, CentreStatus, Prisma } from '@prisma/client';
+import { Role, UserStatus, CentreStatus, TransactionType, TransactionStatus, Prisma } from '@prisma/client';
 import { isValidCoordinate } from '../common/utils/geo';
 import * as bcrypt from 'bcrypt';
 
@@ -83,6 +83,7 @@ export class CentresService {
           user: {
             include: {
               registeredLocation: true,
+              wallet: true,
             },
           },
         },
@@ -141,8 +142,15 @@ export class CentresService {
     let distributorId: string | null = null;
 
     if (actorUser.role === Role.DISTRIBUTOR) {
+      const orConditions: any[] = [{ userId: actorUser.id }];
+      if (actorUser.distributorId) {
+        orConditions.push({ id: actorUser.distributorId });
+      }
+      if (actorUser.distributorProfile?.id) {
+        orConditions.push({ id: actorUser.distributorProfile.id });
+      }
       const distProfile = await this.prisma.distributor.findFirst({
-        where: { OR: [{ userId: actorUser.id }, { id: actorUser.distributorId }] },
+        where: { OR: orConditions },
       });
       if (!distProfile || distProfile.status !== 'ACTIVE') {
         throw new ForbiddenException('Only active Distributors can create Centre accounts.');
@@ -150,22 +158,29 @@ export class CentresService {
       distributorId = distProfile.id;
       partnerId = distProfile.partnerId;
     } else if (actorUser.role === Role.PARTNER) {
+      const orConditions: any[] = [{ userId: actorUser.id }];
+      if (actorUser.partnerId) {
+        orConditions.push({ id: actorUser.partnerId });
+      }
+      if (actorUser.partnerProfile?.id) {
+        orConditions.push({ id: actorUser.partnerProfile.id });
+      }
       const partnerProfile = await this.prisma.partner.findFirst({
-        where: { OR: [{ userId: actorUser.id }, { id: actorUser.partnerId }] },
+        where: { OR: orConditions },
       });
       if (!partnerProfile || partnerProfile.status !== 'ACTIVE') {
         throw new ForbiddenException('Only active Partners can create Centre accounts.');
       }
       partnerId = partnerProfile.id;
-      if (dto.distributorId) {
+      if (dto.distributorId && dto.distributorId.trim() !== '') {
         const dist = await this.prisma.distributor.findFirst({
-          where: { id: dto.distributorId, partnerId: partnerProfile.id },
+          where: { id: dto.distributorId.trim(), partnerId: partnerProfile.id },
         });
         if (dist) distributorId = dist.id;
       }
     } else if (actorUser.role === Role.SUPER_ADMIN) {
-      partnerId = dto.partnerId || null;
-      distributorId = dto.distributorId || null;
+      partnerId = dto.partnerId?.trim() || null;
+      distributorId = dto.distributorId?.trim() || null;
     }
 
     // 1. Verify User uniqueness (Email / Mobile)
@@ -241,10 +256,10 @@ export class CentresService {
           district: dto.district.trim(),
           taluk: dto.taluk.trim(),
           pincode: dto.pincode?.trim() || null,
-          feePaid: true,
+          feePaid: false,
           registrationFee: new Prisma.Decimal(249),
-          feeTransactionId: `${actorUser.role}-ONBOARDING-${Date.now()}`,
-          status: initialStatus,
+          feeTransactionId: null,
+          status: CentreStatus.PENDING_VERIFICATION,
         },
       });
 
@@ -415,6 +430,7 @@ export class CentresService {
           user: {
             include: {
               registeredLocation: true,
+              wallet: true,
             },
           },
         },
@@ -534,7 +550,7 @@ export class CentresService {
     };
   }
 
-  async reissueActivation(adminUser: any, id: string) {
+  async reissueActivation(actorUser: any, id: string) {
     const centre = await this.prisma.centre.findUnique({
       where: { id },
       include: { user: true },
@@ -542,6 +558,32 @@ export class CentresService {
 
     if (!centre) {
       throw new NotFoundException(`Centre '${id}' not found`);
+    }
+
+    if (actorUser.role === Role.DISTRIBUTOR) {
+      const dist = await this.prisma.distributor.findFirst({
+        where: {
+          OR: [
+            { userId: actorUser.id },
+            { id: actorUser.distributorId || '' },
+          ],
+        },
+      });
+      if (!dist || centre.distributorId !== dist.id) {
+        throw new ForbiddenException('You do not have permission to manage this centre.');
+      }
+    } else if (actorUser.role === Role.PARTNER) {
+      const partner = await this.prisma.partner.findFirst({
+        where: {
+          OR: [
+            { userId: actorUser.id },
+            { id: actorUser.partnerId || '' },
+          ],
+        },
+      });
+      if (!partner || centre.user?.partnerId !== partner.id) {
+        throw new ForbiddenException('You do not have permission to manage this centre.');
+      }
     }
 
     const temporaryPassword = this.generateTemporaryPassword();
@@ -561,21 +603,139 @@ export class CentresService {
     });
 
     await this.audit.log({
-      actorId: adminUser.id,
-      actorType: 'ADMIN',
+      actorId: actorUser.id,
+      actorType: actorUser.role === Role.SUPER_ADMIN ? 'ADMIN' : actorUser.role,
       action: 'CENTRE_ACTIVATION_REISSUED',
       entity: 'Centre',
       entityId: id,
-      metadata: { reissuedBy: adminUser.email },
+      metadata: { reissuedBy: actorUser.email, actorRole: actorUser.role },
     });
 
     return {
       message: 'Activation credentials reissued. Operator must change password on next sign-in.',
       centreId: id,
       centreCode: centre.centreCode,
-      operatorEmail: centre.user.email,
+      centreName: centre.centreName,
+      ownerName: centre.user?.name,
+      mobile: centre.user?.mobile,
+      operatorEmail: centre.user?.email,
       temporaryPassword,
     };
+  }
+
+  async adjustCentreWallet(
+    adminUser: any,
+    centreId: string,
+    dto: { amount: number; action: 'CREDIT' | 'DEBIT'; reason?: string },
+  ) {
+    const amount = Number(dto.amount);
+    if (!amount || isNaN(amount) || amount <= 0) {
+      throw new BadRequestException('Adjustment amount must be a positive number greater than 0.');
+    }
+
+    if (dto.action !== 'CREDIT' && dto.action !== 'DEBIT') {
+      throw new BadRequestException("Action must be either 'CREDIT' or 'DEBIT'.");
+    }
+
+    const centre = await this.prisma.centre.findUnique({
+      where: { id: centreId },
+      include: {
+        user: {
+          include: {
+            wallet: true,
+          },
+        },
+      },
+    });
+
+    if (!centre) {
+      throw new NotFoundException(`Centre with ID '${centreId}' not found`);
+    }
+
+    return await this.prisma.$transaction(async (tx) => {
+      // 1. Get or create wallet for the centre user
+      let wallet = centre.user?.wallet;
+      if (!wallet) {
+        wallet = await tx.wallet.create({
+          data: {
+            userId: centre.userId,
+            availableBalance: new Prisma.Decimal(0),
+            reservedBalance: new Prisma.Decimal(0),
+          },
+        });
+      }
+
+      const prevAvailable = Number(wallet.availableBalance);
+      let newAvailable: number;
+
+      if (dto.action === 'CREDIT') {
+        newAvailable = prevAvailable + amount;
+      } else {
+        if (prevAvailable < amount) {
+          throw new BadRequestException(
+            `Cannot deduct ₹${amount}: Insufficient available balance (Current balance: ₹${prevAvailable.toFixed(2)}).`,
+          );
+        }
+        newAvailable = prevAvailable - amount;
+      }
+
+      // 2. Update wallet
+      const updatedWallet = await tx.wallet.update({
+        where: { id: wallet.id },
+        data: {
+          availableBalance: new Prisma.Decimal(newAvailable),
+        },
+      });
+
+      // 3. Create audit transaction record
+      const transaction = await tx.walletTransaction.create({
+        data: {
+          walletId: wallet.id,
+          userId: centre.userId,
+          type: TransactionType.ADJUSTMENT,
+          amount: new Prisma.Decimal(dto.action === 'CREDIT' ? amount : -amount),
+          status: TransactionStatus.COMPLETED,
+          reference: `ADMIN-${dto.action}-${Date.now()}`,
+          metadata: {
+            adminId: adminUser.id,
+            adminEmail: adminUser.email,
+            action: dto.action,
+            amount,
+            reason: dto.reason?.trim() || `Manual Admin ${dto.action === 'CREDIT' ? 'Credit' : 'Deduction'}`,
+            previousBalance: prevAvailable,
+            newBalance: newAvailable,
+            centreCode: centre.centreCode,
+            centreName: centre.centreName,
+          },
+        },
+      });
+
+      // 4. Audit log
+      await this.audit.log({
+        actorId: adminUser.id,
+        actorType: 'ADMIN',
+        action: dto.action === 'CREDIT' ? 'CENTRE_WALLET_CREDIT' : 'CENTRE_WALLET_DEBIT',
+        entity: 'Wallet',
+        entityId: wallet.id,
+        metadata: {
+          centreId: centre.id,
+          centreCode: centre.centreCode,
+          centreName: centre.centreName,
+          action: dto.action,
+          amount,
+          previousBalance: prevAvailable,
+          newBalance: newAvailable,
+          reason: dto.reason || null,
+        },
+      });
+
+      return {
+        success: true,
+        message: `Successfully ${dto.action === 'CREDIT' ? 'credited' : 'deducted'} ₹${amount.toFixed(2)} ${dto.action === 'CREDIT' ? 'to' : 'from'} ${centre.centreName}'s wallet.`,
+        wallet: updatedWallet,
+        transaction,
+      };
+    });
   }
 
   async getNetworkStats() {

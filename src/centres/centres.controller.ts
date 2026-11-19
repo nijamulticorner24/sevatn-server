@@ -83,9 +83,19 @@ export class CentresController {
   }
 
   @Post(':id/reissue-activation')
+  @Roles(Role.SUPER_ADMIN, Role.PARTNER, Role.DISTRIBUTOR)
+  async reissueActivation(@CurrentUser() actorUser: any, @Param('id') id: string) {
+    return this.centresService.reissueActivation(actorUser, id);
+  }
+
+  @Post(':id/wallet-adjust')
   @Roles(Role.SUPER_ADMIN)
-  async reissueActivation(@CurrentUser() adminUser: any, @Param('id') id: string) {
-    return this.centresService.reissueActivation(adminUser, id);
+  async adjustCentreWallet(
+    @CurrentUser() adminUser: any,
+    @Param('id') id: string,
+    @Body() dto: { amount: number; action: 'CREDIT' | 'DEBIT'; reason?: string },
+  ) {
+    return this.centresService.adjustCentreWallet(adminUser, id, dto);
   }
 }
 
@@ -144,5 +154,14 @@ export class AdminCentresController {
   @Post(':id/reissue-activation')
   async reissueActivation(@CurrentUser() adminUser: any, @Param('id') id: string) {
     return this.centresService.reissueActivation(adminUser, id);
+  }
+
+  @Post(':id/wallet-adjust')
+  async adjustCentreWallet(
+    @CurrentUser() adminUser: any,
+    @Param('id') id: string,
+    @Body() dto: { amount: number; action: 'CREDIT' | 'DEBIT'; reason?: string },
+  ) {
+    return this.centresService.adjustCentreWallet(adminUser, id, dto);
   }
 }

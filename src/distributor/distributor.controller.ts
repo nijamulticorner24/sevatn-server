@@ -81,6 +81,24 @@ export class DistributorController {
     const distributorId = this.resolveDistributorId(req);
     return this.distributorService.regenerateCentreInvitation(distributorId, id, req.user);
   }
+
+  /**
+   * Distributor gets own earnings summary and payout history
+   */
+  @Get('payouts')
+  async getMyPayouts(@Request() req: any) {
+    const distributorId = this.resolveDistributorId(req);
+    return this.distributorService.getDistributorPayouts(distributorId);
+  }
+
+  /**
+   * Distributor requests UPI payout / withdrawal
+   */
+  @Post('payouts/request')
+  async requestPayout(@Request() req: any, @Body() body: any) {
+    const distributorId = this.resolveDistributorId(req);
+    return this.distributorService.requestDistributorPayout(req.user, distributorId, body);
+  }
 }
 
 @Controller('admin/distributors')
@@ -92,6 +110,26 @@ export class AdminDistributorsController {
   @Get()
   async getAllDistributorsAdmin(@Query() query: any) {
     return this.distributorService.getAllDistributorsAdmin(query);
+  }
+
+  /**
+   * Super Admin lists all distributor payout requests
+   */
+  @Get('payouts/all')
+  async getAllDistributorPayouts(@Query() query: any) {
+    return this.distributorService.getAllDistributorPayoutsAdmin(query);
+  }
+
+  /**
+   * Super Admin settles a distributor payout request
+   */
+  @Post('payouts/:id/settle')
+  async settleDistributorPayout(
+    @Param('id') id: string,
+    @Body() dto: { paymentReference: string; adminNotes?: string; screenshotUrl?: string },
+    @Request() req: any,
+  ) {
+    return this.distributorService.settleDistributorPayout(id, dto, req.user);
   }
 }
 

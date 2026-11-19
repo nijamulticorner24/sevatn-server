@@ -148,8 +148,8 @@ async function runRegressionTestSuite() {
   // TEST 6: TicketAssist Sabarimala Existing Booking Flow Intact
   // -------------------------------------------------------------
   console.log('\n[6] Testing Existing TicketAssist Protection & Zero Regression...');
-  const demoCentreUser = await prisma.user.findUnique({
-    where: { email: 'muthu.esevai@gmail.com' },
+  const demoCentreUser = await prisma.user.findFirst({
+    where: { role: Role.CENTRE },
     include: { wallet: true, centre: true },
   });
   assert(!!demoCentreUser, 'Existing TicketAssist demo user exists');

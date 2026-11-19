@@ -20,6 +20,7 @@ import { EventsModule } from './events/events.module';
 import { OutboxModule } from './common/outbox/outbox.module';
 import { PricingModule } from './pricing/pricing.module';
 import { DistributorModule } from './distributor/distributor.module';
+import { S3StorageModule } from './common/storage/s3-storage.module';
 
 @Module({
   imports: [
@@ -29,6 +30,7 @@ import { DistributorModule } from './distributor/distributor.module';
     AuditModule,
     EventsModule,
     OutboxModule,
+    S3StorageModule,
     NotificationsModule,
     AuthModule,
     CentresModule,

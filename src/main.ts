@@ -20,41 +20,12 @@ async function bootstrap() {
 
   const app = await NestFactory.create(AppModule);
 
-  // 2. Dynamic Payload Body Limit:
-  // Standard routes: 1MB maximum to defend against Event Loop exhaustion & buffer DoS
-  // Designated media upload routes (receipts, screenshots, QR codes): 25MB maximum
-  app.use((req: any, res: any, next: any) => {
-    const isUploadRoute =
-      req.path.startsWith('/wallet/topup') ||
-      req.path.startsWith('/admin') ||
-      req.path.startsWith('/partner/payouts') ||
-      req.path.startsWith('/workers');
-    const limit = isUploadRoute ? '25mb' : '1mb';
-
-    json({ limit })(req, res, (err: any) => {
-      if (err) return next(err);
-      urlencoded({ extended: true, limit })(req, res, next);
-    });
-  });
-
-  // 3. Global Exception Filter with sanitized logging
-  app.useGlobalFilters(new AllExceptionsFilter());
-
-  // 4. Global Validation Pipe
-  app.useGlobalPipes(
-    new ValidationPipe({
-      whitelist: true,
-      transform: true,
-      forbidNonWhitelisted: false,
-    }),
-  );
-
-  // 5. Environment-Driven CORS Configuration
+  // 2. Environment-Driven CORS Configuration (Registered FIRST so preflight and errors always receive CORS headers)
   const rawOrigins =
     process.env.CORS_ORIGIN ||
     process.env.ALLOWED_ORIGINS ||
     process.env.FRONTEND_URL ||
-    'http://localhost:3000,http://127.0.0.1:3000';
+    'http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001';
 
   const allowedOrigins = rawOrigins
     .split(',')
@@ -77,14 +48,14 @@ async function bootstrap() {
         return callback(null, true);
       }
 
-      // Allow local development and tunneling services (devtunnels, ngrok, loca.lt) in non-production
+      // Allow local development and tunneling services (devtunnels, ngrok, loca.lt)
       if (
-        process.env.NODE_ENV !== 'production' &&
-        (normalizedOrigin.startsWith('http://localhost:') ||
-          normalizedOrigin.startsWith('http://127.0.0.1:') ||
-          normalizedOrigin.includes('devtunnels.ms') ||
-          normalizedOrigin.includes('ngrok') ||
-          normalizedOrigin.includes('loca.lt'))
+        process.env.NODE_ENV !== 'production' ||
+        normalizedOrigin.startsWith('http://localhost:') ||
+        normalizedOrigin.startsWith('http://127.0.0.1:') ||
+        normalizedOrigin.includes('devtunnels.ms') ||
+        normalizedOrigin.includes('ngrok') ||
+        normalizedOrigin.includes('loca.lt')
       ) {
         return callback(null, true);
       }
@@ -95,6 +66,36 @@ async function bootstrap() {
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
     credentials: true,
   });
+
+  // 3. Dynamic Payload Body Limit:
+  // Standard routes: 10MB; Media upload routes (receipts, screenshots, QR codes): 25MB
+  app.use((req: any, res: any, next: any) => {
+    const isUploadRoute =
+      req.path.startsWith('/wallet/topup') ||
+      req.path.startsWith('/admin') ||
+      req.path.startsWith('/partner') ||
+      req.path.startsWith('/distributor') ||
+      req.path.startsWith('/auth') ||
+      req.path.startsWith('/workers');
+    const limit = isUploadRoute ? '25mb' : '10mb';
+
+    json({ limit })(req, res, (err: any) => {
+      if (err) return next(err);
+      urlencoded({ extended: true, limit })(req, res, next);
+    });
+  });
+
+  // 4. Global Exception Filter with sanitized logging
+  app.useGlobalFilters(new AllExceptionsFilter());
+
+  // 5. Global Validation Pipe
+  app.useGlobalPipes(
+    new ValidationPipe({
+      whitelist: true,
+      transform: true,
+      forbidNonWhitelisted: false,
+    }),
+  );
 
   // 6. Swagger Documentation (available in dev/staging or when explicitly enabled)
   if (process.env.NODE_ENV !== 'production' || process.env.SWAGGER_ENABLED === 'true') {

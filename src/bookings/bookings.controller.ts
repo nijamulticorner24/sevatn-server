@@ -7,12 +7,13 @@ import {
   Query,
   UseGuards,
   UseInterceptors,
+  ForbiddenException,
 } from '@nestjs/common';
 import { BookingsService } from './bookings.service';
-import { JwtAuthGuard } from '../common/guards';
-import { CurrentUser } from '../common/decorators';
+import { JwtAuthGuard, RolesGuard } from '../common/guards';
+import { CurrentUser, Roles } from '../common/decorators';
 import { CreateBookingDto, ResolveHumanActionDto } from './dto/booking.dto';
-import { BookingStatus } from '@prisma/client';
+import { BookingStatus, Role } from '@prisma/client';
 import { IdempotencyInterceptor } from '../common/interceptors/idempotency.interceptor';
 import { ServiceAccessGuard } from '../common/guards/service-access.guard';
 import { RequireService } from '../common/decorators/require-service.decorator';
@@ -24,9 +25,13 @@ export class BookingsController {
   constructor(private readonly bookingsService: BookingsService) {}
 
   @Post()
-  @UseGuards(ServiceAccessGuard)
+  @Roles(Role.CENTRE)
+  @UseGuards(RolesGuard, ServiceAccessGuard)
   @RequireService('TICKET_ASSIST')
   async createBooking(@CurrentUser() user: any, @Body() dto: CreateBookingDto) {
+    if (user.role !== Role.CENTRE) {
+      throw new ForbiddenException('Only registered and authorized Centre operators are permitted to create bookings.');
+    }
     return this.bookingsService.createBooking(user.id, dto);
   }
 

@@ -38,6 +38,11 @@ export class AdminController {
     return this.adminService.updateSystemConfig(body);
   }
 
+  @Post('config/telegram-test')
+  async testTelegramNotification(@Body() body: { botToken?: string; chatId?: string }) {
+    return this.adminService.testTelegramNotification(body.botToken, body.chatId);
+  }
+
   @Get('audit-logs')
   async getAuditLogs() {
     return this.auditService.getRecentLogs(100);
@@ -140,6 +145,23 @@ export class AdminController {
     return this.adminService.verifyPartnerFranchiseFee(adminUser, id, notes);
   }
 
+  @Post('ledger/distributor-fee/:id/verify')
+  async verifyDistributorRegistrationFee(
+    @CurrentUser() adminUser: any,
+    @Param('id') id: string,
+  ) {
+    return this.adminService.verifyDistributorRegistrationFee(adminUser, id);
+  }
+
+  @Post('ledger/distributor-fee/:id/reject')
+  async rejectDistributorRegistrationFee(
+    @CurrentUser() adminUser: any,
+    @Param('id') id: string,
+    @Body('reason') reason?: string,
+  ) {
+    return this.adminService.rejectDistributorRegistrationFee(adminUser, id, reason);
+  }
+
   @Post('ledger/partner-fee/:id/reject')
   async rejectPartnerFranchiseFee(
     @CurrentUser() adminUser: any,
@@ -147,5 +169,10 @@ export class AdminController {
     @Body('reason') reason?: string,
   ) {
     return this.adminService.rejectPartnerFranchiseFee(adminUser, id, reason);
+  }
+
+  @Post('ledger/notify-pending-telegram')
+  async notifyLedgerPendingTelegram() {
+    return this.adminService.notifyLedgerPendingTelegram();
   }
 }

@@ -124,30 +124,32 @@ export class BookingsService {
       }
     }
 
-    // Verify user role & registered centre location
+    // Verify user role & registered centre location: Strictly CENTRE role only
     const callingUser = await this.prisma.user.findUnique({
       where: { id: userId },
       select: { id: true, role: true, registeredLocation: true },
     });
-    const isSuperAdmin = callingUser?.role === Role.SUPER_ADMIN;
+    if (!callingUser || callingUser.role !== Role.CENTRE) {
+      throw new ForbiddenException(
+        'Booking creation is exclusively restricted to registered and active Centre operators.',
+      );
+    }
 
     // 2b. Location 5 KM Geofence Enforcement (defence-in-depth)
-    if (!isSuperAdmin && callingUser?.role !== Role.WORKER && callingUser?.role !== Role.PARTNER) {
-      if (callingUser?.registeredLocation) {
-        if (dto.latitude !== undefined && dto.longitude !== undefined) {
-          const distanceKm = calculateHaversineDistanceKm(
-            { latitude: dto.latitude, longitude: dto.longitude },
-            {
-              latitude: callingUser.registeredLocation.latitude,
-              longitude: callingUser.registeredLocation.longitude,
-            },
+    if (callingUser.registeredLocation) {
+      if (dto.latitude !== undefined && dto.longitude !== undefined) {
+        const distanceKm = calculateHaversineDistanceKm(
+          { latitude: dto.latitude, longitude: dto.longitude },
+          {
+            latitude: callingUser.registeredLocation.latitude,
+            longitude: callingUser.registeredLocation.longitude,
+          },
+        );
+        if (distanceKm > 5.0) {
+          throw new ForbiddenException(
+            `Access Denied: You are ${distanceKm} KM away from your registered centre. ` +
+              `Access is permitted strictly within a 5.0 KM radius under SevaTN security policy.`,
           );
-          if (distanceKm > 5.0) {
-            throw new ForbiddenException(
-              `Access Denied: You are ${distanceKm} KM away from your registered centre. ` +
-                `Access is permitted strictly within a 5.0 KM radius under SevaTN security policy.`,
-            );
-          }
         }
       }
     }
@@ -167,7 +169,7 @@ export class BookingsService {
       if (!existingAccount) {
         throw new NotFoundException('Selected devotee account was not found.');
       }
-      if (existingAccount.userId !== userId && !isSuperAdmin) {
+      if (existingAccount.userId !== userId) {
         throw new ForbiddenException('You do not have permission to use this devotee account.');
       }
       if (existingAccount.status !== AccountStatus.VERIFIED) {
@@ -225,27 +227,8 @@ export class BookingsService {
     });
 
     const result = await this.prisma.$transaction(async (tx) => {
-      // 1. Verify and reserve funds from wallet (Super Admin auto-funded/exempted)
-      let wallet = await tx.wallet.findUnique({ where: { userId } });
-
-      if (isSuperAdmin) {
-        if (!wallet) {
-          wallet = await tx.wallet.create({
-            data: {
-              userId,
-              availableBalance: new Prisma.Decimal(999999),
-              reservedBalance: new Prisma.Decimal(0),
-            },
-          });
-        } else if (Number(wallet.availableBalance) < feeAmount) {
-          wallet = await tx.wallet.update({
-            where: { userId },
-            data: {
-              availableBalance: { increment: 100000 },
-            },
-          });
-        }
-      }
+      // 1. Verify and reserve funds from wallet
+      const wallet = await tx.wallet.findUnique({ where: { userId } });
 
       if (!wallet || Number(wallet.availableBalance) < feeAmount) {
         throw new BadRequestException(
