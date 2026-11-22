@@ -2,6 +2,7 @@ import {
   Controller,
   Get,
   Post,
+  Delete,
   Param,
   Body,
   Query,
@@ -150,6 +151,14 @@ export class AdminDistributorsController {
     @Request() req: any,
   ) {
     return this.distributorService.adjustDistributorWallet(req.user, id, dto);
+  }
+
+  /**
+   * Super Admin permanently deletes a distributor
+   */
+  @Delete(':id')
+  async deleteDistributor(@Param('id') id: string, @Request() req: any) {
+    return this.distributorService.deleteDistributor(req.user, id);
   }
 }
 

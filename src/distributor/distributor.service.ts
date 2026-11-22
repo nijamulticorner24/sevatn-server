@@ -19,7 +19,7 @@ import {
   UpdateDistributorStatusDto,
   GenerateCentreInvitationDto,
 } from './dto/distributor.dto';
-import { Role, UserStatus, InvitationStatus, TransactionType, TransactionStatus, Prisma } from '@prisma/client';
+import { Role, UserStatus, InvitationStatus, TransactionType, TransactionStatus, PayoutStatus, Prisma } from '@prisma/client';
 import { randomBytes } from 'crypto';
 import * as bcrypt from 'bcrypt';
 
@@ -850,6 +850,108 @@ export class DistributorService {
         transaction,
       };
     });
+  }
+
+  /**
+   * Super Admin deletes a distributor account and cleans up user profile
+   */
+  async deleteDistributor(adminUser: any, distributorId: string) {
+    const distributor = await this.prisma.distributor.findFirst({
+      where: {
+        OR: [{ id: distributorId }, { distributorCode: distributorId }],
+      },
+      include: {
+        user: {
+          include: {
+            wallet: true,
+          },
+        },
+        _count: {
+          select: {
+            centres: true,
+            payouts: true,
+          },
+        },
+      },
+    });
+
+    if (!distributor) {
+      throw new NotFoundException('Distributor profile not found');
+    }
+
+    // Safety check: Prevent deletion if there are pending payouts
+    const pendingPayouts = await this.prisma.distributorPayout.count({
+      where: {
+        distributorId: distributor.id,
+        status: PayoutStatus.REQUESTED,
+      },
+    });
+
+    if (pendingPayouts > 0) {
+      throw new BadRequestException(
+        `Cannot delete distributor '${distributor.name}' (${distributor.distributorCode}) because they have ${pendingPayouts} pending payout request(s). Please settle or reject the payout requests first.`,
+      );
+    }
+
+    await this.prisma.$transaction(async (tx) => {
+      // 1. Detach any centres affiliated with this distributor
+      await tx.centre.updateMany({
+        where: { distributorId: distributor.id },
+        data: { distributorId: null },
+      });
+
+      // 2. Detach any users registered under this distributor
+      await tx.user.updateMany({
+        where: { distributorId: distributor.id },
+        data: { distributorId: null },
+      });
+
+      // 3. Delete the distributor record (cascades to distributor invitations and payouts)
+      await tx.distributor.delete({
+        where: { id: distributor.id },
+      });
+
+      // 4. Delete the associated user account if one exists
+      if (distributor.userId) {
+        await tx.user.delete({
+          where: { id: distributor.userId },
+        }).catch(() => {});
+      }
+    });
+
+    // Write audit log
+    await this.audit.log({
+      actorId: adminUser?.id || null,
+      actorType: 'ADMIN',
+      action: 'DISTRIBUTOR_DELETED',
+      entity: 'Distributor',
+      entityId: distributor.id,
+      metadata: {
+        distributorId: distributor.id,
+        distributorCode: distributor.distributorCode,
+        name: distributor.name,
+        businessName: distributor.businessName,
+        mobile: distributor.mobile,
+        email: distributor.email,
+        partnerId: distributor.partnerId,
+        detachedCentresCount: distributor._count.centres,
+        deletedByUserId: adminUser?.id,
+        deletedByEmail: adminUser?.email,
+      },
+    });
+
+    // Emit event for real-time dashboards
+    try {
+      this.eventsGateway?.server?.emit('distributor:deleted', {
+        id: distributor.id,
+        distributorCode: distributor.distributorCode,
+      });
+    } catch (_) {}
+
+    return {
+      success: true,
+      message: `Distributor '${distributor.name}' (${distributor.distributorCode}) has been permanently deleted.`,
+    };
   }
 
   /**
