@@ -239,8 +239,70 @@ export class CentresService {
     const userInitialStatus =
       initialStatus === CentreStatus.SUSPENDED ? UserStatus.SUSPENDED : UserStatus.ACTIVE;
 
+    // Resolve Centre Onboarding Fee from SystemConfig
+    const sysConfig = await this.prisma.systemConfig.findUnique({ where: { id: 'default' } });
+    const centreFeeAmount = Number(sysConfig?.registrationFee || 249);
+
+    // If created by Partner, check Partner wallet
+    let partnerUserId: string | null = null;
+    if (actorUser.role === Role.PARTNER) {
+      partnerUserId = actorUser.id;
+      const partnerWallet = await this.prisma.wallet.findUnique({ where: { userId: partnerUserId } });
+      const currentAvailable = Number(partnerWallet?.availableBalance || 0);
+      if (currentAvailable < centreFeeAmount) {
+        throw new BadRequestException(
+          `Insufficient Partner Wallet Balance: Your available balance is ₹${currentAvailable.toFixed(2)}, but the Centre Onboarding Fee is ₹${centreFeeAmount.toFixed(2)}. Please recharge your partner wallet to proceed with onboarding.`,
+        );
+      }
+    }
+
     // 5. Execute Transactional Creation
     const result = await this.prisma.$transaction(async (tx) => {
+      // Deduct Centre Onboarding Fee from Partner's Wallet if creator is Partner
+      let partnerWalletUpdated: any = null;
+      if (actorUser.role === Role.PARTNER && partnerUserId) {
+        let pWallet = await tx.wallet.findUnique({ where: { userId: partnerUserId } });
+        if (!pWallet) {
+          pWallet = await tx.wallet.create({
+            data: {
+              userId: partnerUserId,
+              availableBalance: new Prisma.Decimal(0),
+              reservedBalance: new Prisma.Decimal(0),
+            },
+          });
+        }
+        const prevBal = Number(pWallet.availableBalance);
+        if (prevBal < centreFeeAmount) {
+          throw new BadRequestException(
+            `Insufficient Partner Wallet Balance: Your available balance is ₹${prevBal.toFixed(2)}, but the Centre Onboarding Fee is ₹${centreFeeAmount.toFixed(2)}. Please recharge your partner wallet.`,
+          );
+        }
+        const newBal = prevBal - centreFeeAmount;
+        partnerWalletUpdated = await tx.wallet.update({
+          where: { id: pWallet.id },
+          data: { availableBalance: new Prisma.Decimal(newBal) },
+        });
+
+        await tx.walletTransaction.create({
+          data: {
+            walletId: pWallet.id,
+            userId: partnerUserId,
+            type: TransactionType.ADJUSTMENT,
+            amount: new Prisma.Decimal(-centreFeeAmount),
+            status: TransactionStatus.COMPLETED,
+            reference: `CTR-FEE-${centreCode}`,
+            metadata: {
+              description: `Centre Onboarding Fee for ${dto.centreName.trim()} (${centreCode})`,
+              centreCode,
+              centreName: dto.centreName.trim(),
+              feeAmount: centreFeeAmount,
+              previousBalance: prevBal,
+              newBalance: newBal,
+            },
+          },
+        });
+      }
+
       const user = await tx.user.create({
         data: {
           name: dto.name.trim(),
@@ -268,8 +330,8 @@ export class CentresService {
           taluk: dto.taluk.trim(),
           pincode: dto.pincode?.trim() || null,
           feePaid: true,
-          registrationFee: new Prisma.Decimal(249),
-          feeTransactionId: null,
+          registrationFee: new Prisma.Decimal(centreFeeAmount),
+          feeTransactionId: actorUser.role === Role.PARTNER ? `CTR-FEE-${centreCode}` : null,
           status: initialStatus,
         },
       });
@@ -306,8 +368,17 @@ export class CentresService {
         });
       }
 
-      return { user, centre, wallet };
+      return { user, centre, wallet, partnerWalletUpdated };
     });
+
+    if (result.partnerWalletUpdated && this.eventsGateway && partnerUserId) {
+      try {
+        this.eventsGateway.notifyWalletUpdated(partnerUserId, {
+          availableBalance: Number(result.partnerWalletUpdated.availableBalance),
+          reservedBalance: Number(result.partnerWalletUpdated.reservedBalance),
+        });
+      } catch (_) {}
+    }
 
     // 6. Broadcast Real-time WebSocket activation
     if (this.eventsGateway) {

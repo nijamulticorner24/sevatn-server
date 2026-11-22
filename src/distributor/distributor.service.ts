@@ -90,11 +90,74 @@ export class DistributorService {
       );
     }
 
+    // System Config Distributor License Fee
+    const sysConfig = await this.prisma.systemConfig.findUnique({ where: { id: 'default' } });
+    const distributorFeeAmount = Number(sysConfig?.distributorFee || 399);
+
+    // Resolve Partner User ID for wallet deduction
+    const partnerUserId: string | null = partner.userId || partnerUser?.id || null;
+
+    // Check Partner wallet balance if creator is Partner
+    if (partnerUser?.role === Role.PARTNER && partnerUserId) {
+      const pWallet = await this.prisma.wallet.findUnique({ where: { userId: partnerUserId } });
+      const currentAvailable = Number(pWallet?.availableBalance || 0);
+      if (currentAvailable < distributorFeeAmount) {
+        throw new BadRequestException(
+          `Insufficient Partner Wallet Balance: Your available balance is ₹${currentAvailable.toFixed(2)}, but the Distributor License Fee is ₹${distributorFeeAmount.toFixed(2)}. Please recharge your partner wallet to onboard this distributor.`,
+        );
+      }
+    }
+
     const distributorCode = await this.generateUniqueCode();
     const rawPassword = dto.password?.trim() || `Dist@${cleanMobile.slice(-4)}`;
     const passwordHash = await bcrypt.hash(rawPassword, 10);
 
     const result = await this.prisma.$transaction(async (tx) => {
+      // 1. Deduct Distributor License Fee from Partner's Wallet if creator is Partner
+      let partnerWalletUpdated: any = null;
+      if (partnerUser?.role === Role.PARTNER && partnerUserId) {
+        let pWallet = await tx.wallet.findUnique({ where: { userId: partnerUserId } });
+        if (!pWallet) {
+          pWallet = await tx.wallet.create({
+            data: {
+              userId: partnerUserId,
+              availableBalance: new Prisma.Decimal(0),
+              reservedBalance: new Prisma.Decimal(0),
+            },
+          });
+        }
+        const prevBal = Number(pWallet.availableBalance);
+        if (prevBal < distributorFeeAmount) {
+          throw new BadRequestException(
+            `Insufficient Partner Wallet Balance: Your available balance is ₹${prevBal.toFixed(2)}, but the Distributor License Fee is ₹${distributorFeeAmount.toFixed(2)}. Please recharge your partner wallet.`,
+          );
+        }
+        const newBal = prevBal - distributorFeeAmount;
+        partnerWalletUpdated = await tx.wallet.update({
+          where: { id: pWallet.id },
+          data: { availableBalance: new Prisma.Decimal(newBal) },
+        });
+
+        await tx.walletTransaction.create({
+          data: {
+            walletId: pWallet.id,
+            userId: partnerUserId,
+            type: TransactionType.ADJUSTMENT,
+            amount: new Prisma.Decimal(-distributorFeeAmount),
+            status: TransactionStatus.COMPLETED,
+            reference: `DIST-FEE-${distributorCode}`,
+            metadata: {
+              description: `Distributor License Fee for ${dto.name.trim()} (${distributorCode})`,
+              distributorCode,
+              distributorName: dto.name.trim(),
+              feeAmount: distributorFeeAmount,
+              previousBalance: prevBal,
+              newBalance: newBal,
+            },
+          },
+        });
+      }
+
       // Create User account
       const user = await tx.user.create({
         data: {
@@ -123,6 +186,9 @@ export class DistributorService {
           district: dto.district?.trim() || partner.district || null,
           taluk: dto.taluk?.trim() || partner.taluk || null,
           status: 'ACTIVE',
+          distributorFee: new Prisma.Decimal(distributorFeeAmount),
+          feePaid: true,
+          paymentReference: partnerUser?.role === Role.PARTNER ? `DIST-FEE-${distributorCode}` : null,
           commissionSlab: dto.commissionSlab?.trim() || 'STANDARD',
           commissionPercentage: new Prisma.Decimal(dto.commissionPercentage !== undefined ? dto.commissionPercentage : 10.0),
           commissionRate: new Prisma.Decimal(dto.commissionRate !== undefined ? dto.commissionRate : 0.0),
@@ -136,8 +202,17 @@ export class DistributorService {
         data: { distributorId: distributor.id },
       });
 
-      return { user, distributor };
+      return { user, distributor, partnerWalletUpdated };
     });
+
+    if (result.partnerWalletUpdated && this.eventsGateway && partnerUserId) {
+      try {
+        this.eventsGateway.notifyWalletUpdated(partnerUserId, {
+          availableBalance: Number(result.partnerWalletUpdated.availableBalance),
+          reservedBalance: Number(result.partnerWalletUpdated.reservedBalance),
+        });
+      } catch (_) {}
+    }
 
     await this.audit.log({
       actorId: partnerUser?.id,
