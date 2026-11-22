@@ -32,6 +32,11 @@ export class AccountsController {
     return this.accountsService.listAccounts(user.id);
   }
 
+  @Get(':id/password')
+  async getAccountPassword(@Param('id') id: string, @CurrentUser() user: any) {
+    return this.accountsService.getAccountPassword(id, user.id);
+  }
+
   @Get(':id')
   async getAccountById(@Param('id') id: string, @CurrentUser() user: any) {
     return this.accountsService.getAccountById(id, user.id);

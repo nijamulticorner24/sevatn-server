@@ -179,112 +179,141 @@ export class WalletService {
       ? receiptFileName.replace(/[^a-zA-Z0-9._-]/g, '_')
       : `receipt_${Date.now()}`;
 
-    return await this.prisma.$transaction(async (tx) => {
-      let wallet = await tx.wallet.findUnique({ where: { userId } });
-      if (!wallet) {
-        wallet = await tx.wallet.create({
+    const result = await this.prisma.$transaction(
+      async (tx) => {
+        let wallet = await tx.wallet.findUnique({ where: { userId } });
+        if (!wallet) {
+          wallet = await tx.wallet.create({
+            data: {
+              userId,
+              availableBalance: new Prisma.Decimal(0),
+              reservedBalance: new Prisma.Decimal(0),
+            },
+          });
+        }
+
+        // ONLY credit available balance if ONLINE gateway.
+        // OFFLINE UPI submissions remain PENDING until authorised verification!
+        let updatedWallet = wallet;
+        if (!isOffline) {
+          updatedWallet = await tx.wallet.update({
+            where: { userId },
+            data: {
+              availableBalance: { increment: amount },
+            },
+          });
+        }
+
+        const txStatus = isOffline ? TransactionStatus.PENDING : TransactionStatus.COMPLETED;
+
+        const transaction = await tx.walletTransaction.create({
           data: {
+            walletId: wallet.id,
             userId,
-            availableBalance: new Prisma.Decimal(0),
-            reservedBalance: new Prisma.Decimal(0),
+            type: TransactionType.TOPUP,
+            amount: new Prisma.Decimal(amount),
+            status: txStatus,
+            reference: cleanRef,
+            idempotencyKey: idempotencyKey || undefined,
+            metadata: {
+              note: isOffline
+                ? 'Wallet Topup (UPI / QR Proof Submitted)'
+                : 'Wallet Topup (Online Gateway)',
+              paymentMethod,
+              receiptUrl: receiptUrl || null,
+              receiptFileName: safeFileName,
+              receiptFileSize: receiptFileSize || null,
+              submittedAt: new Date().toISOString(),
+            },
           },
         });
-      }
 
-      // ONLY credit available balance if ONLINE gateway.
-      // OFFLINE UPI submissions remain PENDING until authorised verification!
-      let updatedWallet = wallet;
-      if (!isOffline) {
-        updatedWallet = await tx.wallet.update({
-          where: { userId },
-          data: {
-            availableBalance: { increment: amount },
-          },
-        });
-      }
+        return {
+          wallet: updatedWallet,
+          transaction,
+          txStatus,
+        };
+      },
+      {
+        maxWait: 15000,
+        timeout: 30000,
+      },
+    );
 
-      const txStatus = isOffline ? TransactionStatus.PENDING : TransactionStatus.COMPLETED;
-
-      const transaction = await tx.walletTransaction.create({
-        data: {
-          walletId: wallet.id,
-          userId,
-          type: TransactionType.TOPUP,
-          amount: new Prisma.Decimal(amount),
-          status: txStatus,
-          reference: cleanRef,
-          idempotencyKey: idempotencyKey || undefined,
-          metadata: {
-            note: isOffline
-              ? 'Centre Wallet Topup (UPI / QR Proof Submitted)'
-              : 'Centre Wallet Topup (Online Gateway)',
-            paymentMethod,
-            receiptUrl: receiptUrl || null,
-            receiptFileName: safeFileName,
-            receiptFileSize: receiptFileSize || null,
-            submittedAt: new Date().toISOString(),
-          },
-        },
-      });
-
-      await this.audit.log({
+    // Run audit logging outside the transaction to prevent timeout
+    this.audit
+      .log({
         actorId: userId,
         actorType: 'USER',
         action: isOffline ? 'WALLET_TOPUP_SUBMITTED' : 'WALLET_TOPUP',
         entity: 'WalletTransaction',
-        entityId: transaction.id,
+        entityId: result.transaction.id,
         metadata: {
           amount,
           reference: cleanRef,
-          status: txStatus,
+          status: result.txStatus,
           hasReceipt: !!receiptUrl,
-          newBalance: updatedWallet.availableBalance,
+          newBalance: result.wallet.availableBalance,
         },
-      });
+      })
+      .catch((err) => this.logger.warn(`Failed to write topup audit log: ${err.message}`));
 
-      // If offline top-up, trigger Telegram Bot alert asynchronously
-      if (isOffline) {
-        this.prisma.user
-          .findUnique({
-            where: { id: userId },
-            include: { centre: true },
-          })
-          .then((u) => {
-            if (u) {
-              this.notifications.sendTelegramPaymentNotification({
-                paymentType: 'WALLET_TOPUP',
-                amount,
-                paymentReference: cleanRef,
-                screenshotUrl: receiptUrl,
-                applicantName: u.name,
-                entityName: u.centre?.centreName,
-                entityCode: u.centre?.centreCode,
-                district: u.centre?.district,
-                mobile: u.mobile,
-                email: u.email,
-                role: u.role,
-              });
-            }
-          })
-          .catch((err) => this.logger.error(`[Telegram Topup Notification] Error: ${err.message}`));
-      }
+    // If offline top-up, trigger Telegram Bot alert asynchronously
+    if (isOffline) {
+      this.prisma.user
+        .findUnique({
+          where: { id: userId },
+          include: { centre: true, partnerProfile: true, distributorProfile: true },
+        })
+        .then((u: any) => {
+          if (u) {
+            const entityName =
+              u.centre?.centreName ||
+              u.partnerProfile?.name ||
+              u.distributorProfile?.name;
+            const entityCode =
+              u.centre?.centreCode ||
+              u.partnerProfile?.partnerCode ||
+              u.distributorProfile?.distributorCode;
+            const district =
+              u.centre?.district ||
+              u.partnerProfile?.district ||
+              u.distributorProfile?.district;
 
-      return {
-        message: isOffline
-          ? 'Top-up request submitted for verification. Your wallet will be credited once your receipt is verified.'
-          : 'Topup successful',
-        wallet: updatedWallet,
-        transaction,
-        status: txStatus,
-      };
-    });
+            this.notifications.sendTelegramPaymentNotification({
+              paymentType: 'WALLET_TOPUP',
+              amount,
+              paymentReference: cleanRef,
+              screenshotUrl: receiptUrl,
+              applicantName: u.name,
+              entityName,
+              entityCode,
+              district,
+              mobile: u.mobile,
+              email: u.email,
+              role: u.role,
+            });
+          }
+        })
+        .catch((err) => this.logger.error(`[Telegram Topup Notification] Error: ${err.message}`));
+    }
+
+    return {
+      message: isOffline
+        ? 'Top-up request submitted for verification. Your wallet will be credited once your receipt is verified.'
+        : 'Topup successful',
+      wallet: result.wallet,
+      transaction: result.transaction,
+      status: result.txStatus,
+    };
   }
 
   /**
    * Authoritative Verification: Admin verifies pending UPI topup and credits wallet
    */
   async verifyTopup(adminUserId: string, transactionId: string) {
-    return await this.prisma.$transaction(async (tx) => {
+    return await this.prisma.$transaction(
+      async (tx) => {
       const transaction = await tx.walletTransaction.findUnique({
         where: { id: transactionId },
       });
@@ -338,6 +367,9 @@ export class WalletService {
         wallet: updatedWallet,
         transaction: updatedTx,
       };
+    }, {
+      maxWait: 15000,
+      timeout: 30000,
     });
   }
 
@@ -489,11 +521,12 @@ export class WalletService {
   /**
    * CAPTURE: Finalize charge on verified booking success with ₹80/₹20 revenue split
    */
-  async capture(dto: CaptureFundsDto) {
+  async capture(dto: CaptureFundsDto, txClient?: Prisma.TransactionClient) {
     const { userId, bookingId, amount, workerMachineId, idempotencyKey } = dto;
+    const client = txClient || this.prisma;
 
     if (idempotencyKey) {
-      const existing = await this.prisma.walletTransaction.findUnique({
+      const existing = await client.walletTransaction.findUnique({
         where: { idempotencyKey },
       });
       if (existing) {
@@ -501,7 +534,7 @@ export class WalletService {
       }
     }
 
-    return await this.prisma.$transaction(async (tx) => {
+    const runCapture = async (tx: Prisma.TransactionClient) => {
       // Idempotency check on booking capture: NEVER ALLOW DUPLICATE CAPTURE
       const existingCapture = await tx.walletTransaction.findFirst({
         where: {
@@ -613,7 +646,13 @@ export class WalletService {
       });
 
       return { message: 'Funds captured successfully', transaction };
-    });
+    };
+
+    if (txClient) {
+      return await runCapture(txClient);
+    } else {
+      return await this.prisma.$transaction(runCapture);
+    }
   }
 
   /**
@@ -787,17 +826,28 @@ export class WalletService {
   /**
    * Get full ledger transactions for a user
    */
-  async getTransactions(userId: string, page = 1, limit = 50) {
+  async getTransactions(userId: string, page = 1, limit = 50, type?: string, search?: string) {
     const skip = (page - 1) * limit;
+    const where: Prisma.WalletTransactionWhereInput = { userId };
+    if (type && type !== 'ALL') {
+      where.type = type as any;
+    }
+    if (search && search.trim()) {
+      const q = search.trim();
+      where.OR = [
+        { reference: { contains: q, mode: 'insensitive' } },
+        { booking: { bookingCode: { contains: q, mode: 'insensitive' } } },
+      ];
+    }
     const [transactions, total] = await Promise.all([
       this.prisma.walletTransaction.findMany({
-        where: { userId },
+        where,
         skip,
         take: limit,
         orderBy: { createdAt: 'desc' },
         include: { booking: { select: { bookingCode: true, route: true, requestedDate: true } } },
       }),
-      this.prisma.walletTransaction.count({ where: { userId } }),
+      this.prisma.walletTransaction.count({ where }),
     ]);
 
     return { transactions, total, page, totalPages: Math.ceil(total / limit) };

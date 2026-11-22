@@ -15,6 +15,7 @@ import { AccountLockService } from '../availability/account-lock.service';
 import { CreateBookingDto, ResolveHumanActionDto } from './dto/booking.dto';
 import { BookingStatus, JobType, AccountStatus, Role, Prisma } from '@prisma/client';
 import { calculateHaversineDistanceKm } from '../common/utils/geo';
+import { getTodayISTDateString, isDateInPast } from '../common/booking-status.constants';
 
 import { EventsGateway } from '../events/events.gateway';
 import { SmartAllocatorService } from '../workers/smart-allocator.service';
@@ -129,14 +130,14 @@ export class BookingsService {
       where: { id: userId },
       select: { id: true, role: true, registeredLocation: true },
     });
-    if (!callingUser || callingUser.role !== Role.CENTRE) {
+    if (!callingUser || (callingUser.role !== Role.CENTRE && callingUser.role !== Role.DISTRIBUTOR)) {
       throw new ForbiddenException(
-        'Booking creation is exclusively restricted to registered and active Centre operators.',
+        'Booking creation is exclusively restricted to registered and active Centre operators and Distributors.',
       );
     }
 
-    // 2b. Location 5 KM Geofence Enforcement (defence-in-depth)
-    if (callingUser.registeredLocation) {
+    // 2b. Location 5 KM Geofence Enforcement (defence-in-depth, applicable to Centres)
+    if (callingUser.role === Role.CENTRE && callingUser.registeredLocation) {
       if (dto.latitude !== undefined && dto.longitude !== undefined) {
         const distanceKm = calculateHaversineDistanceKm(
           { latitude: dto.latitude, longitude: dto.longitude },
@@ -181,6 +182,111 @@ export class BookingsService {
       isNewAccountCredentials = true;
     }
 
+    // 3b. Devotee Profile Single Active Request Gate:
+    // A Devotee Profile can only have 1 active booking request at a time.
+    // Multiple dates or concurrent requests on the same devotee profile are strictly prohibited.
+    const nonTerminalStatuses: BookingStatus[] = [
+      BookingStatus.NEW,
+      BookingStatus.AVAILABILITY_CHECKING,
+      BookingStatus.DRAFT,
+      BookingStatus.PENDING,
+      BookingStatus.SUBMITTED,
+      BookingStatus.QUEUED,
+      BookingStatus.FAST_BOOKING_QUEUED,
+      BookingStatus.MATCHING,
+      BookingStatus.CLAIMED,
+      BookingStatus.EXECUTION_QUEUED,
+      BookingStatus.EXECUTING,
+      BookingStatus.WAITING_FOR_ACCOUNT,
+      BookingStatus.WORKER_ASSIGNED,
+      BookingStatus.ASSIGNED,
+      BookingStatus.BROWSER_STARTING,
+      BookingStatus.OFFICIAL_SITE_OPEN,
+      BookingStatus.OPENING_OFFICIAL_SITE,
+      BookingStatus.LOGIN_IN_PROGRESS,
+      BookingStatus.LOGIN_SUCCESS,
+      BookingStatus.BOOKING_FLOW_STARTED,
+      BookingStatus.OPENING_VIRTUAL_Q,
+      BookingStatus.WAITING_FOR_DATE_AVAILABILITY,
+      BookingStatus.DATE_AVAILABLE,
+      BookingStatus.SELECTING_DATE,
+      BookingStatus.VERIFYING_DATE_SELECTION,
+      BookingStatus.DATE_SELECTION_VERIFIED,
+      BookingStatus.SELECTING_ROUTE,
+      BookingStatus.DATE_VERIFIED,
+      BookingStatus.ROUTE_VERIFIED,
+      BookingStatus.SLOT_VERIFIED,
+      BookingStatus.OPENING_PILGRIM_SELECTION,
+      BookingStatus.SELECTING_EXISTING_PILGRIMS,
+      BookingStatus.PILGRIMS_VERIFIED,
+      BookingStatus.SUBMITTING_PILGRIMS,
+      BookingStatus.NOMINEE_VERIFIED,
+      BookingStatus.SELECTING_RELIEF_FUND_NO,
+      BookingStatus.RELIEF_VERIFIED,
+      BookingStatus.ADDING_TO_WISHLIST,
+      BookingStatus.VERIFYING_RESULT,
+      BookingStatus.WISHLIST_ADDED,
+      BookingStatus.WISHLIST_VERIFIED,
+      BookingStatus.PROCEEDING_TO_CHECKOUT,
+      BookingStatus.CHECKOUT_VERIFIED,
+      BookingStatus.ZERO_COST_CONFIRMATION_PENDING,
+      BookingStatus.CONFIRMATION_PENDING,
+      BookingStatus.DISCOVERING,
+      BookingStatus.CHECKING_AVAILABILITY,
+      BookingStatus.WATCHING,
+      BookingStatus.WAITING,
+      BookingStatus.AVAILABILITY_FOUND,
+      BookingStatus.BOOKING_IN_PROGRESS,
+      BookingStatus.BOOKING,
+      BookingStatus.CONFIRMATION_CHECK,
+      BookingStatus.HOLD_INVALID_NOMINEE,
+      BookingStatus.TEMPORARY_SLOT_LOST,
+      BookingStatus.RETRYABLE_FAILURE,
+      BookingStatus.REQUIRES_HUMAN,
+      BookingStatus.CAPTCHA_REQUIRED,
+      BookingStatus.OTP_REQUIRED,
+    ];
+
+    let checkAccountId = accountId;
+    if (!checkAccountId && dto.username) {
+      const existingAcct = await this.prisma.bookingAccount.findUnique({
+        where: {
+          userId_username: {
+            userId,
+            username: dto.username.trim(),
+          },
+        },
+      });
+      if (existingAcct) {
+        checkAccountId = existingAcct.id;
+      }
+    }
+
+    if (checkAccountId) {
+      const activeBooking = await this.prisma.bookingRequest.findFirst({
+        where: {
+          accountId: checkAccountId,
+          status: { in: nonTerminalStatuses },
+        },
+        select: {
+          id: true,
+          bookingCode: true,
+          requestedDate: true,
+          requestedDateStr: true,
+          status: true,
+        },
+      });
+
+      if (activeBooking) {
+        const dateDisplay =
+          activeBooking.requestedDateStr ||
+          (activeBooking.requestedDate ? activeBooking.requestedDate.toISOString().split('T')[0] : 'scheduled date');
+        throw new BadRequestException(
+          `This devotee profile already has an active booking request (#${activeBooking.bookingCode} for ${dateDisplay}, status: ${activeBooking.status}). Only 1 active booking request is permitted per devotee profile. Multiple dates or duplicate requests on the same profile are not allowed until the active request is finalized or cancelled.`,
+        );
+      }
+    }
+
     // 4. Idempotency Guard (Avoid duplicate wallet holds and requests)
     if (dto.idempotencyKey) {
       const existingTx = await this.prisma.walletTransaction.findUnique({
@@ -218,13 +324,14 @@ export class BookingsService {
       throw new BadRequestException('Sabarimala portal allows a maximum of 10 pilgrims per booking.');
     }
     const pilgrimCount = Math.max(1, rawPilgrimCount);
-    const feeAmount = baseServiceFee * pilgrimCount;
 
-    // Calculate immutable 3-level ticket price breakdown snapshot
+    // Calculate immutable 3-level ticket price breakdown snapshot (Base Price + Franchise/Partner Markup + Distributor Markup)
     const priceCalculation = await this.pricingService.calculateBookingPrice({
       userId,
       quantity: pilgrimCount,
     });
+    const unitPrice = Number(priceCalculation?.finalTicketPrice) || baseServiceFee;
+    const feeAmount = Number(priceCalculation?.totalTicketAmount) || (unitPrice * pilgrimCount);
 
     const result = await this.prisma.$transaction(async (tx) => {
       // 1. Verify and reserve funds from wallet
@@ -232,7 +339,7 @@ export class BookingsService {
 
       if (!wallet || Number(wallet.availableBalance) < feeAmount) {
         throw new BadRequestException(
-          `Insufficient wallet balance. Required: ₹${feeAmount} (₹${baseServiceFee} × ${pilgrimCount} pilgrim${pilgrimCount > 1 ? 's' : ''}), Available: ₹${wallet?.availableBalance || 0}`,
+          `Insufficient wallet balance. Required: ₹${feeAmount} (₹${unitPrice} × ${pilgrimCount} pilgrim${pilgrimCount > 1 ? 's' : ''}), Available: ₹${wallet?.availableBalance || 0}`,
         );
       }
 
@@ -440,34 +547,249 @@ export class BookingsService {
   }
 
   /**
+   * Automatically cancels pending/open bookings whose darshan date is strictly in the past.
+   * Releases wallet reservations and frees account locks.
+   */
+  async autoCancelPastPendingBookings(userId?: string): Promise<{ cancelledCount: number; details: string[] }> {
+    const todayIST = getTodayISTDateString();
+    const details: string[] = [];
+
+    const openStatuses: BookingStatus[] = [
+      BookingStatus.PENDING,
+      BookingStatus.FAST_BOOKING_QUEUED,
+      BookingStatus.WATCHING,
+      BookingStatus.EXECUTION_QUEUED,
+      BookingStatus.WAITING_FOR_ACCOUNT,
+      BookingStatus.RETRYABLE_FAILURE,
+      BookingStatus.QUEUED,
+      BookingStatus.WAITING_FOR_DATE_AVAILABILITY,
+      BookingStatus.TEMPORARY_SLOT_LOST,
+      BookingStatus.HOLD_INVALID_NOMINEE,
+      BookingStatus.WORKER_ASSIGNED,
+      BookingStatus.EXECUTING,
+      BookingStatus.CHECKING_AVAILABILITY,
+      BookingStatus.REQUIRES_HUMAN,
+      BookingStatus.CAPTCHA_REQUIRED,
+      BookingStatus.OTP_REQUIRED,
+      BookingStatus.ASSIGNED,
+      BookingStatus.LOGIN_IN_PROGRESS,
+      BookingStatus.BOOKING_IN_PROGRESS,
+    ];
+
+    const where: any = {
+      status: { in: openStatuses },
+    };
+    if (userId) {
+      where.userId = userId;
+    }
+
+    let openBookings: any[] = [];
+    try {
+      openBookings = await this.prisma.bookingRequest.findMany({
+        where,
+        select: {
+          id: true,
+          bookingCode: true,
+          userId: true,
+          accountId: true,
+          version: true,
+          requestedDate: true,
+          requestedDateStr: true,
+          status: true,
+        },
+      });
+    } catch (err: any) {
+      this.logger.warn(`Failed to query open bookings for auto-cancel: ${err.message}`);
+      return { cancelledCount: 0, details };
+    }
+
+    let cancelledCount = 0;
+    for (const b of openBookings) {
+      const dateToCheck = b.requestedDateStr || b.requestedDate;
+      if (isDateInPast(dateToCheck, todayIST)) {
+        try {
+          this.logger.log(
+            `[AUTO-CANCEL] Darshan date ${b.requestedDateStr || b.requestedDate} is in the past (Today IST: ${todayIST}). Auto-cancelling booking #${b.bookingCode}`,
+          );
+
+          const reserveTx = await this.prisma.walletTransaction.findFirst({
+            where: {
+              bookingId: b.id,
+              type: 'RESERVE',
+              status: 'COMPLETED',
+            },
+          });
+          const feeAmount = reserveTx ? Number(reserveTx.amount) : 0;
+
+          if (feeAmount > 0) {
+            await this.walletService
+              .release({
+                userId: b.userId,
+                bookingId: b.id,
+                amount: feeAmount,
+                reason: `Auto-cancelled: Darshan date (${b.requestedDateStr || 'past'}) has passed`,
+                idempotencyKey: `auto_cancel_${b.id}`,
+              })
+              .catch((err) => {
+                this.logger.warn(`Wallet release notice for #${b.bookingCode}: ${err.message}`);
+              });
+          }
+
+          if (b.accountId) {
+            await this.accountLockService.releaseLock(b.accountId, b.id).catch(() => {});
+          }
+
+          const cancelNow = new Date();
+          const runAutoCancelTx = async (tx: any) => {
+            if (this.stateMachine) {
+              await this.stateMachine
+                .transition({
+                  bookingId: b.id,
+                  targetStatus: BookingStatus.CANCELLED,
+                  targetExecutionStatus: 'IDLE',
+                  targetFinancialStatus: 'RELEASED',
+                  expectedVersion: b.version,
+                  note: `Auto-cancelled: Darshan date (${b.requestedDateStr || 'past date'}) has passed`,
+                  reason: 'PAST_DATE_AUTO_CANCELLED',
+                  milestone: 'PAST_DATE_AUTO_CANCELLED',
+                  operator: 'BookingsService:autoCancelPastPendingBookings',
+                  force: true,
+                }, tx)
+                .catch(async () => {
+                  await tx.bookingRequest.update({
+                    where: { id: b.id },
+                    data: {
+                      status: BookingStatus.CANCELLED,
+                      assignedMachineId: null,
+                      leaseExpiresAt: null,
+                      leaseStartedAt: null,
+                    },
+                  });
+                });
+            } else {
+              await tx.bookingRequest.update({
+                where: { id: b.id },
+                data: {
+                  status: BookingStatus.CANCELLED,
+                  assignedMachineId: null,
+                  leaseExpiresAt: null,
+                  leaseStartedAt: null,
+                },
+              });
+            }
+
+            await tx.bookingJob.updateMany({
+              where: {
+                bookingRequestId: b.id,
+                status: {
+                  notIn: [BookingStatus.SUCCESS, BookingStatus.COMPLETED, BookingStatus.CANCELLED, BookingStatus.FAILED],
+                },
+              },
+              data: {
+                status: BookingStatus.CANCELLED,
+                workerId: null,
+                leaseExpiresAt: null,
+                completedAt: cancelNow,
+              },
+            });
+          };
+
+          if (typeof this.prisma.$transaction === 'function') {
+            await this.prisma.$transaction(runAutoCancelTx);
+          } else {
+            await runAutoCancelTx(this.prisma);
+          }
+
+          this.eventsGateway.notifyBookingUpdated(b.id, b.userId, {
+            bookingId: b.id,
+            bookingCode: b.bookingCode,
+            status: BookingStatus.CANCELLED,
+            note: 'Auto-cancelled: Darshan date has passed',
+            timestamp: new Date().toISOString(),
+          });
+
+          cancelledCount++;
+          details.push(`Auto-cancelled past booking #${b.bookingCode} (date: ${b.requestedDateStr || 'past'})`);
+        } catch (err: any) {
+          this.logger.warn(`Failed to auto-cancel past booking #${b.bookingCode}: ${err.message}`);
+        }
+      }
+    }
+
+    return { cancelledCount, details };
+  }
+
+  /**
    * Get bookings list with role-based scoping and filters
    */
   async getBookings(user: any, query: { status?: BookingStatus; page?: number; limit?: number; search?: string }) {
+    // Automatically cancel past-date pending bookings so user immediately sees them as cancelled and funds released
+    try {
+      await this.autoCancelPastPendingBookings(user.role === Role.CENTRE ? user.id : undefined);
+    } catch (err: any) {
+      this.logger.warn(`Auto-cancel check on getBookings error: ${err.message}`);
+    }
+
     const page = Number(query.page) || 1;
     const limit = Number(query.limit) || 50;
     const skip = (page - 1) * limit;
 
-    const where: any = {};
+    const andConditions: any[] = [];
+
     if (user.role === Role.CENTRE) {
-      where.userId = user.id;
-    } else if (user.role === Role.PARTNER) {
-      const partnerId = user.partnerProfile?.id || user.partnerId;
-      if (partnerId) {
-        where.user = { partnerId };
+      andConditions.push({ userId: user.id });
+    } else if (user.role === Role.DISTRIBUTOR) {
+      // By default, only show bookings made by this account. Use scope=network for full fleet.
+      if ((query as any)?.scope === 'network') {
+        const distributorId = user.distributorProfile?.id || user.distributorId;
+        if (distributorId) {
+          andConditions.push({
+            OR: [
+              { userId: user.id },
+              { user: { distributorId } },
+              { user: { centre: { distributorId } } },
+            ],
+          });
+        } else {
+          andConditions.push({ userId: user.id });
+        }
       } else {
-        where.userId = user.id;
+        andConditions.push({ userId: user.id });
+      }
+    } else if (user.role === Role.PARTNER) {
+      if ((query as any)?.scope === 'network') {
+        const partnerId = user.partnerProfile?.id || user.partnerId;
+        if (partnerId) {
+          andConditions.push({
+            OR: [
+              { user: { partnerId } },
+              { user: { distributor: { partnerId } } },
+              { user: { centre: { distributor: { partnerId } } } },
+            ],
+          });
+        } else {
+          andConditions.push({ userId: user.id });
+        }
+      } else {
+        andConditions.push({ userId: user.id });
       }
     }
 
     if (query.status) {
-      where.status = query.status;
+      andConditions.push({ status: query.status });
     }
     if (query.search) {
-      where.OR = [
-        { bookingCode: { contains: query.search, mode: 'insensitive' } },
-        { route: { contains: query.search, mode: 'insensitive' } },
-      ];
+      andConditions.push({
+        OR: [
+          { bookingCode: { contains: query.search, mode: 'insensitive' } },
+          { route: { contains: query.search, mode: 'insensitive' } },
+          { account: { username: { contains: query.search, mode: 'insensitive' } } },
+          { account: { label: { contains: query.search, mode: 'insensitive' } } },
+        ],
+      });
     }
+
+    const where: any = andConditions.length > 0 ? { AND: andConditions } : {};
 
     const [bookings, total] = await Promise.all([
       this.prisma.bookingRequest.findMany({
@@ -479,7 +801,18 @@ export class BookingsService {
           pilgrims: true,
           account: { select: { id: true, label: true, username: true, status: true } as any },
           assignedMachine: { select: { machineCode: true, machineName: true, status: true } },
-          user: { select: { name: true, email: true, mobile: true, partnerId: true, centre: { select: { centreName: true, district: true } } } },
+          user: {
+            select: {
+              id: true,
+              name: true,
+              email: true,
+              mobile: true,
+              role: true,
+              partnerId: true,
+              distributorId: true,
+              centre: { select: { centreName: true, centreCode: true, district: true } },
+            },
+          },
         },
       }),
       this.prisma.bookingRequest.count({ where }),
@@ -501,7 +834,36 @@ export class BookingsService {
         attempts: { orderBy: { startedAt: 'desc' } },
         jobs: { orderBy: { createdAt: 'desc' } },
         transactions: true,
-        user: { include: { centre: true } },
+        user: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            mobile: true,
+            role: true,
+            partnerId: true,
+            distributorId: true,
+            centre: {
+              select: {
+                id: true,
+                centreName: true,
+                centreCode: true,
+                district: true,
+                taluk: true,
+                address: true,
+                distributorId: true,
+              },
+            },
+            distributor: {
+              select: {
+                id: true,
+                distributorCode: true,
+                name: true,
+                partnerId: true,
+              },
+            },
+          },
+        },
       },
     });
 
@@ -513,9 +875,24 @@ export class BookingsService {
       throw new ForbiddenException('Access denied to other centres booking data');
     }
 
+    if (user.role === Role.DISTRIBUTOR) {
+      const distributorId = user.distributorProfile?.id || user.distributorId;
+      const isOwner = booking.userId === user.id;
+      const isSubordinate = distributorId && (booking.user?.distributorId === distributorId || booking.user?.centre?.distributorId === distributorId);
+      if (!isOwner && !isSubordinate) {
+        throw new ForbiddenException('Access denied to bookings outside your authorized distributor network');
+      }
+    }
+
     if (user.role === Role.PARTNER) {
       const partnerId = user.partnerProfile?.id || user.partnerId;
-      if (!partnerId || booking.user?.partnerId !== partnerId) {
+      const isOwner = booking.userId === user.id;
+      const isFranchiseBooking = partnerId && (
+        booking.user?.partnerId === partnerId ||
+        booking.user?.distributor?.partnerId === partnerId ||
+        (booking.user?.centre as any)?.distributor?.partnerId === partnerId
+      );
+      if (!isOwner && !isFranchiseBooking) {
         throw new ForbiddenException('Access denied to bookings outside your authorized partner franchise');
       }
     }
@@ -529,7 +906,16 @@ export class BookingsService {
   async cancelBooking(id: string, user: any) {
     const booking = await this.prisma.bookingRequest.findUnique({
       where: { id },
-      include: { user: true },
+      include: {
+        user: {
+          include: {
+            centre: {
+              include: { distributor: true },
+            },
+            distributor: true,
+          },
+        },
+      },
     });
 
     if (!booking) {
@@ -540,9 +926,24 @@ export class BookingsService {
       throw new ForbiddenException('Access denied');
     }
 
+    if (user.role === Role.DISTRIBUTOR) {
+      const distributorId = user.distributorProfile?.id || user.distributorId;
+      const isOwner = booking.userId === user.id;
+      const isSubordinate = distributorId && (booking.user?.distributorId === distributorId || (booking.user as any)?.centre?.distributorId === distributorId);
+      if (!isOwner && !isSubordinate) {
+        throw new ForbiddenException('Access denied to bookings outside your authorized distributor network');
+      }
+    }
+
     if (user.role === Role.PARTNER) {
       const partnerId = user.partnerProfile?.id || user.partnerId;
-      if (!partnerId || booking.user?.partnerId !== partnerId) {
+      const isOwner = booking.userId === user.id;
+      const isFranchise = partnerId && (
+        booking.user?.partnerId === partnerId ||
+        booking.user?.distributor?.partnerId === partnerId ||
+        (booking.user?.centre as any)?.distributor?.partnerId === partnerId
+      );
+      if (!isOwner && !isFranchise) {
         throw new ForbiddenException('Access denied to bookings outside your authorized partner franchise');
       }
     }
@@ -574,33 +975,36 @@ export class BookingsService {
       await this.accountLockService.releaseLock(booking.accountId, booking.id);
     }
 
-    const transitionRes = await this.stateMachine.transition({
-      bookingId: id,
-      targetStatus: BookingStatus.CANCELLED,
-      targetExecutionStatus: 'IDLE',
-      targetFinancialStatus: 'RELEASED',
-      expectedVersion: booking.version,
-      note: 'Cancelled by operator',
-      force: user.role === Role.SUPER_ADMIN,
-    });
-    const updated = transitionRes.booking;
+    const now = new Date();
+    // Atomically transition booking to CANCELLED and close ALL open jobs in ONE transaction
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const transitionRes = await this.stateMachine.transition({
+        bookingId: id,
+        targetStatus: BookingStatus.CANCELLED,
+        targetExecutionStatus: 'IDLE',
+        targetFinancialStatus: 'RELEASED',
+        expectedVersion: booking.version,
+        note: 'Cancelled by operator',
+        force: user.role === Role.SUPER_ADMIN,
+      }, tx);
 
-    // Also cancel any pending or errored jobs
-    await this.prisma.bookingJob.updateMany({
-      where: {
-        bookingRequestId: id,
-        status: { in: [
-          BookingStatus.QUEUED,
-          BookingStatus.WORKER_ASSIGNED,
-          BookingStatus.CHECKING_AVAILABILITY,
-          BookingStatus.WATCHING,
-          BookingStatus.CLAIMED,
-          BookingStatus.EXECUTING,
-          BookingStatus.WORKER_ERROR,
-          BookingStatus.HOLD_INVALID_NOMINEE,
-        ] },
-      },
-      data: { status: BookingStatus.CANCELLED },
+      // Close ALL non-terminal jobs for this booking in the SAME transaction
+      await tx.bookingJob.updateMany({
+        where: {
+          bookingRequestId: id,
+          status: {
+            notIn: [BookingStatus.SUCCESS, BookingStatus.COMPLETED, BookingStatus.CANCELLED, BookingStatus.FAILED],
+          },
+        },
+        data: {
+          status: BookingStatus.CANCELLED,
+          workerId: null,
+          leaseExpiresAt: null,
+          completedAt: now,
+        },
+      });
+
+      return transitionRes.booking;
     });
 
     return { message: 'Booking cancelled and funds released', booking: updated };
@@ -612,7 +1016,16 @@ export class BookingsService {
   async resolveHumanAction(id: string, dto: ResolveHumanActionDto, user: any) {
     const booking = await this.prisma.bookingRequest.findUnique({
       where: { id },
-      include: { user: true },
+      include: {
+        user: {
+          include: {
+            centre: {
+              include: { distributor: true },
+            },
+            distributor: true,
+          },
+        },
+      },
     });
 
     if (!booking) {
@@ -623,9 +1036,24 @@ export class BookingsService {
       throw new ForbiddenException('Access denied to other centres booking data');
     }
 
+    if (user.role === Role.DISTRIBUTOR) {
+      const distributorId = user.distributorProfile?.id || user.distributorId;
+      const isOwner = booking.userId === user.id;
+      const isSubordinate = distributorId && (booking.user?.distributorId === distributorId || (booking.user as any)?.centre?.distributorId === distributorId);
+      if (!isOwner && !isSubordinate) {
+        throw new ForbiddenException('Access denied to bookings outside your authorized distributor network');
+      }
+    }
+
     if (user.role === Role.PARTNER) {
       const partnerId = user.partnerProfile?.id || user.partnerId;
-      if (!partnerId || booking.user?.partnerId !== partnerId) {
+      const isOwner = booking.userId === user.id;
+      const isFranchise = partnerId && (
+        booking.user?.partnerId === partnerId ||
+        booking.user?.distributor?.partnerId === partnerId ||
+        (booking.user?.centre as any)?.distributor?.partnerId === partnerId
+      );
+      if (!isOwner && !isFranchise) {
         throw new ForbiddenException('Access denied to bookings outside your authorized partner franchise');
       }
     }

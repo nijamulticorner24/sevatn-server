@@ -41,8 +41,12 @@ export class DiscoverySchedulerService {
       process.env.AVAILABILITY_DISCOVERY_AVAILABLE_INTERVAL_MS || '60000',
       10,
     );
+    // PR-5: unavailableIntervalMs must be driven by AVAILABILITY_POLL_INTERVAL_MS (8000ms default, not hardcoded 30000ms)
     this.unavailableIntervalMs = parseInt(
-      process.env.AVAILABILITY_DISCOVERY_UNAVAILABLE_INTERVAL_MS || '30000',
+      process.env.AVAILABILITY_DISCOVERY_UNAVAILABLE_INTERVAL_MS ||
+      process.env.AVAILABILITY_POLL_INTERVAL_MS ||
+      process.env.DISCOVERY_INTERVAL_MS ||
+      '8000',
       10,
     );
     this.baseBackoffMs = parseInt(

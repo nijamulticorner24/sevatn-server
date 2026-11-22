@@ -3,6 +3,7 @@ import {
   NotFoundException,
   ConflictException,
   BadRequestException,
+  ForbiddenException,
   Logger,
 } from '@nestjs/common';
 // Trigger reload for refreshed Prisma client types
@@ -15,7 +16,7 @@ import {
   SubmitPartnerPaymentDto,
   ApprovePartnerPaymentDto,
 } from './dto/partner.dto';
-import { InvitationStatus, Role, UserStatus, CentreStatus, Prisma } from '@prisma/client';
+import { InvitationStatus, Role, UserStatus, CentreStatus, TransactionType, TransactionStatus, Prisma } from '@prisma/client';
 import { randomBytes } from 'crypto';
 import * as bcrypt from 'bcrypt';
 
@@ -1654,5 +1655,362 @@ export class PartnersService {
       message: `Partner ${updated.name} (${updated.partnerCode}) suspended.`,
       partner: updated,
     };
+  }
+
+  /**
+   * Get all eligible network recipients (Distributors & Centres) for wallet balance transfer
+   */
+  async getPartnerNetworkRecipients(partnerId: string) {
+    const partner = await this.prisma.partner.findUnique({
+      where: { id: partnerId },
+      include: {
+        distributors: {
+          include: {
+            user: {
+              include: { wallet: true },
+            },
+          },
+          orderBy: { name: 'asc' },
+        },
+      },
+    });
+
+    if (!partner) {
+      throw new NotFoundException(`Partner '${partnerId}' not found.`);
+    }
+
+    // Format network distributors
+    const distributors = (partner.distributors || []).map((d) => ({
+      id: d.id,
+      name: d.name,
+      distributorCode: d.distributorCode,
+      mobile: d.mobile,
+      district: d.district,
+      taluk: d.taluk,
+      status: d.status,
+      availableBalance: Number(d.user?.wallet?.availableBalance || 0),
+    }));
+
+    // Find all centres belonging to this partner:
+    // Either directly registered under partner (user.partnerId === partner.id),
+    // OR registered under any distributor of this partner (distributor.partnerId === partner.id)
+    const centres = await this.prisma.centre.findMany({
+      where: {
+        OR: [
+          { user: { partnerId: partner.id } },
+          { distributor: { partnerId: partner.id } },
+        ],
+      },
+      include: {
+        user: {
+          include: { wallet: true },
+        },
+        distributor: {
+          select: { id: true, name: true, distributorCode: true },
+        },
+      },
+      orderBy: { centreName: 'asc' },
+    });
+
+    const formattedCentres = centres.map((c) => ({
+      id: c.id,
+      centreName: c.centreName,
+      centreCode: c.centreCode,
+      district: c.district,
+      taluk: c.taluk,
+      status: c.status,
+      distributorName: c.distributor?.name,
+      distributorCode: c.distributor?.distributorCode,
+      availableBalance: Number(c.user?.wallet?.availableBalance || 0),
+    }));
+
+    return {
+      distributors,
+      centres: formattedCentres,
+    };
+  }
+
+  /**
+   * Transfer / Share wallet funds from Partner wallet to a Distributor or Centre
+   */
+  async sharePartnerWallet(
+    actorUser: any,
+    partnerId: string,
+    dto: { targetType: 'DISTRIBUTOR' | 'CENTRE'; targetId: string; amount: number; notes?: string },
+  ) {
+    const amount = Number(dto.amount);
+    if (!amount || isNaN(amount) || amount <= 0) {
+      throw new BadRequestException('Transfer amount must be a positive number greater than 0.');
+    }
+
+    if (!dto.targetType || !['DISTRIBUTOR', 'CENTRE'].includes(dto.targetType)) {
+      throw new BadRequestException('targetType must be either DISTRIBUTOR or CENTRE.');
+    }
+
+    if (!dto.targetId) {
+      throw new BadRequestException('Please specify a valid destination recipient.');
+    }
+
+    const partner = await this.prisma.partner.findUnique({
+      where: { id: partnerId },
+      include: {
+        user: {
+          include: { wallet: true },
+        },
+      },
+    });
+
+    if (!partner) {
+      throw new NotFoundException(`Partner '${partnerId}' not found.`);
+    }
+
+    // Resolve partner user ID & wallet
+    let partnerUserId = partner.userId || partner.user?.id;
+    if (!partnerUserId) {
+      const existingUser = await this.prisma.user.findFirst({
+        where: {
+          OR: [
+            { mobile: partner.mobile },
+            ...(partner.email ? [{ email: partner.email }] : []),
+          ],
+        },
+      });
+      if (existingUser) {
+        partnerUserId = existingUser.id;
+        await this.prisma.partner.update({
+          where: { id: partner.id },
+          data: { userId: partnerUserId },
+        });
+      } else {
+        throw new BadRequestException('Partner does not have an active user account.');
+      }
+    }
+
+    let recipientUserId: string;
+    let recipientMetadata: any;
+    let recipientLabel: string;
+
+    if (dto.targetType === 'DISTRIBUTOR') {
+      const distributor = await this.prisma.distributor.findUnique({
+        where: { id: dto.targetId },
+        include: {
+          user: {
+            include: { wallet: true },
+          },
+        },
+      });
+
+      if (!distributor) {
+        throw new NotFoundException(`Distributor with ID '${dto.targetId}' not found.`);
+      }
+
+      if (distributor.partnerId !== partner.id && actorUser.role !== Role.SUPER_ADMIN) {
+        throw new ForbiddenException(`Distributor '${distributor.name}' does not belong to your network.`);
+      }
+
+      let distUserId = distributor.userId || distributor.user?.id;
+      if (!distUserId) {
+        const existingDistUser = await this.prisma.user.findFirst({
+          where: {
+            OR: [
+              { mobile: distributor.mobile },
+              ...(distributor.email ? [{ email: distributor.email }] : []),
+            ],
+          },
+        });
+        if (existingDistUser) {
+          distUserId = existingDistUser.id;
+          await this.prisma.distributor.update({
+            where: { id: distributor.id },
+            data: { userId: distUserId },
+          });
+        } else {
+          throw new BadRequestException(`Distributor '${distributor.name}' has no active user account.`);
+        }
+      }
+
+      recipientUserId = distUserId;
+      recipientLabel = `Distributor ${distributor.name} (${distributor.distributorCode})`;
+      recipientMetadata = {
+        targetType: 'DISTRIBUTOR',
+        distributorId: distributor.id,
+        distributorName: distributor.name,
+        distributorCode: distributor.distributorCode,
+      };
+    } else {
+      // CENTRE
+      const centre = await this.prisma.centre.findUnique({
+        where: { id: dto.targetId },
+        include: {
+          user: {
+            include: { wallet: true },
+          },
+          distributor: true,
+        },
+      });
+
+      if (!centre) {
+        throw new NotFoundException(`Centre with ID '${dto.targetId}' not found.`);
+      }
+
+      const isDirect = centre.user?.partnerId === partner.id;
+      const isViaDistributor = centre.distributor?.partnerId === partner.id;
+      if (!isDirect && !isViaDistributor && actorUser.role !== Role.SUPER_ADMIN) {
+        throw new ForbiddenException(`Centre '${centre.centreName}' does not belong to your network.`);
+      }
+
+      const cUserId = centre.userId || centre.user?.id;
+      if (!cUserId) {
+        throw new BadRequestException(`Centre '${centre.centreName}' has no user account associated.`);
+      }
+
+      recipientUserId = cUserId;
+      recipientLabel = `Centre ${centre.centreName} (${centre.centreCode || 'CSC'})`;
+      recipientMetadata = {
+        targetType: 'CENTRE',
+        centreId: centre.id,
+        centreName: centre.centreName,
+        centreCode: centre.centreCode,
+      };
+    }
+
+    return await this.prisma.$transaction(
+      async (tx) => {
+      // 1. Partner wallet
+      let partnerWallet = await tx.wallet.findUnique({ where: { userId: partnerUserId } });
+      if (!partnerWallet) {
+        partnerWallet = await tx.wallet.create({
+          data: {
+            userId: partnerUserId,
+            availableBalance: new Prisma.Decimal(0),
+            reservedBalance: new Prisma.Decimal(0),
+          },
+        });
+      }
+
+      const partnerPrevAvailable = Number(partnerWallet.availableBalance);
+      if (partnerPrevAvailable < amount) {
+        throw new BadRequestException(
+          `Insufficient wallet balance: Your available balance is ₹${partnerPrevAvailable.toFixed(2)}, cannot transfer ₹${amount.toFixed(2)}.`,
+        );
+      }
+
+      // 2. Recipient wallet
+      let recipientWallet = await tx.wallet.findUnique({ where: { userId: recipientUserId } });
+      if (!recipientWallet) {
+        recipientWallet = await tx.wallet.create({
+          data: {
+            userId: recipientUserId,
+            availableBalance: new Prisma.Decimal(0),
+            reservedBalance: new Prisma.Decimal(0),
+          },
+        });
+      }
+
+      const recipientPrevAvailable = Number(recipientWallet.availableBalance);
+
+      // 3. Update balances
+      const partnerNewAvailable = partnerPrevAvailable - amount;
+      const recipientNewAvailable = recipientPrevAvailable + amount;
+
+      await tx.wallet.update({
+        where: { id: partnerWallet.id },
+        data: { availableBalance: new Prisma.Decimal(partnerNewAvailable) },
+      });
+
+      await tx.wallet.update({
+        where: { id: recipientWallet.id },
+        data: { availableBalance: new Prisma.Decimal(recipientNewAvailable) },
+      });
+
+      const transferRef = `SHARE-${Date.now().toString().slice(-8)}`;
+
+      // 4. Partner debit transaction
+      await tx.walletTransaction.create({
+        data: {
+          walletId: partnerWallet.id,
+          userId: partnerUserId,
+          type: TransactionType.ADJUSTMENT,
+          amount: new Prisma.Decimal(-amount),
+          status: TransactionStatus.COMPLETED,
+          reference: transferRef,
+          metadata: {
+            kind: 'WALLET_SHARE_OUT',
+            direction: 'DEBIT',
+            ...recipientMetadata,
+            notes: dto.notes?.trim() || `Wallet Balance Shared to ${recipientLabel}`,
+            previousBalance: partnerPrevAvailable,
+            newBalance: partnerNewAvailable,
+          },
+        },
+      });
+
+      // 5. Recipient credit transaction
+      await tx.walletTransaction.create({
+        data: {
+          walletId: recipientWallet.id,
+          userId: recipientUserId,
+          type: TransactionType.TOPUP,
+          amount: new Prisma.Decimal(amount),
+          status: TransactionStatus.COMPLETED,
+          reference: transferRef,
+          metadata: {
+            kind: 'WALLET_SHARE_IN',
+            direction: 'CREDIT',
+            partnerId: partner.id,
+            partnerName: partner.name,
+            partnerCode: partner.partnerCode,
+            notes: dto.notes?.trim() || `Wallet Balance Received from Partner ${partner.name}`,
+            previousBalance: recipientPrevAvailable,
+            newBalance: recipientNewAvailable,
+          },
+        },
+      });
+
+      // 6. Audit log
+      await this.audit.log({
+        actorId: actorUser.id,
+        actorType: 'USER',
+        action: 'PARTNER_WALLET_SHARE',
+        entity: 'Wallet',
+        entityId: partnerWallet.id,
+        metadata: {
+          partnerId: partner.id,
+          partnerCode: partner.partnerCode,
+          ...recipientMetadata,
+          amount,
+          transferRef,
+          notes: dto.notes,
+        },
+      });
+
+      // 7. WebSocket live updates
+      try {
+        this.eventsGateway.notifyWalletUpdated(partnerUserId, {
+          availableBalance: partnerNewAvailable,
+          reservedBalance: Number(partnerWallet.reservedBalance),
+        });
+        this.eventsGateway.notifyWalletUpdated(recipientUserId, {
+          availableBalance: recipientNewAvailable,
+          reservedBalance: Number(recipientWallet.reservedBalance),
+        });
+      } catch (wsErr) {
+        this.logger.warn(`Failed to dispatch websocket wallet updates: ${(wsErr as any).message}`);
+      }
+
+      return {
+        success: true,
+        reference: transferRef,
+        amount,
+        targetType: dto.targetType,
+        recipientLabel,
+        partnerRemainingBalance: partnerNewAvailable,
+        recipientNewBalance: recipientNewAvailable,
+        message: `Successfully transferred ₹${amount.toFixed(2)} to ${recipientLabel}.`,
+      };
+    }, {
+      maxWait: 15000,
+      timeout: 30000,
+    });
   }
 }

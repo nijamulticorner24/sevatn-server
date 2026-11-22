@@ -10,6 +10,7 @@ import { AccountLockService } from '../availability/account-lock.service';
 import { EventsGateway } from '../events/events.gateway';
 import { BookingStateMachineService } from './booking-state-machine.service';
 import { SmartAllocatorService } from '../workers/smart-allocator.service';
+import { TicketPricingService } from '../pricing/ticket-pricing.service';
 import { Role, BookingStatus } from '@prisma/client';
 
 describe('Phase 2B: Tenant Scoping & Role-Based Authorization Suite', () => {
@@ -61,6 +62,7 @@ describe('Phase 2B: Tenant Scoping & Role-Based Authorization Suite', () => {
         { provide: AccountLockService, useValue: {} },
         { provide: EventsGateway, useValue: mockEventsGateway },
         { provide: BookingStateMachineService, useValue: { transition: jest.fn().mockResolvedValue({}) } },
+        { provide: TicketPricingService, useValue: { calculateBookingPrice: jest.fn().mockResolvedValue({ baseTicketPrice: 20, partnerMarkup: 0, distributorMarkup: 0, finalTicketPrice: 20, ticketQuantity: 1, totalTicketAmount: 20, pricingConfigVersion: 1, pricingSnapshot: {} }) } },
         { provide: SmartAllocatorService, useValue: {} },
       ],
     }).compile();
@@ -137,6 +139,33 @@ describe('Phase 2B: Tenant Scoping & Role-Based Authorization Suite', () => {
 
     const result = await bookingsService.getBookingById('bk-1', partnerFranchise1);
     expect(result.id).toBe('bk-1');
+  });
+
+  it('allows authorized Distributor to access bookings under their network centres', async () => {
+    const bookingDistributor = {
+      id: 'bk-dist-1',
+      userId: 'user-centre-a',
+      user: { id: 'user-centre-a', distributorId: 'dist-1' },
+    };
+    mockPrisma.bookingRequest.findUnique.mockResolvedValue(bookingDistributor);
+
+    const distributorUser = { id: 'user-dist-1', role: Role.DISTRIBUTOR, distributorId: 'dist-1' };
+    const result = await bookingsService.getBookingById('bk-dist-1', distributorUser);
+    expect(result.id).toBe('bk-dist-1');
+  });
+
+  it('prohibits Distributor from viewing bookings outside their distributor network', async () => {
+    const bookingDistributor = {
+      id: 'bk-dist-1',
+      userId: 'user-centre-a',
+      user: { id: 'user-centre-a', distributorId: 'dist-1' },
+    };
+    mockPrisma.bookingRequest.findUnique.mockResolvedValue(bookingDistributor);
+
+    const otherDistributorUser = { id: 'user-dist-2', role: Role.DISTRIBUTOR, distributorId: 'dist-2' };
+    await expect(bookingsService.getBookingById('bk-dist-1', otherDistributorUser)).rejects.toThrow(
+      new ForbiddenException('Access denied to bookings outside your authorized distributor network'),
+    );
   });
 
   it('allows Super Admin full access to view any booking across the network', async () => {

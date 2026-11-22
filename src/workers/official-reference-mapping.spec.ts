@@ -273,7 +273,12 @@ describe('Official Booking Reference Mapping Regression Suite', () => {
       mockBookingRequest.officialBookingReference = 'IVQ26103022183531421270';
 
       const result = await workersService.claimJob('w-machine-1');
-      expect(result).toEqual({ hasJob: false });
+      expect(result).toEqual(
+        expect.objectContaining({
+          hasJob: false,
+          reason: 'ALREADY_COMPLETED(IVQ26103022183531421270)',
+        }),
+      );
     });
   });
 

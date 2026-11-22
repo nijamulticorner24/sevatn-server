@@ -5,14 +5,26 @@ import {
   BadRequestException,
   ConflictException,
   Optional,
+  Inject,
+  forwardRef,
 } from '@nestjs/common';
 import { Interval } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
 import { AccountLockService } from '../availability/account-lock.service';
 import { EventsGateway } from '../events/events.gateway';
 import { BookingStateMachineService } from '../bookings/booking-state-machine.service';
+import { BookingsService } from '../bookings/bookings.service';
+import { WalletService } from '../wallet/wallet.service';
 import { WorkerStatus, BookingStatus, JobType, Prisma } from '@prisma/client';
 import { validateNominee } from '../common/nominee-validator';
+import {
+  ACTIVE_RUNNING_JOB_STATUSES,
+  TERMINAL_OR_EXCLUDED_BOOKING_STATUSES,
+  TERMINAL_BOOKING_CLOSURE_STATUSES,
+  evaluateJobActiveCapacity,
+  extractAuthoritativeReference,
+} from '../common/booking-status.constants';
+import { normalizeDemandKey } from '../common/utils/demand-key';
 
 export interface WorkerAvailabilityAssessment {
   workerId: string;
@@ -63,6 +75,8 @@ export class SmartAllocatorService {
     private accountLockService: AccountLockService,
     @Optional() private eventsGateway?: EventsGateway,
     @Optional() private stateMachine?: BookingStateMachineService,
+    @Optional() @Inject(forwardRef(() => BookingsService)) private bookingsService?: BookingsService,
+    @Optional() @Inject(forwardRef(() => WalletService)) private walletService?: WalletService,
   ) {}
 
   /**
@@ -450,15 +464,74 @@ export class SmartAllocatorService {
       };
     }
 
-    // Guard: Existing confirmed bookings are not resubmitted
+    // Guard 1: Terminal / already-confirmed bookings MUST NOT be allocated or acquire account locks.
+    // Auto-close orphaned jobs whose booking is already terminal (CANCELLED, COMPLETED, SUCCESS, FAILED, EXPIRED).
     const allocBooking = job.bookingRequest as any;
-    if (allocBooking && (allocBooking.status === BookingStatus.SUCCESS || allocBooking.status === 'BOOKING_CONFIRMED' || allocBooking.officialBookingReference)) {
-      this.logger.log(`[ALLOCATOR] Skipping allocation for Job #${job.id}: Booking #${allocBooking.bookingCode} is already confirmed with reference ${allocBooking.officialBookingReference || allocBooking.officialReference}.`);
-      return {
-        allocated: false,
-        jobId: job.id,
-        decisionReason: `Booking #${allocBooking.bookingCode} is already confirmed with authoritative reference. Resubmission rejected.`,
-      };
+    if (allocBooking) {
+      const storedRef = extractAuthoritativeReference(allocBooking);
+      const isTerminalSuccess =
+        allocBooking.status === BookingStatus.SUCCESS ||
+        allocBooking.status === BookingStatus.COMPLETED ||
+        allocBooking.status === 'BOOKING_CONFIRMED' ||
+        Boolean(storedRef);
+      const isTerminalClosed =
+        isTerminalSuccess || TERMINAL_OR_EXCLUDED_BOOKING_STATUSES.includes(allocBooking.status);
+
+      if (isTerminalClosed) {
+        const closedJobStatus = isTerminalSuccess ? BookingStatus.SUCCESS : BookingStatus.CANCELLED;
+        this.logger.log(
+          `[ALLOCATOR] Closing orphaned Job #${job.id} (${job.status} -> ${closedJobStatus}): Booking #${allocBooking.bookingCode} is in terminal status (${allocBooking.status}).`,
+        );
+        await Promise.resolve(
+          this.prisma.bookingJob.update({
+            where: { id: job.id },
+            data: {
+              status: closedJobStatus,
+              workerId: null,
+              leaseExpiresAt: null,
+              completedAt: new Date(),
+            },
+          }),
+        ).catch(() => {});
+        return {
+          allocated: false,
+          jobId: job.id,
+          decisionReason: `Booking #${allocBooking.bookingCode} is in terminal status (${allocBooking.status}). Orphaned job closed.`,
+        };
+      }
+
+      // Guard 2: Skip WATCHING bookings unless their date/route is currently AVAILABLE in availability cache
+      if (allocBooking.status === BookingStatus.WATCHING) {
+        const dateStr =
+          allocBooking.requestedDateStr ||
+          (allocBooking.requestedDate instanceof Date
+            ? allocBooking.requestedDate.toISOString().split('T')[0]
+            : String(allocBooking.requestedDate || '').split('T')[0]);
+        const isAvail = await this.isDateRouteAvailableInCache(dateStr, allocBooking.route);
+        if (!isAvail.available) {
+          return {
+            allocated: false,
+            jobId: job.id,
+            decisionReason: `Booking #${allocBooking.bookingCode} is WATCHING and date ${dateStr} is not AVAILABLE in cache (status=${isAvail.status}).`,
+          };
+        }
+      }
+
+      // Guard 3: Validate state machine transitionability BEFORE acquiring an account lock
+      if (
+        this.stateMachine &&
+        typeof this.stateMachine.canTransition === 'function' &&
+        !this.stateMachine.canTransition(allocBooking.status, BookingStatus.EXECUTING)
+      ) {
+        this.logger.warn(
+          `[ALLOCATOR] Skipping Job #${job.id}: Booking #${allocBooking.bookingCode} cannot transition ${allocBooking.status} -> EXECUTING.`,
+        );
+        return {
+          allocated: false,
+          jobId: job.id,
+          decisionReason: `Invalid state transition prevented before locking: ${allocBooking.status} -> EXECUTING`,
+        };
+      }
     }
 
     // 0. Mandatory Nominee Pre-Validation: Validate before any worker allocation
@@ -729,7 +802,7 @@ export class SmartAllocatorService {
       return this.allocateJob(nextVerification.id);
     }
 
-    // Priority 2: Oldest pending Booking Execution
+    // Priority 2: Oldest pending Booking Execution (join bookingRequest to exclude terminal & WATCHING bookings)
     const nextBooking = await this.prisma.bookingJob.findFirst({
       where: {
         jobType: JobType.BOOKING_EXECUTION,
@@ -740,6 +813,12 @@ export class SmartAllocatorService {
             ((BookingStatus as any).FAST_BOOKING_QUEUED || 'FAST_BOOKING_QUEUED') as any,
           ],
         },
+        bookingRequest: {
+          status: {
+            notIn: [...TERMINAL_OR_EXCLUDED_BOOKING_STATUSES, BookingStatus.WATCHING],
+          },
+          officialBookingReference: null,
+        },
       },
       orderBy: { createdAt: 'asc' },
     });
@@ -749,6 +828,56 @@ export class SmartAllocatorService {
     }
 
     return null;
+  }
+
+  /**
+   * Checks whether a date/route is currently AVAILABLE in the server availability cache
+   * (DiscoverySchedule or active AVAILABLE AvailabilityOpportunity).
+   */
+  async isDateRouteAvailableInCache(
+    dateStr?: string | null,
+    route?: string | null,
+  ): Promise<{ available: boolean; status: string }> {
+    if (!dateStr) return { available: false, status: 'NO_DATE' };
+
+    const demandKey = normalizeDemandKey(dateStr, route || 'Pamba');
+    const prismaAny = this.prisma as any;
+
+    try {
+      if (typeof prismaAny.discoverySchedule?.findUnique === 'function') {
+        const sched = await prismaAny.discoverySchedule.findUnique({
+          where: { demandKey },
+        });
+        if (sched) {
+          if (sched.status === 'AVAILABLE') {
+            return { available: true, status: 'AVAILABLE' };
+          }
+          // Even if schedule says UNAVAILABLE/UNKNOWN, check if a fresh AVAILABLE opportunity exists
+          if (typeof prismaAny.availabilityOpportunity?.findFirst === 'function') {
+            const availOpp = await prismaAny.availabilityOpportunity.findFirst({
+              where: { date: dateStr, status: 'AVAILABLE' },
+            });
+            if (availOpp) {
+              return { available: true, status: 'AVAILABLE_OPPORTUNITY' };
+            }
+          }
+          return { available: false, status: sched.status || 'UNAVAILABLE' };
+        }
+      }
+
+      if (typeof prismaAny.availabilityOpportunity?.findFirst === 'function') {
+        const availOpp = await prismaAny.availabilityOpportunity.findFirst({
+          where: { date: dateStr, status: 'AVAILABLE' },
+        });
+        if (availOpp) {
+          return { available: true, status: 'AVAILABLE_OPPORTUNITY' };
+        }
+      }
+    } catch (err: any) {
+      this.logger.warn(`[AVAILABILITY-CACHE] Cache lookup notice for ${demandKey}: ${err?.message || err}`);
+    }
+
+    return { available: false, status: 'UNKNOWN' };
   }
 
   /**
@@ -769,6 +898,17 @@ export class SmartAllocatorService {
               ((BookingStatus as any).FAST_BOOKING_QUEUED || 'FAST_BOOKING_QUEUED') as any,
             ],
           },
+          OR: [
+            { jobType: JobType.ACCOUNT_VERIFICATION },
+            {
+              bookingRequest: {
+                status: {
+                  notIn: [...TERMINAL_OR_EXCLUDED_BOOKING_STATUSES, BookingStatus.WATCHING],
+                },
+                officialBookingReference: null,
+              },
+            },
+          ],
         },
         orderBy: [{ jobType: 'asc' }, { createdAt: 'asc' }],
         take: 25,
@@ -832,58 +972,182 @@ export class SmartAllocatorService {
   }
 
   /**
-   * Reconciles authoritative capacity counters by checking active database leases.
+   * Authoritatively evaluates active capacity for a worker by inspecting only RUNNING jobs
+   * with unexpired leases (strictly excluding COMPLETED, WATCHING, NEEDS_REVIEW with official
+   * reference, and jobs with expired leases). Logs the full capacity decision.
    */
-  async reconcileWorkerCapacity(workerId: string): Promise<number> {
-    const activeJobCount = await this.prisma.bookingJob.count({
-      where: {
-        workerId,
-        status: {
-          in: [
-            BookingStatus.WORKER_ASSIGNED,
-            BookingStatus.EXECUTING,
-            BookingStatus.CHECKING_AVAILABILITY,
-            BookingStatus.WATCHING,
-          ],
+  async evaluateWorkerCapacity(
+    workerId: string,
+    maxCapacity?: number,
+    workerReportedActiveJobIds?: string[],
+    syncMachine: boolean = true,
+  ): Promise<{
+    activeCount: number;
+    maxCapacity: number;
+    countedJobs: Array<{ jobId: string; bookingCode?: string; status: string; reason: string; leaseRemainingSec?: number; bookingRequestId?: string | null }>;
+    excludedJobs: Array<{ jobId: string; bookingCode?: string; status: string; reason: string }>;
+  }> {
+    const now = new Date();
+    let effectiveLimit = maxCapacity;
+    let machineCode = workerId;
+
+    if (effectiveLimit === undefined && typeof this.prisma.workerMachine?.findUnique === 'function') {
+      const w = await this.prisma.workerMachine.findUnique({ where: { id: workerId } }).catch(() => null);
+      if (w) {
+        effectiveLimit = (w as any).maxConcurrentJobs ?? 1;
+        machineCode = w.machineCode || workerId;
+      }
+    }
+    const limit = effectiveLimit ?? 1;
+
+    const countedJobs: Array<{ jobId: string; bookingCode?: string; status: string; reason: string; leaseRemainingSec?: number; bookingRequestId?: string | null }> = [];
+    const excludedJobs: Array<{ jobId: string; bookingCode?: string; status: string; reason: string }> = [];
+
+    if (typeof this.prisma.bookingJob?.findMany === 'function') {
+      const workerJobs = await this.prisma.bookingJob.findMany({
+        where: {
+          workerId,
+          status: {
+            notIn: [BookingStatus.CANCELLED, BookingStatus.FAILED],
+          },
         },
-      },
-    });
+        include: {
+          bookingRequest: {
+            select: {
+              id: true,
+              bookingCode: true,
+              status: true,
+              officialBookingReference: true,
+              officialReference: true,
+              cartId: true,
+              reconciliationStatus: true,
+              requestedDateStr: true,
+            },
+          },
+        },
+      });
 
-    await this.prisma.workerMachine.update({
-      where: { id: workerId },
-      data: {
-        currentActiveJobs: activeJobCount,
-        status: activeJobCount > 0 ? WorkerStatus.BUSY : WorkerStatus.ONLINE,
-      },
-    });
+      for (const job of workerJobs) {
+        if (job.workerId !== workerId) continue;
+        const evalRes = evaluateJobActiveCapacity(job as any, now, workerReportedActiveJobIds);
+        const bookingCode = (job as any).bookingRequest?.bookingCode;
+        if (evalRes.counts) {
+          countedJobs.push({
+            jobId: job.id,
+            bookingCode,
+            status: job.status,
+            reason: evalRes.reason,
+            leaseRemainingSec: evalRes.leaseRemainingSec,
+            bookingRequestId: job.bookingRequestId,
+          });
+        } else {
+          excludedJobs.push({
+            jobId: job.id,
+            bookingCode,
+            status: job.status,
+            reason: evalRes.reason,
+          });
+        }
+      }
+    } else if (typeof this.prisma.bookingJob?.count === 'function') {
+      const fallbackCount = await this.prisma.bookingJob.count({
+        where: {
+          workerId,
+          status: { in: ACTIVE_RUNNING_JOB_STATUSES },
+          leaseExpiresAt: { gt: now },
+        },
+      });
+      for (let i = 0; i < fallbackCount; i++) {
+        countedJobs.push({
+          jobId: `active-${i + 1}`,
+          status: 'EXECUTING',
+          reason: 'RUNNING(unexpired lease)',
+        });
+      }
+    }
 
-    return activeJobCount;
+    const activeCount = countedJobs.length;
+    const countedSummary = countedJobs.length > 0
+      ? countedJobs.map((j) => `${j.jobId}(${j.bookingCode || 'N/A'}:${j.reason})`).join(', ')
+      : 'none';
+    const excludedSummary = excludedJobs.length > 0
+      ? excludedJobs.slice(0, 8).map((j) => `${j.jobId}(${j.bookingCode || 'N/A'}:${j.reason})`).join(', ')
+      : 'none';
+
+    this.logger.log(
+      `[CAPACITY] Worker ${machineCode}: active=${activeCount}/${limit} | counted=[${countedSummary}] | excluded=[${excludedSummary}]`,
+    );
+
+    if (syncMachine && typeof this.prisma.workerMachine?.update === 'function') {
+      await Promise.resolve(
+        this.prisma.workerMachine.update({
+          where: { id: workerId },
+          data: {
+            currentActiveJobs: activeCount,
+            status: activeCount > 0 ? WorkerStatus.BUSY : WorkerStatus.ONLINE,
+            ...(activeCount === 0
+              ? {
+                  currentJobId: null,
+                  currentBookingId: null,
+                  currentActivity: 'IDLE',
+                }
+              : {}),
+          },
+        }),
+      ).catch(() => {});
+    }
+
+    return { activeCount, maxCapacity: limit, countedJobs, excludedJobs };
+  }
+
+  /**
+   * Reconciles authoritative capacity counters by checking active unexpired database leases.
+   */
+  async reconcileWorkerCapacity(workerId: string, workerReportedActiveJobIds?: string[]): Promise<number> {
+    const res = await this.evaluateWorkerCapacity(workerId, undefined, workerReportedActiveJobIds, true);
+    return res.activeCount;
   }
 
   /**
    * Recovers expired worker reservations with strict safety controls.
    * If outcome is ambiguous or external site submission occurred, flags for human review.
    */
-  async recoverStaleLeases(): Promise<{ recoveredCount: number; humanReviewCount: number }> {
+  async recoverStaleLeases(): Promise<{
+    recoveredCount: number;
+    humanReviewCount: number;
+    totalRecovered?: number;
+    staleLeasesRecovered?: number;
+    recreatedJobsCount?: number;
+    requeuedAccountsCount?: number;
+    retryableRequeuedCount?: number;
+    expiredLocksCleaned?: number;
+    pastBookingsAutoCancelled?: number;
+    uncompletedPassesReconciled?: number;
+    orphanedTerminalJobsClosed?: number;
+    details?: string[];
+  }> {
     const now = new Date();
-    const expiredJobs = await this.prisma.bookingJob.findMany({
-      where: {
-        status: {
-          in: [
-            BookingStatus.WORKER_ASSIGNED,
-            BookingStatus.EXECUTING,
-            BookingStatus.CHECKING_AVAILABILITY,
-          ],
-        },
-        leaseExpiresAt: { lte: now },
-      },
-      include: { worker: true, bookingRequest: true },
-    });
+    const details: string[] = [];
 
+    // 1. Recover stale/expired worker leases (isolated in its own try/catch)
     let recoveredCount = 0;
     let humanReviewCount = 0;
+    try {
+      const expiredJobs = await this.prisma.bookingJob.findMany({
+        where: {
+          status: {
+            in: [
+              BookingStatus.WORKER_ASSIGNED,
+              BookingStatus.EXECUTING,
+              BookingStatus.CHECKING_AVAILABILITY,
+            ],
+          },
+          leaseExpiresAt: { lte: now },
+        },
+        include: { worker: true, bookingRequest: true },
+      });
 
-    for (const job of expiredJobs) {
+      for (const job of expiredJobs) {
       try {
         const assignedWorkerId = job.workerId;
 
@@ -925,6 +1189,7 @@ export class SmartAllocatorService {
           }
 
           humanReviewCount++;
+          details.push(`Lease expired for Job #${job.id} during active execution; escalated to REQUIRES_HUMAN.`);
         } else {
           // Safe to recover back to queue
           await this.prisma.bookingJob.update({
@@ -963,6 +1228,7 @@ export class SmartAllocatorService {
           }
 
           recoveredCount++;
+          details.push(`Recovered stale Job #${job.id} back to QUEUED.`);
         }
 
         // Release capacity on the assigned worker without immediately reallocating to it
@@ -984,9 +1250,413 @@ export class SmartAllocatorService {
       } catch (err: any) {
         this.logger.warn(`Error recovering stale job #${job.id}: ${err.message}`);
       }
+      }
+    } catch (staleSweepErr: any) {
+      this.logger.warn(`Reconcile stale leases sweep error: ${staleSweepErr.message}`);
     }
 
-    return { recoveredCount, humanReviewCount };
+    // 2. Reconcile EXECUTION_QUEUED requests: recreate job as QUEUED if missing, or reset request to PENDING
+    let recreatedJobsCount = 0;
+    try {
+      const executionQueuedRequests = typeof this.prisma.bookingRequest?.findMany === 'function'
+        ? await this.prisma.bookingRequest.findMany({
+            where: { status: { in: [BookingStatus.EXECUTION_QUEUED] } },
+            include: { jobs: true },
+          })
+        : [];
+
+      for (const br of executionQueuedRequests) {
+        const brJob = (br as any).jobs && (br as any).jobs.length > 0 ? (br as any).jobs[0] : null;
+        const activeJobStatuses: any[] = [
+          BookingStatus.QUEUED,
+          BookingStatus.EXECUTING,
+          BookingStatus.WORKER_ASSIGNED,
+          BookingStatus.LOGIN_IN_PROGRESS,
+          BookingStatus.BOOKING_IN_PROGRESS,
+        ];
+        const hasActiveJob = brJob && activeJobStatuses.includes(brJob.status) && (
+          brJob.status !== BookingStatus.EXECUTING || (brJob.leaseExpiresAt && new Date(brJob.leaseExpiresAt).getTime() > now.getTime())
+        );
+
+        if (!hasActiveJob) {
+          try {
+            if (brJob) {
+              await this.prisma.bookingJob.update({
+                where: { id: brJob.id },
+                data: {
+                  status: BookingStatus.QUEUED,
+                  workerId: null,
+                  startedAt: null,
+                  heartbeatAt: null,
+                  leaseExpiresAt: null,
+                },
+              });
+            } else {
+              await this.prisma.bookingJob.create({
+                data: {
+                  jobType: JobType.BOOKING_EXECUTION,
+                  bookingRequestId: br.id,
+                  accountId: br.accountId || null,
+                  workerId: null,
+                  status: BookingStatus.QUEUED,
+                },
+              });
+            }
+            recreatedJobsCount++;
+            details.push(`Recreated QUEUED job for EXECUTION_QUEUED booking #${br.bookingCode}`);
+          } catch (jobErr: any) {
+            this.logger.warn(`Failed to recreate job for #${br.bookingCode}: ${jobErr.message}. Resetting request to PENDING.`);
+            await this.prisma.bookingRequest.update({
+              where: { id: br.id },
+              data: { status: BookingStatus.PENDING, assignedMachineId: null, leaseExpiresAt: null },
+            }).catch(() => {});
+            details.push(`Reset EXECUTION_QUEUED booking #${br.bookingCode} to PENDING (job recreate failed)`);
+          }
+        }
+      }
+    } catch (recErr: any) {
+      this.logger.warn(`Reconcile EXECUTION_QUEUED error: ${recErr.message}`);
+    }
+
+    // 3. Reconcile WAITING_FOR_ACCOUNT requests: requeue if account is now free
+    let requeuedAccountsCount = 0;
+    try {
+      const waitingForAccountRequests = typeof this.prisma.bookingRequest?.findMany === 'function'
+        ? await this.prisma.bookingRequest.findMany({
+            where: { status: { in: [BookingStatus.WAITING_FOR_ACCOUNT] } },
+            include: { jobs: true },
+          })
+        : [];
+
+      for (const br of waitingForAccountRequests) {
+        const brJob = (br as any).jobs && (br as any).jobs.length > 0 ? (br as any).jobs[0] : null;
+        if (br.accountId) {
+          const isLocked = await this.accountLockService.isLocked(br.accountId, br.id);
+          if (!isLocked) {
+            try {
+              if (this.stateMachine) {
+                await this.stateMachine.transition({
+                  bookingId: br.id,
+                  targetStatus: BookingStatus.QUEUED,
+                  milestone: 'ACCOUNT_FREED_REQUEUED',
+                  reason: 'Devotee account is free; requeued by Reconciler.',
+                }).catch(() => {});
+              } else {
+                await this.prisma.bookingRequest.update({
+                  where: { id: br.id },
+                  data: { status: BookingStatus.QUEUED },
+                });
+              }
+
+              if (brJob) {
+                await this.prisma.bookingJob.update({
+                  where: { id: brJob.id },
+                  data: { status: BookingStatus.QUEUED, workerId: null, leaseExpiresAt: null },
+                });
+              } else {
+                await this.prisma.bookingJob.create({
+                  data: {
+                    jobType: JobType.BOOKING_EXECUTION,
+                    bookingRequestId: br.id,
+                    accountId: br.accountId,
+                    workerId: null,
+                    status: BookingStatus.QUEUED,
+                  },
+                }).catch(() => {});
+              }
+
+              requeuedAccountsCount++;
+              details.push(`Requeued WAITING_FOR_ACCOUNT booking #${br.bookingCode} (account freed)`);
+            } catch (err: any) {
+              this.logger.warn(`Error requeueing WAITING_FOR_ACCOUNT booking #${br.bookingCode}: ${err.message}`);
+            }
+          }
+        }
+      }
+    } catch (accErr: any) {
+      this.logger.warn(`Reconcile WAITING_FOR_ACCOUNT error: ${accErr.message}`);
+    }
+
+    // 4. Reconcile RETRYABLE_FAILURE jobs: return to QUEUED when nextRetryAt/cooldown has passed
+    let retryableRequeuedCount = 0;
+    try {
+      const retryableJobs = await this.prisma.bookingJob.findMany({
+        where: { status: { in: [BookingStatus.RETRYABLE_FAILURE] } },
+        include: { bookingRequest: true },
+      });
+
+      for (const rj of retryableJobs) {
+        const nextRetryAt = (rj as any).nextRetryAt || rj.bookingRequest?.nextCheckAt;
+        const isRetryDue = !nextRetryAt || new Date(nextRetryAt).getTime() <= now.getTime();
+
+        if (isRetryDue) {
+          try {
+            await this.prisma.bookingJob.update({
+              where: { id: rj.id },
+              data: {
+                status: BookingStatus.QUEUED,
+                workerId: null,
+                heartbeatAt: null,
+                leaseExpiresAt: null,
+              },
+            });
+
+            if (rj.bookingRequestId) {
+              if (this.stateMachine) {
+                await this.stateMachine.transition({
+                  bookingId: rj.bookingRequestId,
+                  targetStatus: BookingStatus.QUEUED,
+                  milestone: 'RETRYABLE_FAILURE_COOLDOWN_ELAPSED',
+                  reason: 'Retryable cooldown elapsed; job returned to queue.',
+                }).catch(() => {});
+              } else {
+                await this.prisma.bookingRequest.update({
+                  where: { id: rj.bookingRequestId },
+                  data: { status: BookingStatus.QUEUED, nextCheckAt: null },
+                });
+              }
+            }
+
+            retryableRequeuedCount++;
+            details.push(`Returned RETRYABLE_FAILURE job #${rj.id} to QUEUED (cooldown elapsed)`);
+          } catch (err: any) {
+            this.logger.warn(`Error requeueing RETRYABLE_FAILURE job #${rj.id}: ${err.message}`);
+          }
+        }
+      }
+    } catch (retErr: any) {
+      this.logger.warn(`Reconcile RETRYABLE_FAILURE error: ${retErr.message}`);
+    }
+
+    // 5. Clean expired / orphaned account locks
+    let expiredLocksCleaned = 0;
+    try {
+      expiredLocksCleaned = await this.accountLockService.cleanupExpiredLocks();
+      if (expiredLocksCleaned > 0) {
+        details.push(`Cleaned ${expiredLocksCleaned} expired/stale account lock(s)`);
+      }
+    } catch (_) {}
+
+    // 6. Auto-cancel past-date pending bookings system-wide
+    let pastBookingsAutoCancelled = 0;
+    try {
+      if (this.bookingsService) {
+        const autoCancelRes = await this.bookingsService.autoCancelPastPendingBookings();
+        pastBookingsAutoCancelled = autoCancelRes.cancelledCount;
+        if (autoCancelRes.details.length > 0) {
+          details.push(...autoCancelRes.details);
+        }
+      }
+    } catch (err: any) {
+      this.logger.warn(`Reconciler past bookings auto-cancel error: ${err.message}`);
+    }
+
+    // 7a. Reconcile bookings with an official reference whose status is not COMPLETED/SUCCESS (isolated try/catch)
+    let uncompletedPassesReconciled = 0;
+    let uncompletedPassesQuerySucceeded = false;
+    try {
+      const pendingConfirmedBookings = await this.prisma.bookingRequest.findMany({
+        where: {
+          officialBookingReference: { not: null },
+          status: { notIn: [BookingStatus.SUCCESS, BookingStatus.COMPLETED, BookingStatus.CANCELLED] },
+        },
+        include: { jobs: true },
+      });
+      uncompletedPassesQuerySucceeded = true;
+
+      for (const br of pendingConfirmedBookings) {
+        try {
+          const passRef = extractAuthoritativeReference(br);
+          if (passRef) {
+            const brJob = br.jobs && br.jobs.length > 0 ? br.jobs[0] : null;
+            await this.prisma.$transaction(async (tx) => {
+              if (brJob) {
+                await tx.bookingJob.update({
+                  where: { id: brJob.id },
+                  data: { status: BookingStatus.SUCCESS, leaseExpiresAt: null, completedAt: now },
+                });
+              }
+
+              if (this.stateMachine) {
+                await this.stateMachine.transition({
+                  bookingId: br.id,
+                  targetStatus: BookingStatus.SUCCESS,
+                  targetExecutionStatus: 'COMPLETED',
+                  targetFinancialStatus: 'CAPTURED',
+                  milestone: 'RECONCILER_CONFIRMED',
+                  officialReference: passRef,
+                  officialBookingReference: passRef,
+                  note: 'Auto-completed by Server Reconciler from authoritative portal reference',
+                  force: true,
+                }, tx);
+              } else {
+                await tx.bookingRequest.update({
+                  where: { id: br.id },
+                  data: {
+                    status: BookingStatus.SUCCESS,
+                    executionStatus: 'COMPLETED',
+                    financialStatus: 'CAPTURED',
+                    completedAt: now,
+                    assignedMachineId: null,
+                    leaseExpiresAt: null,
+                  },
+                });
+              }
+
+              if (this.walletService) {
+                const reserveTx = await tx.walletTransaction.findFirst({
+                  where: { bookingId: br.id, type: 'RESERVE', status: 'COMPLETED' },
+                });
+                const feeAmount = reserveTx ? Number(reserveTx.amount) : 10;
+                await this.walletService.capture({
+                  userId: br.userId,
+                  bookingId: br.id,
+                  amount: feeAmount,
+                  idempotencyKey: `cap_${br.id}`,
+                }, tx);
+              }
+            });
+
+            if (typeof (this.prisma as any).bookingReconciliation?.upsert === 'function') {
+              await this.prisma.bookingReconciliation.upsert({
+                where: { bookingRequestId: br.id },
+                update: {
+                  status: 'RECONCILED_SUCCESS',
+                  resolvedReference: passRef,
+                  resolvedAt: now,
+                  investigationNote: 'Auto-reconciled by Reconciler sweep with authoritative pass',
+                },
+                create: {
+                  bookingRequestId: br.id,
+                  status: 'RECONCILED_SUCCESS',
+                  resolvedReference: passRef,
+                  resolvedAt: now,
+                  investigationNote: 'Auto-reconciled by Reconciler sweep with authoritative pass',
+                },
+              }).catch(() => {});
+            }
+
+            uncompletedPassesReconciled++;
+            details.push(`Auto-completed Booking #${br.bookingCode} with confirmed reference ${passRef}`);
+          }
+        } catch (recErr: any) {
+          this.logger.warn(`Failed to auto-complete booking #${br.bookingCode}: ${recErr.message}. Surfacing in admin queue.`);
+          if (typeof (this.prisma as any).bookingReconciliation?.upsert === 'function') {
+            await this.prisma.bookingReconciliation.upsert({
+              where: { bookingRequestId: br.id },
+              update: {
+                status: 'PENDING',
+                lastMilestone: br.lastMilestone || 'OFFICIAL_PASS_UNCONFIRMED',
+                investigationNote: `Official reference ${br.officialBookingReference} detected but auto-completion failed: ${recErr.message}`,
+              },
+              create: {
+                bookingRequestId: br.id,
+                status: 'PENDING',
+                lastMilestone: br.lastMilestone || 'OFFICIAL_PASS_UNCONFIRMED',
+                investigationNote: `Official reference ${br.officialBookingReference} detected but auto-completion failed: ${recErr.message}`,
+              },
+            }).catch(() => {});
+          }
+        }
+      }
+    } catch (passErr: any) {
+      this.logger.warn(`Reconcile pending confirmed passes error: ${passErr.message}`);
+    }
+
+    // 7b. Surface jobs in RECONCILIATION_REQUIRED or bookings with reconciliationStatus='NEEDS_REVIEW' in admin queue (isolated try/catch)
+    try {
+      const needsReviewJobs = await this.prisma.bookingJob.findMany({
+        where: {
+          OR: [
+            { status: BookingStatus.RECONCILIATION_REQUIRED },
+            { bookingRequest: { reconciliationStatus: 'NEEDS_REVIEW' } },
+          ],
+        },
+        include: { bookingRequest: true },
+      });
+
+      for (const nrj of needsReviewJobs) {
+        if (nrj.bookingRequestId && typeof (this.prisma as any).bookingReconciliation?.upsert === 'function') {
+          await this.prisma.bookingReconciliation.upsert({
+            where: { bookingRequestId: nrj.bookingRequestId },
+            update: {
+              status: 'HUMAN_REVIEW',
+              lastMilestone: 'NEEDS_REVIEW',
+              investigationNote: nrj.errorMessage || nrj.bookingRequest?.requiresHumanNote || 'Job marked NEEDS_REVIEW after lease mismatch or portal ambiguity.',
+            },
+            create: {
+              bookingRequestId: nrj.bookingRequestId,
+              status: 'HUMAN_REVIEW',
+              lastMilestone: 'NEEDS_REVIEW',
+              investigationNote: nrj.errorMessage || nrj.bookingRequest?.requiresHumanNote || 'Job marked NEEDS_REVIEW after lease mismatch or portal ambiguity.',
+            },
+          }).catch(() => {});
+        }
+      }
+    } catch (reviewErr: any) {
+      this.logger.warn(`Reconcile NEEDS_REVIEW queue error: ${reviewErr.message}`);
+    }
+
+    // 7c. Close orphaned non-terminal jobs whose BookingRequest is already terminal (CANCELLED/COMPLETED/SUCCESS/FAILED/EXPIRED)
+    let orphanedTerminalJobsClosed = 0;
+    try {
+      if (typeof this.prisma.bookingJob?.updateMany === 'function') {
+        const closedRes = await this.prisma.bookingJob.updateMany({
+          where: {
+            status: {
+              notIn: [BookingStatus.CANCELLED, BookingStatus.SUCCESS, BookingStatus.COMPLETED, BookingStatus.FAILED],
+            },
+            bookingRequest: {
+              status: {
+                in: TERMINAL_BOOKING_CLOSURE_STATUSES,
+              },
+            },
+          },
+          data: {
+            status: BookingStatus.CANCELLED,
+            workerId: null,
+            leaseExpiresAt: null,
+            completedAt: now,
+          },
+        });
+        orphanedTerminalJobsClosed = closedRes?.count ?? 0;
+        if (orphanedTerminalJobsClosed > 0) {
+          details.push(`Closed ${orphanedTerminalJobsClosed} orphaned job(s) belonging to terminal bookings`);
+        }
+      }
+    } catch (orphanErr: any) {
+      this.logger.warn(`Reconcile orphaned terminal jobs error: ${orphanErr.message}`);
+    }
+
+    const totalRecovered =
+      recoveredCount +
+      recreatedJobsCount +
+      requeuedAccountsCount +
+      retryableRequeuedCount +
+      pastBookingsAutoCancelled +
+      uncompletedPassesReconciled +
+      orphanedTerminalJobsClosed;
+    const uncompletedPassesSegment = uncompletedPassesQuerySucceeded
+      ? `, Uncompleted Passes: ${uncompletedPassesReconciled}`
+      : '';
+    this.logger.log(
+      `[RECONCILER] Pass completed. Recovered: ${totalRecovered} (Leases: ${recoveredCount}, Recreated: ${recreatedJobsCount}, Accounts: ${requeuedAccountsCount}, Retries: ${retryableRequeuedCount}, Expired Locks: ${expiredLocksCleaned}, Past Bookings Cancelled: ${pastBookingsAutoCancelled}, Orphaned Jobs Closed: ${orphanedTerminalJobsClosed}${uncompletedPassesSegment})`,
+    );
+
+    return {
+      recoveredCount,
+      humanReviewCount,
+      totalRecovered,
+      staleLeasesRecovered: recoveredCount,
+      recreatedJobsCount,
+      requeuedAccountsCount,
+      retryableRequeuedCount,
+      expiredLocksCleaned,
+      pastBookingsAutoCancelled,
+      ...(uncompletedPassesQuerySucceeded ? { uncompletedPassesReconciled } : {}),
+      orphanedTerminalJobsClosed,
+      details,
+    };
   }
 
   /**

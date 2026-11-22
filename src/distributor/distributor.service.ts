@@ -19,7 +19,7 @@ import {
   UpdateDistributorStatusDto,
   GenerateCentreInvitationDto,
 } from './dto/distributor.dto';
-import { Role, UserStatus, InvitationStatus, Prisma } from '@prisma/client';
+import { Role, UserStatus, InvitationStatus, TransactionType, TransactionStatus, Prisma } from '@prisma/client';
 import { randomBytes } from 'crypto';
 import * as bcrypt from 'bcrypt';
 
@@ -416,7 +416,7 @@ export class DistributorService {
       where: { id: distributorId },
       include: {
         partner: {
-          select: { id: true, partnerCode: true, name: true, markup: true },
+          select: { id: true, partnerCode: true, name: true, mobile: true, email: true, district: true, taluk: true, markup: true },
         },
         centres: true,
         invitations: true,
@@ -477,7 +477,7 @@ export class DistributorService {
       where: { id: distributorId },
       include: {
         partner: {
-          select: { id: true, partnerCode: true, name: true, district: true, taluk: true },
+          select: { id: true, partnerCode: true, name: true, mobile: true, email: true, district: true, taluk: true },
         },
       },
     });
@@ -514,7 +514,7 @@ export class DistributorService {
         where,
         include: {
           user: {
-            select: { id: true, name: true, mobile: true, email: true, status: true, createdAt: true, mustChangePassword: true },
+            select: { id: true, name: true, mobile: true, email: true, status: true, createdAt: true, mustChangePassword: true, wallet: { select: { availableBalance: true } } },
           },
         },
         skip: (page - 1) * limit,
@@ -665,7 +665,12 @@ export class DistributorService {
           select: { id: true, partnerCode: true, name: true, district: true },
         },
         user: {
-          select: { id: true, email: true, mobile: true },
+          select: {
+            id: true,
+            email: true,
+            mobile: true,
+            wallet: true,
+          },
         },
         _count: {
           select: { centres: true },
@@ -680,7 +685,417 @@ export class DistributorService {
       email: d.email || d.user?.email || null,
       markup: Number(d.markup),
       centresCount: d._count.centres,
+      wallet: d.user?.wallet || null,
+      availableBalance: Number(d.user?.wallet?.availableBalance ?? 0),
+      reservedBalance: Number(d.user?.wallet?.reservedBalance ?? 0),
     }));
+  }
+
+  /**
+   * Super Admin adjusts a distributor's wallet balance (CREDIT or DEBIT)
+   */
+  async adjustDistributorWallet(
+    adminUser: any,
+    distributorId: string,
+    dto: { amount: number; action: 'CREDIT' | 'DEBIT'; reason?: string },
+  ) {
+    const amount = Number(dto.amount);
+    if (!amount || isNaN(amount) || amount <= 0) {
+      throw new BadRequestException('Adjustment amount must be a positive number greater than 0.');
+    }
+
+    if (dto.action !== 'CREDIT' && dto.action !== 'DEBIT') {
+      throw new BadRequestException("Action must be either 'CREDIT' or 'DEBIT'.");
+    }
+
+    const distributor = await this.prisma.distributor.findUnique({
+      where: { id: distributorId },
+      include: {
+        user: {
+          include: {
+            wallet: true,
+          },
+        },
+      },
+    });
+
+    if (!distributor) {
+      throw new NotFoundException(`Distributor with ID '${distributorId}' not found`);
+    }
+
+    // Resolve distributor user
+    let userId = distributor.userId;
+    if (!userId && distributor.user?.id) {
+      userId = distributor.user.id;
+    }
+
+    if (!userId) {
+      // Find user by mobile or email if unlinked
+      const existingUser = await this.prisma.user.findFirst({
+        where: {
+          OR: [
+            { mobile: distributor.mobile },
+            ...(distributor.email ? [{ email: distributor.email }] : []),
+          ],
+        },
+      });
+
+      if (existingUser) {
+        userId = existingUser.id;
+        await this.prisma.distributor.update({
+          where: { id: distributor.id },
+          data: { userId },
+        });
+      } else {
+        throw new BadRequestException(
+          `Distributor '${distributor.distributorCode}' does not have an active user account linked. Cannot adjust wallet.`,
+        );
+      }
+    }
+
+    return await this.prisma.$transaction(
+      async (tx) => {
+      // 1. Get or create wallet for the distributor user
+      let wallet = distributor.user?.wallet;
+      if (!wallet) {
+        wallet = await tx.wallet.findUnique({ where: { userId } });
+      }
+
+      if (!wallet) {
+        wallet = await tx.wallet.create({
+          data: {
+            userId,
+            availableBalance: new Prisma.Decimal(0),
+            reservedBalance: new Prisma.Decimal(0),
+          },
+        });
+      }
+
+      const prevAvailable = Number(wallet.availableBalance);
+      let newAvailable: number;
+
+      if (dto.action === 'CREDIT') {
+        newAvailable = prevAvailable + amount;
+      } else {
+        if (prevAvailable < amount) {
+          throw new BadRequestException(
+            `Cannot deduct ₹${amount}: Insufficient available balance (Current balance: ₹${prevAvailable.toFixed(2)}).`,
+          );
+        }
+        newAvailable = prevAvailable - amount;
+      }
+
+      // 2. Update wallet
+      const updatedWallet = await tx.wallet.update({
+        where: { id: wallet.id },
+        data: {
+          availableBalance: new Prisma.Decimal(newAvailable),
+        },
+      });
+
+      // 3. Create audit transaction record
+      const transaction = await tx.walletTransaction.create({
+        data: {
+          walletId: wallet.id,
+          userId,
+          type: TransactionType.ADJUSTMENT,
+          amount: new Prisma.Decimal(dto.action === 'CREDIT' ? amount : -amount),
+          status: TransactionStatus.COMPLETED,
+          reference: `ADMIN-DT-${dto.action}-${Date.now()}`,
+          metadata: {
+            adminId: adminUser.id,
+            adminEmail: adminUser.email,
+            action: dto.action,
+            amount,
+            reason: dto.reason?.trim() || `Manual Admin ${dto.action === 'CREDIT' ? 'Credit' : 'Deduction'}`,
+            previousBalance: prevAvailable,
+            newBalance: newAvailable,
+            distributorCode: distributor.distributorCode,
+            distributorName: distributor.name,
+          },
+        },
+      });
+
+      // 4. Audit log
+      await this.audit.log({
+        actorId: adminUser.id,
+        actorType: 'ADMIN',
+        action: dto.action === 'CREDIT' ? 'DISTRIBUTOR_WALLET_CREDIT' : 'DISTRIBUTOR_WALLET_DEBIT',
+        entity: 'Wallet',
+        entityId: wallet.id,
+        metadata: {
+          distributorId: distributor.id,
+          distributorCode: distributor.distributorCode,
+          distributorName: distributor.name,
+          action: dto.action,
+          amount,
+          previousBalance: prevAvailable,
+          newBalance: newAvailable,
+          reason: dto.reason || null,
+        },
+      });
+
+      if (this.eventsGateway) {
+        this.eventsGateway.notifyWalletUpdated(userId, {
+          availableBalance: newAvailable,
+          reservedBalance: Number(wallet.reservedBalance),
+        });
+      }
+
+      return {
+        success: true,
+        message: `Successfully ${dto.action === 'CREDIT' ? 'credited' : 'deducted'} ₹${amount.toFixed(2)} ${dto.action === 'CREDIT' ? 'to' : 'from'} ${distributor.name}'s wallet. New balance: ₹${newAvailable.toFixed(2)}.`,
+        availableBalance: newAvailable,
+        wallet: updatedWallet,
+        transaction,
+      };
+    });
+  }
+
+  /**
+   * Helper to resolve the active Distributor record ID for a requesting user
+   */
+  async resolveDistributorIdForUser(user: any): Promise<string> {
+    let distributorId = user?.distributorProfile?.id || user?.distributorId;
+    if (!distributorId && user?.id) {
+      const d = await this.prisma.distributor.findFirst({
+        where: {
+          OR: [
+            { userId: user.id },
+            ...(user.mobile ? [{ mobile: user.mobile }] : []),
+            ...(user.email ? [{ email: user.email }] : []),
+          ],
+        },
+      });
+      if (d) distributorId = d.id;
+    }
+    if (!distributorId) {
+      throw new BadRequestException('User is not associated with any active Distributor account.');
+    }
+    return distributorId;
+  }
+
+  /**
+   * Transfer / Share wallet balance from Distributor to one of their network Centres
+   */
+  async transferWalletToCentre(
+    actorUser: any,
+    distributorId: string,
+    dto: { centreId: string; amount: number; notes?: string },
+  ) {
+    const amount = Number(dto.amount);
+    if (!amount || isNaN(amount) || amount <= 0) {
+      throw new BadRequestException('Transfer amount must be a positive number greater than 0.');
+    }
+
+    if (!dto.centreId) {
+      throw new BadRequestException('Please select a valid destination Centre.');
+    }
+
+    const distributor = await this.prisma.distributor.findUnique({
+      where: { id: distributorId },
+      include: {
+        user: {
+          include: { wallet: true },
+        },
+      },
+    });
+
+    if (!distributor) {
+      throw new NotFoundException(`Distributor '${distributorId}' not found.`);
+    }
+
+    // Resolve distributor user & wallet
+    let distUserId = distributor.userId || distributor.user?.id;
+    if (!distUserId) {
+      const existingUser = await this.prisma.user.findFirst({
+        where: {
+          OR: [
+            { mobile: distributor.mobile },
+            ...(distributor.email ? [{ email: distributor.email }] : []),
+          ],
+        },
+      });
+      if (existingUser) {
+        distUserId = existingUser.id;
+        await this.prisma.distributor.update({
+          where: { id: distributor.id },
+          data: { userId: distUserId },
+        });
+      } else {
+        throw new BadRequestException('Distributor does not have an active user account.');
+      }
+    }
+
+    // Target centre
+    const centre = await this.prisma.centre.findUnique({
+      where: { id: dto.centreId },
+      include: {
+        user: {
+          include: { wallet: true },
+        },
+      },
+    });
+
+    if (!centre) {
+      throw new NotFoundException(`Target Centre with ID '${dto.centreId}' not found.`);
+    }
+
+    // Ensure centre belongs to distributor (unless actor is SUPER_ADMIN)
+    if (centre.distributorId !== distributor.id && actorUser.role !== Role.SUPER_ADMIN) {
+      throw new ForbiddenException(`Centre '${centre.centreName}' does not belong to your network.`);
+    }
+
+    const centreUserId = centre.userId || centre.user?.id;
+    if (!centreUserId) {
+      throw new BadRequestException(`Target Centre '${centre.centreName}' has no user account associated.`);
+    }
+
+    return await this.prisma.$transaction(
+      async (tx) => {
+      // 1. Get or create distributor wallet
+      let distWallet = await tx.wallet.findUnique({ where: { userId: distUserId } });
+      if (!distWallet) {
+        distWallet = await tx.wallet.create({
+          data: {
+            userId: distUserId,
+            availableBalance: new Prisma.Decimal(0),
+            reservedBalance: new Prisma.Decimal(0),
+          },
+        });
+      }
+
+      const distPrevAvailable = Number(distWallet.availableBalance);
+      if (distPrevAvailable < amount) {
+        throw new BadRequestException(
+          `Insufficient wallet balance: Your available balance is ₹${distPrevAvailable.toFixed(2)}, cannot transfer ₹${amount.toFixed(2)}.`,
+        );
+      }
+
+      // 2. Get or create centre wallet
+      let centreWallet = await tx.wallet.findUnique({ where: { userId: centreUserId } });
+      if (!centreWallet) {
+        centreWallet = await tx.wallet.create({
+          data: {
+            userId: centreUserId,
+            availableBalance: new Prisma.Decimal(0),
+            reservedBalance: new Prisma.Decimal(0),
+          },
+        });
+      }
+
+      const centrePrevAvailable = Number(centreWallet.availableBalance);
+
+      // 3. Update balances
+      const distNewAvailable = distPrevAvailable - amount;
+      const centreNewAvailable = centrePrevAvailable + amount;
+
+      await tx.wallet.update({
+        where: { id: distWallet.id },
+        data: { availableBalance: new Prisma.Decimal(distNewAvailable) },
+      });
+
+      await tx.wallet.update({
+        where: { id: centreWallet.id },
+        data: { availableBalance: new Prisma.Decimal(centreNewAvailable) },
+      });
+
+      const transferRef = `SHARE-${Date.now().toString().slice(-8)}`;
+
+      // 4. Create distributor transaction record (debit)
+      const distTx = await tx.walletTransaction.create({
+        data: {
+          walletId: distWallet.id,
+          userId: distUserId,
+          type: TransactionType.ADJUSTMENT,
+          amount: new Prisma.Decimal(-amount),
+          status: TransactionStatus.COMPLETED,
+          reference: transferRef,
+          metadata: {
+            kind: 'WALLET_SHARE_OUT',
+            direction: 'DEBIT',
+            centreId: centre.id,
+            centreName: centre.centreName,
+            centreCode: centre.centreCode,
+            notes: dto.notes?.trim() || 'Wallet Balance Shared to Centre',
+            previousBalance: distPrevAvailable,
+            newBalance: distNewAvailable,
+          },
+        },
+      });
+
+      // 5. Create centre transaction record (credit)
+      const centreTx = await tx.walletTransaction.create({
+        data: {
+          walletId: centreWallet.id,
+          userId: centreUserId,
+          type: TransactionType.TOPUP,
+          amount: new Prisma.Decimal(amount),
+          status: TransactionStatus.COMPLETED,
+          reference: transferRef,
+          metadata: {
+            kind: 'WALLET_SHARE_IN',
+            direction: 'CREDIT',
+            distributorId: distributor.id,
+            distributorName: distributor.name,
+            distributorCode: distributor.distributorCode,
+            notes: dto.notes?.trim() || 'Wallet Balance Received from Distributor',
+            previousBalance: centrePrevAvailable,
+            newBalance: centreNewAvailable,
+          },
+        },
+      });
+
+      // 6. Audit log
+      await this.audit.log({
+        actorId: actorUser.id,
+        actorType: 'USER',
+        action: 'DISTRIBUTOR_WALLET_SHARE_TO_CENTRE',
+        entity: 'Wallet',
+        entityId: distWallet.id,
+        metadata: {
+          distributorId: distributor.id,
+          distributorCode: distributor.distributorCode,
+          centreId: centre.id,
+          centreName: centre.centreName,
+          centreCode: centre.centreCode,
+          amount,
+          transferRef,
+          notes: dto.notes?.trim() || null,
+        },
+      });
+
+      // 7. WebSocket live event dispatch
+      if (this.eventsGateway) {
+        this.eventsGateway.notifyWalletUpdated(distUserId, {
+          availableBalance: distNewAvailable,
+          reservedBalance: Number(distWallet.reservedBalance),
+        });
+        this.eventsGateway.notifyWalletUpdated(centreUserId, {
+          availableBalance: centreNewAvailable,
+          reservedBalance: Number(centreWallet.reservedBalance),
+        });
+      }
+
+      return {
+        success: true,
+        message: `Successfully transferred ₹${amount.toFixed(2)} to ${centre.centreName} (${centre.centreCode})`,
+        transferRef,
+        amount,
+        newBalance: distNewAvailable,
+        centre: {
+          id: centre.id,
+          centreName: centre.centreName,
+          centreCode: centre.centreCode,
+          district: centre.district,
+          newBalance: centreNewAvailable,
+        },
+        transaction: distTx,
+      };
+    }, {
+      maxWait: 15000,
+      timeout: 30000,
+    });
   }
 
   // =========================================================================

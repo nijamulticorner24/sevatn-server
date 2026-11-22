@@ -21,23 +21,19 @@ import { Role } from '@prisma/client';
 export class DistributorController {
   constructor(private readonly distributorService: DistributorService) {}
 
-  private resolveDistributorId(req: any): string {
-    const distributorId = req.user?.distributorProfile?.id || req.user?.distributorId;
-    if (!distributorId) {
-      throw new BadRequestException('User is not associated with any Distributor account');
-    }
-    return distributorId;
+  private async resolveDistributorId(req: any): Promise<string> {
+    return this.distributorService.resolveDistributorIdForUser(req.user);
   }
 
   @Get('overview')
   async getOverview(@Request() req: any) {
-    const distributorId = this.resolveDistributorId(req);
+    const distributorId = await this.resolveDistributorId(req);
     return this.distributorService.getDistributorOverview(distributorId);
   }
 
   @Get('profile')
   async getProfile(@Request() req: any) {
-    const distributorId = this.resolveDistributorId(req);
+    const distributorId = await this.resolveDistributorId(req);
     return this.distributorService.getDistributorProfile(distributorId);
   }
 
@@ -48,7 +44,7 @@ export class DistributorController {
     @Query('limit') limit = '50',
     @Query('search') search?: string,
   ) {
-    const distributorId = this.resolveDistributorId(req);
+    const distributorId = await this.resolveDistributorId(req);
     return this.distributorService.getDistributorCentres(
       distributorId,
       parseInt(page, 10) || 1,
@@ -62,14 +58,14 @@ export class DistributorController {
     @Request() req: any,
     @Body() dto: GenerateCentreInvitationDto,
   ) {
-    const distributorId = this.resolveDistributorId(req);
+    const distributorId = await this.resolveDistributorId(req);
     dto.expiresInMinutes = dto.expiresInMinutes || 30;
     return this.distributorService.generateCentreInvitation(distributorId, dto, req.user);
   }
 
   @Get('centres/invitations')
   async getCentreInvitations(@Request() req: any) {
-    const distributorId = this.resolveDistributorId(req);
+    const distributorId = await this.resolveDistributorId(req);
     return this.distributorService.getDistributorInvitations(distributorId);
   }
 
@@ -78,8 +74,20 @@ export class DistributorController {
     @Request() req: any,
     @Param('id') id: string,
   ) {
-    const distributorId = this.resolveDistributorId(req);
+    const distributorId = await this.resolveDistributorId(req);
     return this.distributorService.regenerateCentreInvitation(distributorId, id, req.user);
+  }
+
+  /**
+   * Distributor shares / transfers wallet balance to one of their network Centres
+   */
+  @Post('wallet/transfer-to-centre')
+  async transferWalletToCentre(
+    @Request() req: any,
+    @Body() dto: { centreId: string; amount: number; notes?: string },
+  ) {
+    const distributorId = await this.resolveDistributorId(req);
+    return this.distributorService.transferWalletToCentre(req.user, distributorId, dto);
   }
 
   /**
@@ -87,7 +95,7 @@ export class DistributorController {
    */
   @Get('payouts')
   async getMyPayouts(@Request() req: any) {
-    const distributorId = this.resolveDistributorId(req);
+    const distributorId = await this.resolveDistributorId(req);
     return this.distributorService.getDistributorPayouts(distributorId);
   }
 
@@ -96,7 +104,7 @@ export class DistributorController {
    */
   @Post('payouts/request')
   async requestPayout(@Request() req: any, @Body() body: any) {
-    const distributorId = this.resolveDistributorId(req);
+    const distributorId = await this.resolveDistributorId(req);
     return this.distributorService.requestDistributorPayout(req.user, distributorId, body);
   }
 }
@@ -130,6 +138,18 @@ export class AdminDistributorsController {
     @Request() req: any,
   ) {
     return this.distributorService.settleDistributorPayout(id, dto, req.user);
+  }
+
+  /**
+   * Super Admin adjusts a distributor's wallet balance (CREDIT or DEBIT)
+   */
+  @Post(':id/wallet-adjust')
+  async adjustDistributorWallet(
+    @Param('id') id: string,
+    @Body() dto: { amount: number; action: 'CREDIT' | 'DEBIT'; reason?: string },
+    @Request() req: any,
+  ) {
+    return this.distributorService.adjustDistributorWallet(req.user, id, dto);
   }
 }
 

@@ -175,4 +175,18 @@ export class AdminController {
   async notifyLedgerPendingTelegram() {
     return this.adminService.notifyLedgerPendingTelegram();
   }
+
+  @Get('reconciliations')
+  async getReconciliationsQueue() {
+    return this.adminService.getReconciliationsQueue();
+  }
+
+  @Post('reconciliations/:id/complete-with-reference')
+  async completeWithReference(
+    @CurrentUser() adminUser: any,
+    @Param('id') id: string,
+    @Body('officialReference') officialReference: string,
+  ) {
+    return this.adminService.completeWithReference(id, officialReference, adminUser);
+  }
 }

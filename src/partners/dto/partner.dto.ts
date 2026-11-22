@@ -6,6 +6,8 @@ import {
   IsEnum,
   MinLength,
   Matches,
+  IsNumber,
+  Min,
 } from 'class-validator';
 import { PartnerStatus } from '@prisma/client';
 
@@ -160,4 +162,23 @@ export class ApprovePartnerPaymentDto {
   @IsOptional()
   notes?: string;
 }
+
+export class SharePartnerWalletDto {
+  @IsString()
+  @IsNotEmpty()
+  targetType: 'DISTRIBUTOR' | 'CENTRE';
+
+  @IsString()
+  @IsNotEmpty()
+  targetId: string;
+
+  @IsNumber()
+  @Min(1)
+  amount: number;
+
+  @IsString()
+  @IsOptional()
+  notes?: string;
+}
+
 

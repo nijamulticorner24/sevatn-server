@@ -35,8 +35,10 @@ export class WalletController {
     @CurrentUser() user: any,
     @Query('page') page = '1',
     @Query('limit') limit = '50',
+    @Query('type') type?: string,
+    @Query('search') search?: string,
   ) {
-    return this.walletService.getTransactions(user.id, parseInt(page), parseInt(limit));
+    return this.walletService.getTransactions(user.id, parseInt(page), parseInt(limit), type, search);
   }
 
   @Post('refund')

@@ -116,6 +116,7 @@ enum BookingStatus {
   LOADER_TIMEOUT
   PAYMENT_INITIALIZED
   PAYMENT_PENDING
+  PAYMENT_SUBMITTED
   PAYMENT_SUCCESS
   PAYMENT_FAILED
   ZERO_COST_CONFIRMATION_PENDING
@@ -458,9 +459,10 @@ model BookingJob {
   worker            WorkerMachine?  @relation(fields: [workerId], references: [id], onDelete: SetNull)
   status            BookingStatus   @default(QUEUED)
   version           Int             @default(1)
-  leaseGeneration   Int             @default(1)
+  leaseGeneration   Int             @default(0)
   leaseId           String?
   fencingToken      String?
+  paymentSubmittedAt DateTime?
   lastMilestone     String?
   attempt           Int             @default(0)
   maxAttempts       Int             @default(3)
@@ -479,6 +481,7 @@ model BookingJob {
   @@unique([bookingRequestId])
   @@index([status, leaseExpiresAt])
   @@index([workerId])
+  @@index([workerId, leaseGeneration])
   @@index([bookingRequestId])
   @@index([accountId])
 }

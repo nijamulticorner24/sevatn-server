@@ -152,6 +152,18 @@ describe('WorkersService Fencing & Lease Remediation (Phase 3)', () => {
       expect(stateMachine.transition).not.toHaveBeenCalled();
     });
 
+    it('REJECTS completion when job has legacy leaseGeneration = 0 and caller omits leaseGeneration with 403 LEASE_GENERATION_REQUIRED', async () => {
+      mockJob.leaseGeneration = 0;
+      mockJob.fencingToken = null;
+      await expect(
+        workersService.completeJob('job-fencing-1', 'w-active-1', {
+          officialReference: 'OFFICIAL-PASS-999',
+        }),
+      ).rejects.toThrow(new ForbiddenException('leaseGeneration is required (LEASE_GENERATION_REQUIRED)'));
+
+      expect(stateMachine.transition).not.toHaveBeenCalled();
+    });
+
     it('ACCEPTS completion with valid leaseGeneration and fencingToken, invoking state machine and capturing wallet', async () => {
       const result = await workersService.completeJob('job-fencing-1', 'w-active-1', {
         officialReference: 'OFFICIAL-PASS-999',

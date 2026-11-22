@@ -301,8 +301,8 @@ export class AdminService {
 
   async getPublicPaymentConfig() {
     const config: any = (await this.getSystemConfig()) || {};
-    const upiId = config.offlineUpiId || 'pay.ticketassist@okaxis';
-    const accountName = config.offlineAccountName || 'TicketAssist Services & Network';
+    const upiId = config.offlineUpiId || 'pay.sevatn@okaxis';
+    const accountName = config.offlineAccountName || 'SevaTN Services & Network';
     const defaultQr = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&margin=10&data=${encodeURIComponent(
       `upi://pay?pa=${upiId}&pn=${encodeURIComponent(accountName)}&cu=INR`,
     )}`;
@@ -315,6 +315,7 @@ export class AdminService {
       offlineUpiId: upiId,
       offlineAccountName: accountName,
       offlineQrImageUrl: config.offlineQrImageUrl || defaultQr,
+      offlineQrCodeUrl: config.offlineQrImageUrl || defaultQr,
       offlineBankName: config.offlineBankName || 'HDFC Bank',
       offlineAccountNumber: config.offlineAccountNumber || '50200012345678',
       offlineIfscCode: config.offlineIfscCode || 'HDFC0001234',
@@ -340,7 +341,7 @@ export class AdminService {
       // Ensure 'default' row exists
       await this.prisma.$executeRawUnsafe(`
         INSERT INTO "SystemConfig" ("id", "serviceFee", "registrationFee", "franchiseFee", "distributorFee", "accountValidityDays", "checkingIntervalSeconds", "leaseTimeoutSeconds", "humanAssistedModeOnly", "onlinePaymentEnabled", "onlineGatewayProvider", "offlinePaymentEnabled", "offlineUpiId", "offlineAccountName", "partnerMinWithdrawal", "telegramBotEnabled", "telegramBotToken", "telegramChatId", "headerMarqueeEnabled", "headerMarqueeText", "headerMarqueeSpeed", "headerMarqueeBgColor", "updatedAt")
-        VALUES ('default', 100, 249, 599, 399, 365, 300, 120, false, true, 'RAZORPAY', true, 'pay.ticketassist@okaxis', 'TicketAssist Services & Network', 100, false, null, null, false, null, 30, 'DEFAULT', NOW())
+        VALUES ('default', 100, 249, 599, 399, 365, 300, 120, false, true, 'RAZORPAY', true, 'pay.sevatn@okaxis', 'SevaTN Services & Network', 100, false, null, null, false, null, 30, 'DEFAULT', NOW())
         ON CONFLICT ("id") DO NOTHING
       `);
 
@@ -469,8 +470,16 @@ export class AdminService {
       BookingStatus.RETRYABLE_FAILURE,
     ];
 
+    const terminalStatuses: BookingStatus[] = [
+      BookingStatus.SUCCESS,
+      BookingStatus.CANCELLED,
+      BookingStatus.FAILED,
+      BookingStatus.COMPLETED,
+      'BOOKING_CONFIRMED' as any,
+    ];
+
     const pendingRequests = await this.prisma.bookingRequest.findMany({
-      where: { status: { in: activeStatuses } },
+      where: { status: { notIn: terminalStatuses } },
     });
 
     let releasedHoldsCount = 0;
@@ -485,45 +494,70 @@ export class AdminService {
       });
       releasedHoldsCount++;
 
-      // Cancel booking request via State Machine
-      if (this.stateMachine) {
-        try {
-          await this.stateMachine.transition({
-            bookingId: booking.id,
-            targetStatus: BookingStatus.CANCELLED,
-            targetExecutionStatus: 'IDLE',
-            failureReason: `Queue cleared by Admin (${adminUser?.name || 'Administrator'})`,
-            milestone: 'CANCELLED_BY_ADMIN',
-            force: true,
-          });
-        } catch (smErr: any) {
-          this.logger.warn(`Admin clearQueue fallback for #${booking.id}: ${smErr.message}`);
-          await this.prisma.bookingRequest.update({
+      // Cancel booking request and close its jobs atomically in the SAME transaction (shared path with cancelBooking)
+      const cancelNow = new Date();
+      const cancelFailureReason = `Queue cleared by Admin (${adminUser?.name || 'Administrator'})`;
+      const runCancelTx = async (tx: any) => {
+        if (this.stateMachine) {
+          try {
+            await this.stateMachine.transition({
+              bookingId: booking.id,
+              targetStatus: BookingStatus.CANCELLED,
+              targetExecutionStatus: 'IDLE',
+              failureReason: cancelFailureReason,
+              milestone: 'CANCELLED_BY_ADMIN',
+              force: true,
+            }, tx);
+          } catch (smErr: any) {
+            this.logger.warn(`Admin clearQueue fallback for #${booking.id}: ${smErr.message}`);
+            await tx.bookingRequest.update({
+              where: { id: booking.id },
+              data: {
+                status: BookingStatus.CANCELLED,
+                assignedMachineId: null,
+                leaseExpiresAt: null,
+                leaseStartedAt: null,
+                failureReason: cancelFailureReason,
+              },
+            });
+          }
+        } else {
+          await tx.bookingRequest.update({
             where: { id: booking.id },
             data: {
               status: BookingStatus.CANCELLED,
               assignedMachineId: null,
               leaseExpiresAt: null,
               leaseStartedAt: null,
-              failureReason: `Queue cleared by Admin (${adminUser?.name || 'Administrator'})`,
+              failureReason: cancelFailureReason,
             },
           });
         }
-      } else {
-        await this.prisma.bookingRequest.update({
-          where: { id: booking.id },
+
+        await tx.bookingJob.updateMany({
+          where: {
+            bookingRequestId: booking.id,
+            status: {
+              notIn: [BookingStatus.SUCCESS, BookingStatus.CANCELLED, BookingStatus.FAILED, BookingStatus.COMPLETED],
+            },
+          },
           data: {
             status: BookingStatus.CANCELLED,
-            assignedMachineId: null,
+            workerId: null,
             leaseExpiresAt: null,
-            leaseStartedAt: null,
-            failureReason: `Queue cleared by Admin (${adminUser?.name || 'Administrator'})`,
+            completedAt: cancelNow,
           },
         });
+      };
+
+      if (typeof this.prisma.$transaction === 'function') {
+        await this.prisma.$transaction(runCancelTx);
+      } else {
+        await runCancelTx(this.prisma);
       }
     }
 
-    // Cancel all pending/active jobs
+    // Also cancel any remaining orphaned/unlinked non-terminal jobs
     const cancelledJobs = await this.prisma.bookingJob.updateMany({
       where: {
         status: {
@@ -534,6 +568,7 @@ export class AdminService {
         status: BookingStatus.CANCELLED,
         workerId: null,
         leaseExpiresAt: null,
+        completedAt: new Date(),
       },
     });
 
@@ -543,7 +578,7 @@ export class AdminService {
       where: { status: 'AVAILABLE' },
     });
 
-    // Reset worker machines
+    // Reset worker machines (including currentActiveJobs counter!)
     const workers = await this.prisma.workerMachine.findMany();
     const now = Date.now();
     for (const worker of workers) {
@@ -552,6 +587,9 @@ export class AdminService {
         where: { id: worker.id },
         data: {
           currentJobId: null,
+          currentBookingId: null,
+          currentActiveJobs: 0,
+          currentActivity: 'IDLE',
           status: isOnline ? WorkerStatus.ONLINE : WorkerStatus.OFFLINE,
         },
       });
@@ -1585,6 +1623,118 @@ export class AdminService {
       success: result.success !== false,
       waitingActionItems: overview.waitingActionItems,
       result,
+    };
+  }
+
+  /**
+   * Surfaces bookings awaiting reconciliation in the admin queue
+   */
+  async getReconciliationsQueue() {
+    return this.prisma.bookingReconciliation.findMany({
+      where: {
+        status: { in: ['PENDING', 'HUMAN_REVIEW'] },
+      },
+      include: {
+        bookingRequest: {
+          include: {
+            user: { select: { id: true, name: true, mobile: true, email: true } },
+            jobs: true,
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  /**
+   * Admin "Complete with reference" action: completes booking with official reference and captures funds
+   */
+  async completeWithReference(bookingId: string, officialReference: string, adminUser: any) {
+    if (!officialReference || officialReference.trim().length < 5) {
+      throw new BadRequestException('Valid official booking reference is required');
+    }
+    const cleanRef = officialReference.trim();
+
+    const booking = await this.prisma.bookingRequest.findUnique({
+      where: { id: bookingId },
+      include: { jobs: true },
+    });
+    if (!booking) {
+      throw new NotFoundException(`Booking #${bookingId} not found`);
+    }
+
+    const now = new Date();
+    await this.prisma.$transaction(async (tx) => {
+      const job = booking.jobs && booking.jobs.length > 0 ? booking.jobs[0] : null;
+      if (job) {
+        await tx.bookingJob.update({
+          where: { id: job.id },
+          data: { status: BookingStatus.SUCCESS, completedAt: now },
+        });
+      }
+
+      await tx.bookingRequest.update({
+        where: { id: bookingId },
+        data: {
+          status: BookingStatus.SUCCESS,
+          executionStatus: 'COMPLETED',
+          financialStatus: 'CAPTURED',
+          officialReference: cleanRef,
+          officialBookingReference: cleanRef,
+          completedAt: now,
+          assignedMachineId: null,
+          leaseExpiresAt: null,
+          reconciliationStatus: 'RECONCILED_SUCCESS',
+          requiresHumanNote: `Manually completed by Admin ${adminUser?.email || adminUser?.id || 'SUPER_ADMIN'}`,
+        },
+      });
+
+      const reserveTx = await tx.walletTransaction.findFirst({
+        where: { bookingId, type: 'RESERVE', status: 'COMPLETED' },
+      });
+      const feeAmount = reserveTx ? Number(reserveTx.amount) : 10;
+      await this.walletService.capture({
+        userId: booking.userId,
+        bookingId,
+        amount: feeAmount,
+        idempotencyKey: `cap_${bookingId}`,
+      }, tx);
+
+      await tx.bookingReconciliation.upsert({
+        where: { bookingRequestId: bookingId },
+        update: {
+          status: 'RECONCILED_SUCCESS',
+          resolvedReference: cleanRef,
+          resolvedByUserId: adminUser?.id || null,
+          resolvedAt: now,
+          investigationNote: `Completed with reference by ${adminUser?.email || 'Admin'}`,
+        },
+        create: {
+          bookingRequestId: bookingId,
+          status: 'RECONCILED_SUCCESS',
+          resolvedReference: cleanRef,
+          resolvedByUserId: adminUser?.id || null,
+          resolvedAt: now,
+          investigationNote: `Completed with reference by ${adminUser?.email || 'Admin'}`,
+        },
+      });
+    });
+
+    await this.prisma.auditLog.create({
+      data: {
+        actorId: adminUser?.id || 'SUPER_ADMIN',
+        actorType: 'ADMIN',
+        action: 'COMPLETE_BOOKING_WITH_REFERENCE',
+        entity: 'BookingRequest',
+        entityId: bookingId,
+        metadata: { officialReference: cleanRef },
+      },
+    });
+
+    return {
+      success: true,
+      message: `Booking #${booking.bookingCode} completed successfully with reference ${cleanRef}`,
+      reference: cleanRef,
     };
   }
 }

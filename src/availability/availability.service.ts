@@ -7,6 +7,7 @@ import { BookingStateMachineService } from '../bookings/booking-state-machine.se
 import { BookingStatus } from '@prisma/client';
 import { Interval } from '@nestjs/schedule';
 import { normalizeDemandKey } from '../common/utils/demand-key';
+import { CLAIMABLE_OPEN_REQUEST_STATUSES, isDateInPast } from '../common/booking-status.constants';
 
 export interface DateDemandGroup {
   demandKey: string;
@@ -38,30 +39,68 @@ export class AvailabilityService {
    * Integrates with DiscoverySchedule to provide intelligent throttling and distributed status.
    */
   async getDemandDates(): Promise<DateDemandGroup[]> {
-    const pendingBookings = await this.prisma.bookingRequest.findMany({
+    const openBookings = await this.prisma.bookingRequest.findMany({
       where: {
-        status: {
-          in: [
-            BookingStatus.PENDING,
-            BookingStatus.QUEUED,
-            BookingStatus.TEMPORARY_SLOT_LOST,
-            BookingStatus.WAITING_FOR_ACCOUNT,
-            BookingStatus.WAITING_FOR_DATE_AVAILABILITY,
-          ],
-        },
+        status: { in: CLAIMABLE_OPEN_REQUEST_STATUSES },
       },
       select: {
+        id: true,
+        bookingCode: true,
+        status: true,
         requestedDate: true,
         requestedDateStr: true,
         route: true,
+        nextCheckAt: true,
+        accountId: true,
+        jobs: {
+          select: {
+            id: true,
+            status: true,
+            leaseExpiresAt: true,
+          },
+        },
       },
     });
 
     const now = new Date();
     const map = new Map<string, { date: string; route: string; pendingCount: number }>();
+    const excludedRequests: Array<{ code: string; reason: string }> = [];
 
-    for (const b of pendingBookings) {
+    for (const b of openBookings) {
+      const activeJob = (b as any).jobs && (b as any).jobs.length > 0 ? (b as any).jobs[0] : null;
+
       const dateStr = b.requestedDateStr || (b.requestedDate instanceof Date ? b.requestedDate.toISOString().split('T')[0] : String(b.requestedDate).split('T')[0]);
+
+      // Evaluate skip reason codes
+      if (dateStr && isDateInPast(dateStr)) {
+        excludedRequests.push({ code: b.bookingCode, reason: 'PAST_DATE' });
+        continue;
+      }
+
+      if (!b.route || b.route.trim().length === 0) {
+        excludedRequests.push({ code: b.bookingCode, reason: 'ROUTE_MISMATCH' });
+        continue;
+      }
+
+      if (b.nextCheckAt && new Date(b.nextCheckAt).getTime() > now.getTime()) {
+        excludedRequests.push({ code: b.bookingCode, reason: 'IN_COOLDOWN' });
+        continue;
+      }
+
+      if (activeJob && activeJob.status === BookingStatus.EXECUTING && activeJob.leaseExpiresAt && new Date(activeJob.leaseExpiresAt).getTime() > now.getTime()) {
+        excludedRequests.push({ code: b.bookingCode, reason: 'STALE_LEASE' });
+        continue;
+      }
+
+      if (b.accountId) {
+        const isLocked = await this.accountLockService.isLocked(b.accountId, b.id);
+        if (isLocked) {
+          const lock = await this.prisma.accountLock.findFirst({ where: { accountId: b.accountId } });
+          excludedRequests.push({ code: b.bookingCode, reason: `ACCOUNT_LOCKED_BY(${lock?.bookingId || 'unknown'})` });
+          // Note: still eligible for demand scan so when available, it can trigger
+        }
+      }
+
       const key = normalizeDemandKey(dateStr, b.route);
       const existing = map.get(key);
       if (existing) {
@@ -98,8 +137,13 @@ export class AvailabilityService {
 
     demandGroups.sort((a, b) => a.date.localeCompare(b.date));
     this.logger.log(
-      `[AVAILABILITY] Active demand groups: ${demandGroups.map((g) => `${g.demandKey} (pending: ${g.pendingCount}, due: ${g.isDue}, status: ${g.status})`).join(', ') || 'None'}`,
+      `[AVAILABILITY] Active demand groups (${demandGroups.length}): ${demandGroups.map((g) => `${g.demandKey} (pending: ${g.pendingCount}, due: ${g.isDue}, status: ${g.status})`).join(', ') || 'None'}`,
     );
+    if (excludedRequests.length > 0) {
+      this.logger.log(
+        `[AVAILABILITY] Excluded open requests (${excludedRequests.length}): ${excludedRequests.map((e) => `#${e.code}:${e.reason}`).join(', ')}`,
+      );
+    }
     return demandGroups;
   }
 

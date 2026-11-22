@@ -374,7 +374,10 @@ describe('WorkersService Cancellation Sniping & Multi-Worker Safe Claiming Suite
       status: BookingStatus.DATE_UNAVAILABLE,
       errorCode: 'DATE_UNAVAILABLE',
       errorMessage: 'Date is full',
+      leaseGeneration: 1,
+      fencingToken: 'f-1',
     });
+
 
     expect(mockPrisma.bookingRequest.update).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -392,6 +395,51 @@ describe('WorkersService Cancellation Sniping & Multi-Worker Safe Claiming Suite
     const maxExpected = beforeCall + 5.1 * 60 * 1000;
     expect(scheduledTime).toBeGreaterThanOrEqual(minExpected);
     expect(scheduledTime).toBeLessThanOrEqual(maxExpected);
+  });
+
+  it('Watcher Architecture: failJob transitions full date to BookingStatus.WATCHING with isWatching: true', async () => {
+    mockPrisma.bookingJob.findUnique = jest.fn().mockResolvedValue({
+      id: 'job-fail-watching-1',
+      bookingRequestId: 'br-watching-1',
+      workerId: 'worker-1',
+      leaseGeneration: 2,
+      fencingToken: 'f-2',
+      bookingRequest: { id: 'br-watching-1', bookingCode: 'TA-10088', accountId: null },
+    });
+
+    const result = await workersService.failJob('job-fail-watching-1', 'worker-1', {
+      status: 'DATE_FULL' as any,
+      errorCode: 'DATE_UNAVAILABLE',
+      errorMessage: 'Date is FULL/DISABLED. Discovery engine watching.',
+      leaseGeneration: 2,
+      fencingToken: 'f-2',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.message).toBe('Job status changed to WATCHING - Date is FULL');
+
+    // Verify BookingRequest transitioned to WATCHING and isWatching is true
+    expect(mockPrisma.bookingRequest.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'br-watching-1' },
+        data: expect.objectContaining({
+          status: BookingStatus.WATCHING,
+          isWatching: true,
+          nextCheckAt: expect.any(Date),
+        }),
+      })
+    );
+
+    // Verify BookingJob status is set to WATCHING, not RETRYABLE_FAILURE or FAILED
+    expect(mockPrisma.bookingJob.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'job-fail-watching-1' },
+        data: expect.objectContaining({
+          status: BookingStatus.WATCHING,
+          errorCode: 'DATE_UNAVAILABLE',
+        }),
+      })
+    );
   });
 });
 

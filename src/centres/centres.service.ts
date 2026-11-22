@@ -26,6 +26,17 @@ export class CentresService {
     const centre = await this.prisma.centre.findUnique({
       where: { userId },
       include: {
+        distributor: {
+          select: {
+            id: true,
+            distributorCode: true,
+            name: true,
+            businessName: true,
+            mobile: true,
+            email: true,
+            district: true,
+          },
+        },
         user: {
           include: {
             registeredLocation: true,

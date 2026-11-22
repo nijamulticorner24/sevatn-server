@@ -133,7 +133,14 @@ describe('WorkersService Concurrency & Financial Quarantine Invariants', () => {
             return true;
           });
           if (job) {
-            Object.assign(job, data);
+            const resolvedData: any = { ...data };
+            if (data.leaseGeneration && typeof data.leaseGeneration === 'object' && (data.leaseGeneration as any).increment) {
+              resolvedData.leaseGeneration = (job.leaseGeneration || 0) + (data.leaseGeneration as any).increment;
+            }
+            if (data.attempt && typeof data.attempt === 'object' && (data.attempt as any).increment) {
+              resolvedData.attempt = (job.attempt || 0) + (data.attempt as any).increment;
+            }
+            Object.assign(job, resolvedData);
             return { count: 1 };
           }
           return { count: 0 };
@@ -276,6 +283,7 @@ describe('WorkersService Concurrency & Financial Quarantine Invariants', () => {
         status: 'UNKNOWN_RESULT' as any,
         errorCode: 'VERIFICATION_PENDING',
         errorMessage: 'Submitted but confirmation modal not visible before timeout',
+        leaseGeneration: 1,
       };
 
       const result = await workersService.failJob('job-1', 'w-1', failDto);
@@ -297,6 +305,7 @@ describe('WorkersService Concurrency & Financial Quarantine Invariants', () => {
         status: BookingStatus.FAILED,
         errorCode: 'LOGIN_FAILED',
         errorMessage: 'Invalid username/password on official portal',
+        leaseGeneration: 1,
       };
 
       const result = await workersService.failJob('job-1', 'w-1', failDto);
@@ -318,6 +327,7 @@ describe('WorkersService Concurrency & Financial Quarantine Invariants', () => {
         officialReference: 'SAB-2026-BK-1001',
         confirmationData: {},
         note: 'Pass confirmed',
+        leaseGeneration: 1,
       };
 
       await expect(
@@ -331,6 +341,7 @@ describe('WorkersService Concurrency & Financial Quarantine Invariants', () => {
       const shortDto = {
         officialReference: 'ABC',
         confirmationData: {},
+        leaseGeneration: 1,
       };
 
       await expect(
@@ -344,6 +355,7 @@ describe('WorkersService Concurrency & Financial Quarantine Invariants', () => {
       const validDto = {
         officialReference: 'IVQ9827364501',
         confirmationData: { ref: 'IVQ9827364501' },
+        leaseGeneration: 1,
       };
 
       const res = await workersService.completeJob('job-1', 'w-1', validDto);
@@ -417,7 +429,7 @@ describe('WorkersService Concurrency & Financial Quarantine Invariants', () => {
       expect(hb1.executionPermitted).toBe(false);
 
       // Job completes normally
-      await workersService.completeJob('job-1', 'w-1', { officialReference: 'IVQ-CONFIRMED-99' });
+      await workersService.completeJob('job-1', 'w-1', { officialReference: 'IVQ-CONFIRMED-99', leaseGeneration: 1 });
 
       // Worker sends heartbeat with no active jobs -> transitions to STOPPED
       const hb2 = await workersService.handleHeartbeat('w-1', {

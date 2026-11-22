@@ -25,6 +25,7 @@ import {
   UpdateWorkerCapacityDto,
   AllocationQueryDto,
 } from './dto/worker.dto';
+import { AuthorizePaymentDto } from './dto/authorize-payment.dto';
 import { Role } from '@prisma/client';
 
 @Controller('workers')
@@ -329,8 +330,15 @@ export class WorkersController {
    */
   @Post('jobs/claim')
   @UseGuards(MachineAuthGuard)
-  async claimJob(@CurrentMachine() machine: any) {
-    return this.workersService.claimJob(machine.id);
+  async claimJob(
+    @CurrentMachine() machine: any,
+    @Body() dto?: { activeJobIds?: string[]; triggerSource?: 'QUEUE_POLL' | 'SLOT_OPENED' | 'SNIPER'; date?: string; route?: string },
+  ) {
+    return this.workersService.claimJob(machine.id, dto?.activeJobIds, {
+      triggerSource: dto?.triggerSource,
+      date: dto?.date,
+      route: dto?.route,
+    });
   }
 
   /**
@@ -350,9 +358,9 @@ export class WorkersController {
   @UseGuards(MachineAuthGuard)
   async matchPending(
     @CurrentMachine() machine: any,
-    @Body() dto: { date: string; route?: string },
+    @Body() dto: { date: string; route?: string; activeJobIds?: string[] },
   ) {
-    return this.workersService.matchPendingBooking(machine.id, dto.date, dto.route);
+    return this.workersService.matchPendingBooking(machine.id, dto.date, dto.route, dto.activeJobIds);
   }
 
   /**
@@ -412,6 +420,19 @@ export class WorkersController {
     @Body() dto: { status: any; errorCode?: string; errorMessage?: string },
   ) {
     return this.workersService.failJob(jobId, machine.id, dto);
+  }
+
+  /**
+   * Q4/F3: Worker requests authorization before Phase 8 payment click
+   */
+  @Post('jobs/:id/authorize-payment')
+  @UseGuards(MachineAuthGuard)
+  async authorizePayment(
+    @Param('id') id: string,
+    @CurrentMachine() machine: any,
+    @Body() dto: AuthorizePaymentDto,
+  ) {
+    return this.workersService.authorizePayment(id, machine.id, dto);
   }
 
   /**

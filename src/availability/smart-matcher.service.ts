@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AccountLockService } from './account-lock.service';
 import { BookingStateMachineService } from '../bookings/booking-state-machine.service';
 import { BookingStatus, JobType, AccountStatus } from '@prisma/client';
+import { CLAIMABLE_OPEN_REQUEST_STATUSES, isDateInPast } from '../common/booking-status.constants';
 
 export interface AvailabilityEventPayload {
   date: string; // YYYY-MM-DD
@@ -195,12 +196,7 @@ export class SmartMatcherService {
           mode: 'insensitive',
         },
         status: {
-          in: [
-            BookingStatus.PENDING,
-            BookingStatus.QUEUED,
-            BookingStatus.TEMPORARY_SLOT_LOST,
-            BookingStatus.WAITING_FOR_ACCOUNT,
-          ],
+          in: CLAIMABLE_OPEN_REQUEST_STATUSES,
         },
       },
       orderBy: { createdAt: 'asc' },
@@ -324,6 +320,10 @@ export class SmartMatcherService {
                 BookingStatus.QUEUED,
                 BookingStatus.TEMPORARY_SLOT_LOST,
                 BookingStatus.WAITING_FOR_ACCOUNT,
+                BookingStatus.EXECUTION_QUEUED,
+                BookingStatus.WATCHING,
+                BookingStatus.RETRYABLE_FAILURE,
+                BookingStatus.WAITING_FOR_DATE_AVAILABILITY,
               ],
             },
           },
@@ -394,10 +394,6 @@ export class SmartMatcherService {
         const existingJob = await tx.bookingJob.findFirst({
           where: {
             bookingRequestId: bookingId,
-            jobType: JobType.BOOKING_EXECUTION,
-            status: {
-              in: [BookingStatus.QUEUED, BookingStatus.WORKER_ASSIGNED, BookingStatus.TEMPORARY_SLOT_LOST],
-            },
           },
         });
 
@@ -408,6 +404,7 @@ export class SmartMatcherService {
               status: BookingStatus.QUEUED,
               workerId: null,
               startedAt: null,
+              heartbeatAt: null,
               leaseExpiresAt: null,
             },
           });

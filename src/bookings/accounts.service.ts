@@ -152,6 +152,42 @@ export class AccountsService {
   }
 
   /**
+   * Get decrypted password for a saved official booking account
+   */
+  async getAccountPassword(id: string, userId: string) {
+    const account = await (this.prisma.bookingAccount as any).findUnique({
+      where: { id },
+      select: {
+        id: true,
+        userId: true,
+        encryptedPassword: true,
+        encryptionIv: true,
+        encryptionTag: true,
+      },
+    });
+
+    if (!account || account.userId !== userId) {
+      throw new NotFoundException('Account not found');
+    }
+
+    if (!account.encryptedPassword || !account.encryptionIv || !account.encryptionTag) {
+      return { password: '' };
+    }
+
+    try {
+      const password = CredentialCrypto.decrypt(
+        account.encryptedPassword,
+        account.encryptionIv,
+        account.encryptionTag,
+      );
+      return { password };
+    } catch (err: any) {
+      this.logger.error(`Failed to decrypt password for account ${id}: ${err.message}`);
+      throw new BadRequestException('Unable to decrypt account password');
+    }
+  }
+
+  /**
    * Get single account details (sanitized)
    */
   async getAccountById(id: string, userId: string) {

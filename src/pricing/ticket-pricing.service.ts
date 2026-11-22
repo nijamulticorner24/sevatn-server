@@ -380,6 +380,9 @@ export class TicketPricingService {
         distributor: {
           include: { partner: true },
         },
+        distributorProfile: {
+          include: { partner: true },
+        },
         centre: {
           include: {
             distributor: {
@@ -396,11 +399,11 @@ export class TicketPricingService {
     let resolvedDistributorId: string | null = null;
 
     // 1. Resolve Distributor and markup
-    const activeDistributor = user?.distributor || user?.centre?.distributor;
+    const activeDistributor = user?.distributorProfile || user?.distributor || user?.centre?.distributor;
     if (activeDistributor) {
       resolvedDistributorId = activeDistributor.id;
-      // Cap at Super Admin maximum limit
-      distributorMarkup = Math.min(Number(activeDistributor.markup || 0), config.maxDistributorMarkup);
+      // Cap at Super Admin maximum limit. If user is the distributor themselves, own markup is 0
+      distributorMarkup = user?.role === 'DISTRIBUTOR' ? 0 : Math.min(Number(activeDistributor.markup || 0), config.maxDistributorMarkup);
     }
 
     // 2. Resolve Partner and markup (either direct partner or parent partner of distributor)

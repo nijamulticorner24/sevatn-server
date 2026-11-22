@@ -10,6 +10,7 @@ import { AccountLockService } from '../availability/account-lock.service';
 import { EventsGateway } from '../events/events.gateway';
 import { BookingStateMachineService } from './booking-state-machine.service';
 import { SmartAllocatorService } from '../workers/smart-allocator.service';
+import { TicketPricingService } from '../pricing/ticket-pricing.service';
 import { BookingStatus, JobType, AccountStatus } from '@prisma/client';
 
 describe('BookingsService - Booking Readiness & Queue Protection', () => {
@@ -115,17 +116,46 @@ describe('BookingsService - Booking Readiness & Queue Protection', () => {
       notifyBookingUpdated: jest.fn(),
     };
 
+    const mockWalletService = {
+      release: jest.fn().mockResolvedValue({ id: 'tx-rel-1' }),
+      capture: jest.fn().mockResolvedValue({ id: 'tx-cap-1' }),
+    };
+
+    const mockPricingService = {
+      calculateBookingPrice: jest.fn().mockImplementation(async ({ userId, quantity }) => ({
+        baseTicketPrice: 20,
+        partnerMarkup: 0,
+        distributorMarkup: 0,
+        finalTicketPrice: 20,
+        ticketQuantity: quantity || 1,
+        totalTicketAmount: 20 * (quantity || 1),
+        pricingConfigVersion: 1,
+        pricingSnapshot: {
+          baseTicketPrice: 20,
+          partnerMarkup: 0,
+          distributorMarkup: 0,
+          finalTicketPrice: 20,
+          ticketQuantity: quantity || 1,
+          totalTicketAmount: 20 * (quantity || 1),
+          partnerId: null,
+          distributorId: null,
+          calculatedAt: new Date().toISOString(),
+        },
+      })),
+    };
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         BookingsService,
         { provide: PrismaService, useValue: mockPrisma },
-        { provide: WalletService, useValue: {} },
+        { provide: WalletService, useValue: mockWalletService },
         { provide: AuditService, useValue: mockAudit },
         { provide: NotificationsService, useValue: {} },
         { provide: SmartMatcherService, useValue: {} },
         { provide: AccountLockService, useValue: mockAccountLockService },
         { provide: EventsGateway, useValue: mockEventsGateway },
-        { provide: BookingStateMachineService, useValue: { transition: jest.fn().mockResolvedValue({}) } },
+        { provide: BookingStateMachineService, useValue: { transition: jest.fn().mockResolvedValue({ booking: { id: 'booking-1', status: BookingStatus.CANCELLED } }) } },
+        { provide: TicketPricingService, useValue: mockPricingService },
         { provide: SmartAllocatorService, useValue: { runAllocationSweep: jest.fn().mockResolvedValue({}) } },
       ],
     }).compile();
@@ -342,12 +372,12 @@ describe('BookingsService - Booking Readiness & Queue Protection', () => {
       // Verified NO premature BookingJob was created
       expect(mockPrisma.bookingJob.create).not.toHaveBeenCalled();
 
-      // Verified wallet reservation is placed
+      // Verified wallet reservation is placed (matching calculated final ticket price)
       expect(mockPrisma.wallet.update).toHaveBeenCalledWith(
         expect.objectContaining({
           data: {
-            availableBalance: { decrement: 150 },
-            reservedBalance: { increment: 150 },
+            availableBalance: { decrement: 20 },
+            reservedBalance: { increment: 20 },
           },
         }),
       );
@@ -410,6 +440,85 @@ describe('BookingsService - Booking Readiness & Queue Protection', () => {
       expect(result.id).toBe('booking-1');
       expect(mockPrisma.bookingRequest.create).not.toHaveBeenCalled();
       expect(mockPrisma.wallet.update).not.toHaveBeenCalled();
+    });
+
+    it('TEST 12: Rejects booking creation when devotee profile already has an active booking request', async () => {
+      // Devotee profile acc-1 already has an active request #TA-10050
+      mockPrisma.bookingRequest.findFirst.mockResolvedValueOnce({
+        id: 'booking-existing-open',
+        bookingCode: 'TA-10050',
+        requestedDateStr: '2026-11-25',
+        status: BookingStatus.WATCHING,
+      });
+
+      const dto: any = {
+        ...validDto,
+        requestedDate: '2026-11-28', // different date!
+      };
+
+      await expect(bookingsService.createBooking('user-1', dto)).rejects.toThrow(
+        new BadRequestException(
+          'This devotee profile already has an active booking request (#TA-10050 for 2026-11-25, status: WATCHING). Only 1 active booking request is permitted per devotee profile. Multiple dates or duplicate requests on the same profile are not allowed until the active request is finalized or cancelled.',
+        ),
+      );
+    });
+
+    it('TEST 13: Allows new booking creation after previous booking is completed or cancelled', async () => {
+      // No active non-terminal booking found
+      mockPrisma.bookingRequest.findFirst.mockResolvedValueOnce(null);
+
+      const dto: any = {
+        ...validDto,
+        requestedDate: '2026-11-28',
+      };
+
+      const result = await bookingsService.createBooking('user-1', dto);
+      expect(result).toBeDefined();
+      expect(result.bookingCode).toBeDefined();
+    });
+
+    it('TEST 14: Auto-cancels past-date pending bookings and releases wallet reservations', async () => {
+      // Mock past-date booking in PENDING status
+      mockPrisma.bookingRequest.findMany = jest.fn().mockResolvedValueOnce([
+        {
+          id: 'past-booking-1',
+          bookingCode: 'TA-10001',
+          userId: 'user-1',
+          accountId: 'acc-1',
+          version: 1,
+          requestedDate: new Date('2020-01-01'),
+          requestedDateStr: '2020-01-01',
+          status: BookingStatus.PENDING,
+        },
+      ]);
+      mockPrisma.walletTransaction.findFirst.mockResolvedValueOnce({
+        id: 'tx-res-1',
+        amount: 20,
+      });
+      mockPrisma.bookingJob.updateMany = jest.fn().mockResolvedValue({ count: 1 });
+
+      const res = await bookingsService.autoCancelPastPendingBookings('user-1');
+      expect(res.cancelledCount).toBe(1);
+      expect(res.details[0]).toContain('Auto-cancelled past booking #TA-10001');
+    });
+
+    it('TEST 15: Operator can cancel booking and refund wallet hold', async () => {
+      mockPrisma.bookingRequest.findUnique = jest.fn().mockResolvedValueOnce({
+        id: 'booking-cancel-1',
+        bookingCode: 'TA-10002',
+        userId: 'user-1',
+        accountId: 'acc-1',
+        version: 1,
+        status: BookingStatus.PENDING,
+      });
+      mockPrisma.walletTransaction.findFirst.mockResolvedValueOnce({
+        id: 'tx-res-2',
+        amount: 20,
+      });
+      mockPrisma.bookingJob.updateMany = jest.fn().mockResolvedValue({ count: 1 });
+
+      const cancelRes = await bookingsService.cancelBooking('booking-cancel-1', { id: 'user-1', role: 'CENTRE' });
+      expect(cancelRes.message).toContain('Booking cancelled and funds released');
     });
   });
 });

@@ -10,7 +10,7 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { PartnersService } from './partners.service';
-import { GenerateInvitationDto } from './dto/partner.dto';
+import { GenerateInvitationDto, SharePartnerWalletDto } from './dto/partner.dto';
 import { JwtAuthGuard, RolesGuard } from '../common/guards';
 import { Roles } from '../common/decorators';
 import { Role } from '@prisma/client';
@@ -98,5 +98,23 @@ export class PartnerPortalController {
   async requestPayout(@Request() req: any, @Body() body: any) {
     const partnerId = this.resolvePartnerId(req);
     return this.partnersService.requestPayout(req.user, partnerId, body);
+  }
+
+  /**
+   * List eligible network recipients (Distributors & Centres) for wallet balance transfer
+   */
+  @Get('wallet/recipients')
+  async getMyNetworkRecipients(@Request() req: any) {
+    const partnerId = this.resolvePartnerId(req);
+    return this.partnersService.getPartnerNetworkRecipients(partnerId);
+  }
+
+  /**
+   * Transfer / Share wallet funds to a Distributor or Centre
+   */
+  @Post('wallet/share')
+  async shareWallet(@Request() req: any, @Body() dto: SharePartnerWalletDto) {
+    const partnerId = this.resolvePartnerId(req);
+    return this.partnersService.sharePartnerWallet(req.user, partnerId, dto);
   }
 }

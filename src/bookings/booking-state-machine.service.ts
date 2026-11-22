@@ -37,9 +37,11 @@ export interface TransitionRequest {
   confirmedAt?: Date | string;
   confirmationData?: any;
   failureReason?: string;
+  selectedTime?: string | null;
   assignedMachineId?: string | null;
   leaseExpiresAt?: Date | null;
   leaseStartedAt?: Date | null;
+  nextCheckAt?: Date | null;
   force?: boolean;
 }
 
@@ -66,6 +68,7 @@ export class BookingStateMachineService {
       BookingStatus.FAST_BOOKING_QUEUED,
       BookingStatus.EXECUTION_QUEUED,
       BookingStatus.EXECUTING,
+      BookingStatus.WATCHING,
       BookingStatus.MATCHING,
       BookingStatus.ASSIGNED,
       BookingStatus.WORKER_ASSIGNED,
@@ -83,6 +86,7 @@ export class BookingStateMachineService {
       BookingStatus.DISCOVERING,
       BookingStatus.CLAIMED,
       BookingStatus.EXECUTING,
+      BookingStatus.WATCHING,
       BookingStatus.WORKER_ASSIGNED,
       BookingStatus.ASSIGNED,
       BookingStatus.PENDING,
@@ -155,6 +159,7 @@ export class BookingStateMachineService {
       BookingStatus.WORKER_ERROR,
       BookingStatus.FAILED,
       BookingStatus.RETRYABLE_FAILURE,
+      BookingStatus.WATCHING,
       BookingStatus.REQUIRES_HUMAN,
       BookingStatus.PENDING,
       BookingStatus.CANCELLED,
@@ -379,6 +384,7 @@ export class BookingStateMachineService {
       BookingStatus.ROUTE_UNAVAILABLE,
       BookingStatus.NO_AVAILABILITY,
       BookingStatus.RETRYABLE_FAILURE,
+      BookingStatus.WATCHING,
       BookingStatus.WORKER_ERROR,
       BookingStatus.FAILED,
       BookingStatus.REQUIRES_HUMAN,
@@ -595,6 +601,7 @@ export class BookingStateMachineService {
       BookingStatus.CHECKING_AVAILABILITY,
       BookingStatus.QUEUED,
       BookingStatus.PENDING,
+      BookingStatus.CLAIMED,
       BookingStatus.EXECUTING,
       BookingStatus.CANCELLED,
       BookingStatus.FAILED,
@@ -903,6 +910,12 @@ export class BookingStateMachineService {
         updateData.failureReason = req.failureReason;
       }
 
+      if (req.selectedTime !== undefined) {
+        updateData.selectedTime = req.selectedTime;
+      } else if (req.confirmationData?.selectedTime && !currentBooking.selectedTime) {
+        updateData.selectedTime = req.confirmationData.selectedTime;
+      }
+
       if (req.note) {
         updateData.requiresHumanNote = req.note;
       }
@@ -923,10 +936,31 @@ export class BookingStateMachineService {
         updateData.leaseStartedAt = req.leaseStartedAt;
       }
 
+      if (req.nextCheckAt !== undefined) {
+        updateData.nextCheckAt = req.nextCheckAt;
+      }
+
+      if (req.targetStatus === BookingStatus.WATCHING) {
+        updateData.isWatching = true;
+        updateData.assignedMachineId = null;
+        updateData.leaseExpiresAt = null;
+      }
+
       if (req.targetStatus === BookingStatus.SUCCESS || req.targetStatus === BookingStatus.COMPLETED || req.targetStatus === BookingStatus.BOOKING_CONFIRMED) {
         updateData.completedAt = now;
         updateData.assignedMachineId = null;
         updateData.leaseExpiresAt = null;
+      }
+
+      const isTerminalCancellationOrFailure =
+        req.targetStatus === BookingStatus.CANCELLED ||
+        req.targetStatus === BookingStatus.FAILED ||
+        req.targetStatus === BookingStatus.EXPIRED;
+
+      if (isTerminalCancellationOrFailure) {
+        updateData.assignedMachineId = null;
+        updateData.leaseExpiresAt = null;
+        updateData.leaseStartedAt = null;
       }
 
       // Real Atomic Database Compare-And-Swap (CAS)
@@ -945,6 +979,37 @@ export class BookingStateMachineService {
         throw new ConflictException(
           `CONCURRENT_MODIFICATION_CONFLICT: Optimistic lock failure on Booking #${booking.bookingCode}. Version ${casVersion} was concurrently modified.`,
         );
+      }
+
+      // Atomically close open BookingJobs & release AccountLocks in the SAME transaction on terminal transition
+      const isTerminalSuccess =
+        req.targetStatus === BookingStatus.SUCCESS ||
+        req.targetStatus === BookingStatus.COMPLETED ||
+        req.targetStatus === BookingStatus.BOOKING_CONFIRMED;
+
+      if (isTerminalCancellationOrFailure || isTerminalSuccess) {
+        const txAny = tx as any;
+        if (typeof txAny.bookingJob?.updateMany === 'function') {
+          await txAny.bookingJob.updateMany({
+            where: {
+              bookingRequestId: req.bookingId,
+              status: {
+                notIn: [BookingStatus.SUCCESS, BookingStatus.COMPLETED, BookingStatus.CANCELLED, BookingStatus.FAILED],
+              },
+            },
+            data: {
+              status: isTerminalSuccess ? BookingStatus.SUCCESS : BookingStatus.CANCELLED,
+              workerId: isTerminalSuccess ? undefined : null,
+              leaseExpiresAt: null,
+              completedAt: now,
+            },
+          });
+        }
+        if (typeof txAny.accountLock?.deleteMany === 'function') {
+          await txAny.accountLock.deleteMany({
+            where: { bookingId: req.bookingId },
+          });
+        }
       }
 
       // Record Milestone atomically in same transaction
