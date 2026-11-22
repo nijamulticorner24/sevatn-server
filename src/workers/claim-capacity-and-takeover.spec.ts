@@ -68,6 +68,7 @@ describe('Capacity Counting, Same-Owner Takeover, Competing Worker, & Already-Co
       currentActiveJobs: 1, // Deliberately drifted/stale counter to verify authoritative self-healing!
       status: WorkerStatus.BUSY,
       lastHeartbeat: new Date(),
+      capabilities: ['ACCOUNT_VERIFICATION', 'BOOKING_EXECUTION', 'AVAILABILITY_DISCOVERY'],
     };
 
     mockWorkerPC2 = {
@@ -80,6 +81,7 @@ describe('Capacity Counting, Same-Owner Takeover, Competing Worker, & Already-Co
       currentActiveJobs: 1,
       status: WorkerStatus.BUSY,
       lastHeartbeat: new Date(),
+      capabilities: ['ACCOUNT_VERIFICATION', 'BOOKING_EXECUTION', 'AVAILABILITY_DISCOVERY'],
     };
 
     mockJobs = [];

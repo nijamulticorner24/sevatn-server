@@ -1839,7 +1839,13 @@ export class WorkersService {
   async claimJob(
     machineId: string,
     activeJobIds?: string[],
-    claimOptions?: { triggerSource?: 'QUEUE_POLL' | 'SLOT_OPENED' | 'SNIPER' | string; date?: string; route?: string },
+    claimOptions?: {
+      triggerSource?: 'QUEUE_POLL' | 'SLOT_OPENED' | 'SNIPER' | string;
+      date?: string;
+      route?: string;
+      jobType?: string;
+      maxActiveBookings?: number;
+    },
   ) {
     const machine = await this.prisma.workerMachine.findUnique({
       where: { id: machineId },
@@ -1913,9 +1919,48 @@ export class WorkersService {
       orderBy: { startedAt: 'desc' },
     });
 
-    // Only accept preAllocatedJob if it belongs to this machine (or legacy mock without workerId/status) and is NOT already running in-process
+    // Fail-closed booking execution permission policy:
+    // 1. Explicit BOOKING_EXECUTION capability is required in trusted backend DB configuration.
+    // Empty, null, or missing capabilities fails closed to false.
+    const hasBookingCapabilityInDb =
+      Array.isArray(machine.capabilities) && machine.capabilities.includes('BOOKING_EXECUTION');
+
+    const hasAccountVerificationCapabilityInDb =
+      Array.isArray(machine.capabilities) && machine.capabilities.includes('ACCOUNT_VERIFICATION');
+
+    // 2. Machine must be RUNNING (not MONITOR_ONLY, STOPPED, etc.) and have maxConcurrentJobs > 0 in database.
+    const isBookingExecutionAuthorizedByDb =
+      hasBookingCapabilityInDb &&
+      machine.desiredState === 'RUNNING' &&
+      typeof (machine as any).maxConcurrentJobs === 'number' &&
+      (machine as any).maxConcurrentJobs > 0;
+
+    // 3. Worker-supplied options can only restrict further (e.g. maxActiveBookings=0 or jobType='ACCOUNT_VERIFICATION').
+    // Worker-supplied options can NEVER grant booking execution if backend DB authorization is false.
+    const canAcceptBookingExecution =
+      isBookingExecutionAuthorizedByDb &&
+      claimOptions?.maxActiveBookings !== 0 &&
+      claimOptions?.jobType !== JobType.ACCOUNT_VERIFICATION;
+
+    const isJobTypeMismatch =
+      claimOptions?.jobType &&
+      preAllocatedCandidate &&
+      preAllocatedCandidate.jobType !== claimOptions.jobType;
+
+    const cannotAcceptBooking =
+      !canAcceptBookingExecution &&
+      preAllocatedCandidate?.jobType === JobType.BOOKING_EXECUTION;
+
+    const cannotAcceptVerification =
+      !hasAccountVerificationCapabilityInDb &&
+      preAllocatedCandidate?.jobType === JobType.ACCOUNT_VERIFICATION;
+
+    // Only accept preAllocatedJob if it belongs to this machine, matches requested jobType, is strictly authorized for the job type, and is NOT already running in-process
     const preAllocatedJob =
       preAllocatedCandidate &&
+      !isJobTypeMismatch &&
+      !cannotAcceptBooking &&
+      !cannotAcceptVerification &&
       (preAllocatedCandidate.workerId === undefined || preAllocatedCandidate.workerId === machineId) &&
       !(Array.isArray(activeJobIds) && activeJobIds.includes(preAllocatedCandidate.id)) &&
       (
@@ -2178,17 +2223,23 @@ export class WorkersService {
     }
 
     return await this.prisma.$transaction(async (tx) => {
-      // 1. First priority: Account Verification Jobs
-      const verificationJob = await tx.bookingJob.findFirst({
-        where: {
-          jobType: JobType.ACCOUNT_VERIFICATION,
-          status: BookingStatus.QUEUED,
-        },
-        include: {
-          account: true,
-        },
-        orderBy: { createdAt: 'asc' },
-      });
+      // 1. First priority: Account Verification Jobs (requires explicit ACCOUNT_VERIFICATION capability in DB)
+      const canAcceptVerification =
+        hasAccountVerificationCapabilityInDb &&
+        claimOptions?.jobType !== JobType.BOOKING_EXECUTION;
+
+      const verificationJob = canAcceptVerification
+        ? await tx.bookingJob.findFirst({
+            where: {
+              jobType: JobType.ACCOUNT_VERIFICATION,
+              status: BookingStatus.QUEUED,
+            },
+            include: {
+              account: true,
+            },
+            orderBy: { createdAt: 'asc' },
+          })
+        : null;
 
       if (verificationJob && verificationJob.account) {
         // Q1/Q2/ITEM 2: Atomic conditional claim with fencingToken + leaseGeneration increment
@@ -2257,6 +2308,10 @@ export class WorkersService {
       }
 
       // 2. Second priority: Booking Execution Jobs
+      if (!canAcceptBookingExecution) {
+        return { hasJob: false, reason: 'BOOKING_EXECUTION_UNAUTHORIZED_OR_RESTRICTED' };
+      }
+
       const rawCandidateJobs = typeof tx.bookingJob.findMany === 'function'
         ? await tx.bookingJob.findMany({
             where: {
@@ -3027,6 +3082,23 @@ export class WorkersService {
         job: null,
         reason: 'PAST_DATE',
         message: `Target date ${targetDateStr} is in the past`,
+      };
+    }
+
+    // Fail-closed authorization check for cancellation sniping match
+    const hasBookingCapability = Array.isArray(machine.capabilities) && machine.capabilities.includes('BOOKING_EXECUTION');
+    const isAuthorizedForBookings =
+      hasBookingCapability &&
+      machine.desiredState === 'RUNNING' &&
+      typeof (machine as any).maxConcurrentJobs === 'number' &&
+      (machine as any).maxConcurrentJobs > 0;
+
+    if (!isAuthorizedForBookings) {
+      return {
+        hasJob: false,
+        job: null,
+        reason: 'BOOKING_EXECUTION_UNAUTHORIZED',
+        message: 'Worker machine is not authorized for booking execution',
       };
     }
 
@@ -4936,6 +5008,24 @@ export class WorkersService {
    * Renew lease alias
    */
   async renewLease(bookingId: string, machineId: string) {
+    const machine = await this.prisma.workerMachine.findUnique({
+      where: { id: machineId },
+    });
+    if (!machine || !machine.active || (machine as any).adminStatus === 'REVOKED' || (machine as any).adminStatus === 'RETIRED' || (machine as any).adminStatus === 'DISABLED') {
+      throw new UnauthorizedException('Worker machine is not approved, active, or credentials have been revoked');
+    }
+
+    const hasBookingCapability = Array.isArray(machine.capabilities) && machine.capabilities.includes('BOOKING_EXECUTION');
+    const isAuthorizedForBookings =
+      hasBookingCapability &&
+      machine.desiredState === 'RUNNING' &&
+      typeof (machine as any).maxConcurrentJobs === 'number' &&
+      (machine as any).maxConcurrentJobs > 0;
+
+    if (!isAuthorizedForBookings) {
+      throw new ForbiddenException('Worker machine is not authorized for booking execution lease renewal');
+    }
+
     // Q6/ITEM 8: Configurable lease TTL (default 30s) — see Audit 3
     const leaseExpiresAt = new Date(Date.now() + LEASE_TTL_MS);
     await this.prisma.bookingRequest.updateMany({

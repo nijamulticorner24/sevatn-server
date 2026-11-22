@@ -144,6 +144,27 @@ export class WorkersController {
   }
 
   /**
+   * Date-First Discovery: retrieves unique dates with pending bookings.
+   * Registered BEFORE parameterized route ':id' so Express does not intercept it.
+   */
+  @Get('pending-dates')
+  @UseGuards(MachineAuthGuard)
+  async getPendingDates() {
+    return this.workersService.getPendingDates();
+  }
+
+  /**
+   * Watchlist: View all actively watched dates.
+   * Registered BEFORE parameterized route ':id' so Express does not intercept it.
+   */
+  @Get('watchlist')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN, Role.CENTRE)
+  async getWatchlist() {
+    return this.workersService.getWatchlist();
+  }
+
+  /**
    * Admin retrieves single worker details
    */
   @Get(':id')
@@ -332,22 +353,22 @@ export class WorkersController {
   @UseGuards(MachineAuthGuard)
   async claimJob(
     @CurrentMachine() machine: any,
-    @Body() dto?: { activeJobIds?: string[]; triggerSource?: 'QUEUE_POLL' | 'SLOT_OPENED' | 'SNIPER'; date?: string; route?: string },
+    @Body() dto?: {
+      activeJobIds?: string[];
+      triggerSource?: 'QUEUE_POLL' | 'SLOT_OPENED' | 'SNIPER';
+      date?: string;
+      route?: string;
+      jobType?: string;
+      maxActiveBookings?: number;
+    },
   ) {
     return this.workersService.claimJob(machine.id, dto?.activeJobIds, {
       triggerSource: dto?.triggerSource,
       date: dto?.date,
       route: dto?.route,
+      jobType: dto?.jobType,
+      maxActiveBookings: dto?.maxActiveBookings,
     });
-  }
-
-  /**
-   * Date-First Discovery: retrieves unique dates with pending bookings
-   */
-  @Get('pending-dates')
-  @UseGuards(MachineAuthGuard)
-  async getPendingDates() {
-    return this.workersService.getPendingDates();
   }
 
   /**
@@ -371,16 +392,6 @@ export class WorkersController {
   @Roles(Role.SUPER_ADMIN, Role.CENTRE)
   async createWatchlist(@Body() dto: { date: string; route?: string }) {
     return this.workersService.createWatchlistEntry(dto.date, dto.route);
-  }
-
-  /**
-   * Watchlist: View all actively watched dates
-   */
-  @Get('watchlist')
-  @UseGuards(JwtAuthGuard, RolesGuard)
-  @Roles(Role.SUPER_ADMIN, Role.CENTRE)
-  async getWatchlist() {
-    return this.workersService.getWatchlist();
   }
 
   /**
