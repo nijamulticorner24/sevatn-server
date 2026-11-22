@@ -749,6 +749,76 @@ export class CentresService {
     });
   }
 
+  async deleteCentre(adminUser: any, id: string) {
+    const centre = await this.prisma.centre.findFirst({
+      where: {
+        OR: [{ id }, { userId: id }, { centreCode: id }],
+      },
+      include: {
+        user: true,
+      },
+    });
+
+    if (!centre) {
+      throw new NotFoundException('Centre profile not found');
+    }
+
+    // Guard against deleting centre with in-flight active booking requests
+    const activeBookingCount = await this.prisma.bookingRequest.count({
+      where: {
+        userId: centre.userId,
+        status: {
+          notIn: ['SUCCESS', 'COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT'] as any,
+        },
+      },
+    });
+
+    if (activeBookingCount > 0) {
+      throw new BadRequestException(
+        `Cannot delete centre '${centre.centreName}' (${centre.centreCode}) because it has ${activeBookingCount} active or in-flight booking request(s). Please cancel or complete them first.`,
+      );
+    }
+
+    // Delete centre and its associated user (User deletion cascades to Centre, Wallet, Location, etc.)
+    await this.prisma.$transaction(async (tx) => {
+      await tx.user.delete({
+        where: { id: centre.userId },
+      });
+    });
+
+    // Write audit log
+    await this.audit.log({
+      actorId: adminUser?.id || null,
+      actorType: 'ADMIN',
+      action: 'CENTRE_DELETED',
+      entity: 'Centre',
+      entityId: centre.id,
+      metadata: {
+        centreId: centre.id,
+        centreCode: centre.centreCode,
+        centreName: centre.centreName,
+        district: centre.district,
+        userEmail: centre.user?.email,
+        userMobile: centre.user?.mobile,
+        deletedByUserId: adminUser?.id,
+        deletedByEmail: adminUser?.email,
+      },
+    });
+
+    // Emit event for real-time dashboards
+    try {
+      this.eventsGateway?.server?.emit('centre:deleted', {
+        id: centre.id,
+        centreCode: centre.centreCode,
+      });
+    } catch (_) {}
+
+    return {
+      success: true,
+      message: `Centre '${centre.centreName}' (${centre.centreCode}) has been permanently deleted.`,
+    };
+  }
+
   async getNetworkStats() {
     const [registeredCount, activeCount, suspendedCount, districtGrouping] = await Promise.all([
       this.prisma.centre.count(),

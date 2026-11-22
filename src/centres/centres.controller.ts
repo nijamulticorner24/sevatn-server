@@ -3,6 +3,7 @@ import {
   Get,
   Post,
   Patch,
+  Delete,
   Param,
   Body,
   UseGuards,
@@ -97,6 +98,12 @@ export class CentresController {
   ) {
     return this.centresService.adjustCentreWallet(adminUser, id, dto);
   }
+
+  @Delete(':id')
+  @Roles(Role.SUPER_ADMIN)
+  async deleteCentre(@CurrentUser() adminUser: any, @Param('id') id: string) {
+    return this.centresService.deleteCentre(adminUser, id);
+  }
 }
 
 @Controller('admin/centres')
@@ -163,5 +170,10 @@ export class AdminCentresController {
     @Body() dto: { amount: number; action: 'CREDIT' | 'DEBIT'; reason?: string },
   ) {
     return this.centresService.adjustCentreWallet(adminUser, id, dto);
+  }
+
+  @Delete(':id')
+  async deleteCentre(@CurrentUser() adminUser: any, @Param('id') id: string) {
+    return this.centresService.deleteCentre(adminUser, id);
   }
 }
