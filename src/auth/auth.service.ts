@@ -1025,7 +1025,21 @@ export class AuthService {
         passwordHash,
         mustChangePassword: false,
       } as any,
+      include: {
+        centre: true,
+      },
     });
+
+    // If user has an associated centre, ensure feePaid is marked true and activated
+    if (updatedUser.centre && (!updatedUser.centre.feePaid || updatedUser.centre.status === CentreStatus.PENDING_VERIFICATION)) {
+      await this.prisma.centre.update({
+        where: { id: updatedUser.centre.id },
+        data: {
+          feePaid: true,
+          status: updatedUser.centre.status === CentreStatus.PENDING_VERIFICATION ? CentreStatus.ACTIVE : updatedUser.centre.status,
+        },
+      });
+    }
 
     await this.audit.log({
       actorId: userId,

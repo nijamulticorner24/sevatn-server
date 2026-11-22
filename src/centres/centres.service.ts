@@ -267,10 +267,10 @@ export class CentresService {
           district: dto.district.trim(),
           taluk: dto.taluk.trim(),
           pincode: dto.pincode?.trim() || null,
-          feePaid: false,
+          feePaid: true,
           registrationFee: new Prisma.Decimal(249),
           feeTransactionId: null,
-          status: CentreStatus.PENDING_VERIFICATION,
+          status: initialStatus,
         },
       });
 
