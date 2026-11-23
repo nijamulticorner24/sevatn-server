@@ -548,6 +548,22 @@ export class BookingsService {
       });
     }
 
+    // Dispatch real-time Telegram alert for new booking arrival
+    this.notifications
+      .sendTelegramBookingNotification({
+        bookingId: result.id,
+        bookingCode: result.bookingCode,
+        status: result.status,
+        isNew: true,
+        route: result.route,
+        requestedDate: result.requestedDate,
+        selectedTime: (result as any).selectedTime || result.timeSlot || undefined,
+        pilgrimCount: result.pilgrimCount,
+      })
+      .catch((err: any) =>
+        this.logger.warn(`Failed to dispatch Telegram new booking alert: ${err.message}`),
+      );
+
     return result;
   }
 
@@ -617,23 +633,28 @@ export class BookingsService {
             `[AUTO-CANCEL] Darshan date ${b.requestedDateStr || b.requestedDate} is in the past (Today IST: ${todayIST}). Auto-cancelling booking #${b.bookingCode}`,
           );
 
-          const reserveTx = await this.prisma.walletTransaction.findFirst({
+          const reserveTxs = await this.prisma.walletTransaction.findMany({
             where: {
               bookingId: b.id,
-              type: 'RESERVE',
+              type: { in: ['RESERVE', 'RELEASE', 'CAPTURE', 'REFUND'] },
               status: 'COMPLETED',
             },
           });
-          const feeAmount = reserveTx ? Number(reserveTx.amount) : 0;
+          let currentHeld = 0;
+          for (const tx of reserveTxs) {
+            const amt = Number(tx.amount);
+            if (tx.type === 'RESERVE') currentHeld += amt;
+            if (tx.type === 'RELEASE' || tx.type === 'REFUND' || tx.type === 'CAPTURE') currentHeld -= amt;
+          }
 
-          if (feeAmount > 0) {
+          if (currentHeld > 0) {
             await this.walletService
               .release({
                 userId: b.userId,
                 bookingId: b.id,
-                amount: feeAmount,
+                amount: currentHeld,
                 reason: `Auto-cancelled: Darshan date (${b.requestedDateStr || 'past'}) has passed`,
-                idempotencyKey: `auto_cancel_${b.id}`,
+                idempotencyKey: `auto_cancel_${b.id}_v${b.version}_${Date.now()}`,
               })
               .catch((err) => {
                 this.logger.warn(`Wallet release notice for #${b.bookingCode}: ${err.message}`);
@@ -957,15 +978,21 @@ export class BookingsService {
       throw new BadRequestException(`Cannot cancel booking in ${booking.status} state`);
     }
 
-    // Find the exact reserved amount for this booking
-    const reserveTx = await this.prisma.walletTransaction.findFirst({
+    // Find the exact active reserved amount for this booking
+    const reserveTxs = await this.prisma.walletTransaction.findMany({
       where: {
         bookingId: booking.id,
-        type: 'RESERVE',
+        type: { in: ['RESERVE', 'RELEASE', 'CAPTURE', 'REFUND'] },
         status: 'COMPLETED',
       },
     });
-    const feeAmount = reserveTx ? Number(reserveTx.amount) : 100;
+    let currentHeld = 0;
+    for (const tx of reserveTxs) {
+      const amt = Number(tx.amount);
+      if (tx.type === 'RESERVE') currentHeld += amt;
+      if (tx.type === 'RELEASE' || tx.type === 'REFUND' || tx.type === 'CAPTURE') currentHeld -= amt;
+    }
+    const feeAmount = currentHeld > 0 ? currentHeld : 100;
 
     // Release funds and mark CANCELLED
     await this.walletService.release({
@@ -973,7 +1000,7 @@ export class BookingsService {
       bookingId: booking.id,
       amount: feeAmount,
       reason: 'Cancelled by operator',
-      idempotencyKey: `cancel_${booking.id}`,
+      idempotencyKey: `cancel_${booking.id}_v${booking.version}_${Date.now()}`,
     });
 
     if (booking.accountId) {

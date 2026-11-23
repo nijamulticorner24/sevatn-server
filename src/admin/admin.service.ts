@@ -490,7 +490,7 @@ export class AdminService {
         bookingId: booking.id,
         amount: 100,
         reason: 'Cleared by Admin from Queue Manager',
-        idempotencyKey: `admin_clear_${booking.id}`,
+        idempotencyKey: `admin_clear_${booking.id}_v${booking.version}_${Date.now()}`,
       });
       releasedHoldsCount++;
 
@@ -1622,6 +1622,49 @@ export class AdminService {
     return {
       success: result.success !== false,
       waitingActionItems: overview.waitingActionItems,
+      result,
+    };
+  }
+
+  /**
+   * Dispatches manual or targeted Telegram notification for a booking in Central Booking Queue
+   */
+  async notifyBookingTelegram(bookingId: string) {
+    const booking = await this.prisma.bookingRequest.findUnique({
+      where: { id: bookingId },
+      include: {
+        user: { include: { centre: true } },
+        assignedMachine: true,
+      },
+    });
+
+    if (!booking) {
+      throw new NotFoundException(`Booking #${bookingId} not found`);
+    }
+
+    const result = await this.notifications.sendTelegramBookingNotification({
+      bookingId: booking.id,
+      bookingCode: booking.bookingCode,
+      status: booking.status,
+      officialReference: (booking as any).officialBookingReference || (booking as any).officialReference,
+      failureReason: (booking as any).failureReason,
+      requiresHumanNote: (booking as any).requiresHumanNote,
+      note: (booking as any).requiresHumanNote || (booking as any).failureReason,
+      route: booking.route,
+      requestedDate: booking.requestedDate,
+      selectedTime: (booking as any).selectedTime || booking.timeSlot,
+      pilgrimCount: booking.pilgrimCount,
+      centreName: booking.user?.centre?.centreName,
+      operatorName: booking.user?.name,
+      district: booking.user?.centre?.district,
+      mobile: booking.user?.mobile,
+      machineCode: booking.assignedMachine?.machineCode,
+    });
+
+    return {
+      success: result.success !== false,
+      bookingCode: booking.bookingCode,
+      status: booking.status,
       result,
     };
   }

@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { OutboxService } from '../common/outbox/outbox.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import {
   BookingStatus,
   ExecutionStatus,
@@ -800,6 +801,7 @@ export class BookingStateMachineService {
   constructor(
     private prisma: PrismaService,
     @Optional() private outboxService?: OutboxService,
+    @Optional() private notificationsService?: NotificationsService,
   ) {}
 
   /**
@@ -1064,10 +1066,55 @@ export class BookingStateMachineService {
       };
     };
 
+    let result: TransitionResult;
     if (prismaTx) {
-      return run(prismaTx);
+      result = await run(prismaTx);
     } else {
-      return this.prisma.$transaction(run);
+      result = await this.prisma.$transaction(run);
     }
+
+    // Trigger real-time Telegram notification if status transitioned to Action Required, Worker Error, Cancel, or Success
+    const NOTIFY_STATUSES: BookingStatus[] = [
+      BookingStatus.REQUIRES_HUMAN,
+      BookingStatus.WORKER_ERROR,
+      BookingStatus.CANCELLED,
+      BookingStatus.SUCCESS,
+      BookingStatus.BOOKING_CONFIRMED,
+      BookingStatus.COMPLETED,
+    ];
+
+    if (
+      this.notificationsService &&
+      result.previousStatus !== result.newStatus &&
+      NOTIFY_STATUSES.includes(result.newStatus)
+    ) {
+      this.notificationsService
+        .sendTelegramBookingNotification({
+          bookingId: req.bookingId,
+          bookingCode: result.booking?.bookingCode,
+          status: result.newStatus,
+          previousStatus: result.previousStatus,
+          officialReference:
+            req.officialBookingReference ||
+            req.officialReference ||
+            result.booking?.officialBookingReference ||
+            result.booking?.officialReference,
+          failureReason: req.failureReason || result.booking?.failureReason,
+          requiresHumanNote: req.note || result.booking?.requiresHumanNote,
+          note: req.note,
+          workerId: req.workerId,
+          route: result.booking?.route,
+          requestedDate: result.booking?.requestedDate,
+          selectedTime: req.selectedTime || result.booking?.selectedTime || result.booking?.timeSlot,
+          pilgrimCount: result.booking?.pilgrimCount,
+        })
+        .catch((err: any) =>
+          this.logger.warn(
+            `[Telegram Notification] Failed to dispatch booking alert for #${result.booking?.bookingCode}: ${err.message}`,
+          ),
+        );
+    }
+
+    return result;
   }
 }

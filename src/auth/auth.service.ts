@@ -465,6 +465,50 @@ export class AuthService {
         });
       }
 
+      // Fire Telegram Bot notification for online payment onboarding
+      const onlineEntityName =
+        user.role === Role.CENTRE
+          ? user.centre?.centreName || (result.updatedEntity as any)?.centreName
+          : user.role === Role.DISTRIBUTOR
+          ? (user.distributorProfile as any)?.businessName || (user.distributorProfile as any)?.name
+          : user.partnerProfile?.name;
+
+      const onlineEntityCode =
+        user.role === Role.CENTRE
+          ? user.centre?.centreCode || (result.updatedEntity as any)?.centreCode
+          : user.role === Role.DISTRIBUTOR
+          ? (user.distributorProfile as any)?.distributorCode
+          : user.partnerProfile?.partnerCode;
+
+      const onlineDistrict =
+        user.role === Role.CENTRE
+          ? user.centre?.district || (result.updatedEntity as any)?.district
+          : user.role === Role.DISTRIBUTOR
+          ? (user.distributorProfile as any)?.district
+          : user.partnerProfile?.district;
+
+      const onlinePaymentType =
+        user.role === Role.CENTRE
+          ? 'CENTRE_ONBOARDING'
+          : user.role === Role.DISTRIBUTOR
+          ? 'DISTRIBUTOR_LICENSE'
+          : 'PARTNER_FRANCHISE';
+
+      this.notifications
+        .sendTelegramPaymentNotification({
+          paymentType: onlinePaymentType,
+          amount: feeAmount,
+          paymentReference: paymentRef,
+          applicantName: user.name,
+          entityName: onlineEntityName,
+          entityCode: onlineEntityCode,
+          district: onlineDistrict,
+          mobile: user.mobile,
+          email: user.email,
+          role: user.role,
+        })
+        .catch((err) => this.logger.error(`[Telegram Online Notification] Error: ${err.message}`));
+
       const token = this.generateToken(result.updatedUser);
 
       return {

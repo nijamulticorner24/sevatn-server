@@ -7,7 +7,7 @@ import {
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
-import { TransactionType, TransactionStatus, RefundStatus, Prisma } from '@prisma/client';
+import { TransactionType, TransactionStatus, RefundStatus, BookingStatus, Prisma } from '@prisma/client';
 import {
   TopupDto,
   ReserveFundsDto,
@@ -55,6 +55,72 @@ export class WalletService {
           },
         },
       });
+    }
+
+    // Auto-reconciliation guard: if user has reserved balance, verify against active bookings
+    if (Number(wallet.reservedBalance) > 0) {
+      const activeBookings = await this.prisma.bookingRequest.findMany({
+        where: {
+          userId,
+          status: {
+            notIn: [
+              BookingStatus.SUCCESS,
+              BookingStatus.COMPLETED,
+              BookingStatus.BOOKING_CONFIRMED,
+              BookingStatus.CANCELLED,
+              BookingStatus.FAILED,
+            ],
+          },
+        },
+        select: { id: true },
+      });
+
+      if (activeBookings.length === 0) {
+        // Zero active bookings, but wallet has reservedBalance > 0! All holds are orphaned from cancelled bookings.
+        const orphanedAmount = Number(wallet.reservedBalance);
+        this.logger.log(
+          `[WALLET RECONCILE] User ${userId} has 0 active bookings but 🪙 ${orphanedAmount} reserved. Auto-releasing orphaned holds.`,
+        );
+
+        await this.prisma.$transaction(async (tx) => {
+          await tx.wallet.update({
+            where: { id: wallet.id },
+            data: {
+              availableBalance: { increment: orphanedAmount },
+              reservedBalance: { decrement: orphanedAmount },
+            },
+          });
+
+          await tx.walletTransaction.create({
+            data: {
+              walletId: wallet.id,
+              userId,
+              type: TransactionType.RELEASE,
+              amount: new Prisma.Decimal(orphanedAmount),
+              status: TransactionStatus.COMPLETED,
+              reference: `REL-AUTO-RECONCILE-${Date.now().toString().slice(-4)}`,
+              metadata: {
+                reason: 'Auto-reconciled orphaned holds (all bookings cancelled)',
+                orphanedAmount,
+              },
+            },
+          });
+        });
+
+        // Re-read fresh wallet record
+        const freshWallet = await this.prisma.wallet.findUnique({
+          where: { id: wallet.id },
+          include: {
+            transactions: {
+              take: 20,
+              orderBy: { createdAt: 'desc' },
+            },
+          },
+        });
+        if (freshWallet) {
+          wallet = freshWallet;
+        }
+      }
     }
 
     return wallet;
@@ -258,45 +324,43 @@ export class WalletService {
       })
       .catch((err) => this.logger.warn(`Failed to write topup audit log: ${err.message}`));
 
-    // If offline top-up, trigger Telegram Bot alert asynchronously
-    if (isOffline) {
-      this.prisma.user
-        .findUnique({
-          where: { id: userId },
-          include: { centre: true, partnerProfile: true, distributorProfile: true },
-        })
-        .then((u: any) => {
-          if (u) {
-            const entityName =
-              u.centre?.centreName ||
-              u.partnerProfile?.name ||
-              u.distributorProfile?.name;
-            const entityCode =
-              u.centre?.centreCode ||
-              u.partnerProfile?.partnerCode ||
-              u.distributorProfile?.distributorCode;
-            const district =
-              u.centre?.district ||
-              u.partnerProfile?.district ||
-              u.distributorProfile?.district;
+    // Trigger Telegram Bot alert asynchronously for both offline and online top-ups
+    this.prisma.user
+      .findUnique({
+        where: { id: userId },
+        include: { centre: true, partnerProfile: true, distributorProfile: true },
+      })
+      .then((u: any) => {
+        if (u) {
+          const entityName =
+            u.centre?.centreName ||
+            u.partnerProfile?.name ||
+            u.distributorProfile?.name;
+          const entityCode =
+            u.centre?.centreCode ||
+            u.partnerProfile?.partnerCode ||
+            u.distributorProfile?.distributorCode;
+          const district =
+            u.centre?.district ||
+            u.partnerProfile?.district ||
+            u.distributorProfile?.district;
 
-            this.notifications.sendTelegramPaymentNotification({
-              paymentType: 'WALLET_TOPUP',
-              amount,
-              paymentReference: cleanRef,
-              screenshotUrl: receiptUrl,
-              applicantName: u.name,
-              entityName,
-              entityCode,
-              district,
-              mobile: u.mobile,
-              email: u.email,
-              role: u.role,
-            });
-          }
-        })
-        .catch((err) => this.logger.error(`[Telegram Topup Notification] Error: ${err.message}`));
-    }
+          this.notifications.sendTelegramPaymentNotification({
+            paymentType: 'WALLET_TOPUP',
+            amount,
+            paymentReference: cleanRef,
+            screenshotUrl: receiptUrl,
+            applicantName: u.name,
+            entityName,
+            entityCode,
+            district,
+            mobile: u.mobile,
+            email: u.email,
+            role: u.role,
+          });
+        }
+      })
+      .catch((err) => this.logger.error(`[Telegram Topup Notification] Error: ${err.message}`));
 
     return {
       message: isOffline
@@ -671,17 +735,24 @@ export class WalletService {
     }
 
     return await this.prisma.$transaction(async (tx) => {
-      // Check if already released
-      const existingRelease = await tx.walletTransaction.findFirst({
+      // Calculate net currently held for this booking
+      const bookingTxs = await tx.walletTransaction.findMany({
         where: {
           bookingId,
-          type: TransactionType.RELEASE,
+          type: { in: [TransactionType.RESERVE, TransactionType.RELEASE, TransactionType.CAPTURE, TransactionType.REFUND] },
           status: TransactionStatus.COMPLETED,
         },
       });
 
-      if (existingRelease) {
-        return { message: 'Funds already released for this booking', transaction: existingRelease };
+      let netHeld = 0;
+      for (const t of bookingTxs) {
+        const amt = Number(t.amount);
+        if (t.type === TransactionType.RESERVE) netHeld += amt;
+        if (t.type === TransactionType.RELEASE || t.type === TransactionType.REFUND || t.type === TransactionType.CAPTURE) netHeld -= amt;
+      }
+
+      if (netHeld <= 0) {
+        return { message: 'No active funds currently held for this booking' };
       }
 
       const wallet = await tx.wallet.findUnique({ where: { userId } });
@@ -690,7 +761,8 @@ export class WalletService {
       }
 
       // Check how much is currently reserved
-      const releaseAmount = Math.min(Number(wallet.reservedBalance), amount);
+      const toRelease = amount ? Math.min(netHeld, amount) : netHeld;
+      const releaseAmount = Math.min(Number(wallet.reservedBalance), toRelease);
       if (releaseAmount > 0) {
         await tx.wallet.update({
           where: { userId },

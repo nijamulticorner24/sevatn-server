@@ -176,6 +176,12 @@ export class AdminController {
     return this.adminService.notifyLedgerPendingTelegram();
   }
 
+  @Post('bookings/:id/notify-telegram')
+  @Roles(Role.SUPER_ADMIN)
+  async notifyBookingTelegram(@Param('id') id: string) {
+    return this.adminService.notifyBookingTelegram(id);
+  }
+
   @Get('reconciliations')
   async getReconciliationsQueue() {
     return this.adminService.getReconciliationsQueue();

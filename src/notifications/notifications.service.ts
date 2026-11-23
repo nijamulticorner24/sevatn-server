@@ -125,13 +125,19 @@ export class NotificationsService {
         actionUrl = 'http://localhost:3001/admin/ledger?tab=REFUNDS';
         actionLabel = 'Open Refunds in Financial Ledger';
       } else if (payload.paymentType === 'WALLET_TOPUP') {
-        header = '<b>🔔 New Wallet Top-Up Submitted • Verification Required</b>';
-        actionUrl = 'http://localhost:3001/admin/ledger?tab=PENDING';
+        header = payload.screenshotUrl
+          ? '<b>🔔 New Wallet Top-Up Submitted • Verification Required</b>'
+          : '<b>🔔 New Wallet Top-Up Received • Auto-Credited</b>';
+        actionUrl = payload.screenshotUrl
+          ? 'http://localhost:3001/admin/ledger?tab=PENDING'
+          : 'http://localhost:3001/admin/ledger';
         actionLabel = 'Open Top-Ups in Financial Ledger';
       } else if (payload.paymentType === 'PARTNER_PAYOUT' || payload.paymentType === 'DISTRIBUTOR_PAYOUT') {
         header = '<b>🔔 New Earnings Payout Requested • Settlement Required</b>';
         actionUrl = 'http://localhost:3001/admin/payouts';
         actionLabel = 'Open Payouts in Admin Portal';
+      } else if (!payload.screenshotUrl) {
+        header = '<b>🔔 New Onboarding Fee Paid • Auto-Activated</b>';
       }
 
       const captionLines = [
@@ -301,6 +307,169 @@ export class NotificationsService {
   }
 
   /**
+   * Dispatches real-time Telegram notification for Central Booking Queue status transitions:
+   * - New Booking Intake (isNew / NEW)
+   * - Action Required (REQUIRES_HUMAN)
+   * - Worker Error (WORKER_ERROR)
+   * - Cancelled (CANCELLED)
+   * - Success (SUCCESS, BOOKING_CONFIRMED, COMPLETED)
+   */
+  async sendTelegramBookingNotification(payload: {
+    bookingId: string;
+    bookingCode?: string;
+    status: string;
+    isNew?: boolean;
+    previousStatus?: string;
+    officialReference?: string;
+    failureReason?: string;
+    requiresHumanNote?: string;
+    note?: string;
+    workerId?: string;
+    machineCode?: string;
+    route?: string;
+    requestedDate?: Date | string;
+    selectedTime?: string;
+    timeSlot?: string;
+    pilgrimCount?: number;
+    centreName?: string;
+    operatorName?: string;
+    district?: string;
+    mobile?: string;
+  }) {
+    try {
+      const config = await this.prisma.systemConfig.findUnique({ where: { id: 'default' } });
+      if (!config || !config.telegramBotEnabled || !config.telegramBotToken || !config.telegramChatId) {
+        return { skipped: true, reason: 'Telegram notifications not enabled or missing credentials' };
+      }
+
+      const botToken = config.telegramBotToken.trim();
+      const chatId = config.telegramChatId.trim();
+
+      let bookingData = { ...payload };
+      if (!payload.route || !payload.centreName || !payload.bookingCode) {
+        try {
+          const br = await this.prisma.bookingRequest.findUnique({
+            where: { id: payload.bookingId },
+            include: {
+              user: {
+                include: {
+                  centre: true,
+                },
+              },
+              assignedMachine: true,
+            },
+          });
+          if (br) {
+            bookingData = {
+              ...payload,
+              bookingCode: payload.bookingCode || br.bookingCode,
+              route: payload.route || br.route,
+              requestedDate: payload.requestedDate || br.requestedDate,
+              selectedTime: payload.selectedTime || (br as any).selectedTime || br.timeSlot || undefined,
+              pilgrimCount: payload.pilgrimCount || br.pilgrimCount,
+              officialReference: payload.officialReference || (br as any).officialBookingReference || (br as any).officialReference || undefined,
+              failureReason: payload.failureReason || (br as any).failureReason || undefined,
+              requiresHumanNote: payload.requiresHumanNote || (br as any).requiresHumanNote || undefined,
+              centreName: payload.centreName || br.user?.centre?.centreName,
+              operatorName: payload.operatorName || br.user?.name,
+              district: payload.district || br.user?.centre?.district,
+              mobile: payload.mobile || br.user?.mobile,
+              machineCode: payload.machineCode || br.assignedMachine?.machineCode,
+            };
+          }
+        } catch (dbErr: any) {
+          this.logger.warn(`Could not load booking details for Telegram notification: ${dbErr.message}`);
+        }
+      }
+
+      const bookingCode = bookingData.bookingCode || `#${payload.bookingId.slice(0, 8)}`;
+      const timeStr = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+      const actionUrl = `http://localhost:3001/admin/bookings`;
+      const directBookingUrl = `http://localhost:3001/dashboard/bookings/${payload.bookingId}`;
+
+      let header = '<b>🔔 Booking Status Update • Central Queue</b>';
+      let statusLabel = String(payload.status);
+      let detailsLine = '';
+
+      const normalizedStatus = String(payload.status).toUpperCase();
+
+      if (payload.isNew || normalizedStatus === 'NEW_BOOKING' || (normalizedStatus === 'NEW' && payload.isNew)) {
+        header = '<b>🆕 NEW BOOKING RECEIVED • Central Booking Queue</b>';
+        statusLabel = 'New Booking Queued';
+        detailsLine = `📥 <b>Queue Status:</b> Received &amp; queued for Sabarimala slot discovery and auto-dispatch.`;
+      } else if (normalizedStatus === 'REQUIRES_HUMAN') {
+        header = '<b>⚠️ ACTION REQUIRED • Central Booking Queue</b>';
+        statusLabel = 'Action Required';
+        detailsLine = `⚠️ <b>Intervention:</b> ${bookingData.requiresHumanNote || bookingData.note || 'Manual review / captcha verification required on official portal.'}`;
+      } else if (normalizedStatus === 'WORKER_ERROR') {
+        header = '<b>🚨 WORKER ERROR • Central Booking Queue</b>';
+        statusLabel = 'Worker Error';
+        detailsLine = `❌ <b>Error Details:</b> ${bookingData.failureReason || bookingData.note || 'Automation process encountered an execution failure.'}`;
+      } else if (normalizedStatus === 'CANCELLED') {
+        header = '<b>🛑 BOOKING CANCELLED • Central Booking Queue</b>';
+        statusLabel = 'Cancelled';
+        detailsLine = `ℹ️ <b>Reason:</b> ${bookingData.note || bookingData.failureReason || 'Cancelled by operator / admin. Held deposit refunded.'}`;
+      } else if (['SUCCESS', 'COMPLETED', 'BOOKING_CONFIRMED', 'CONFIRMED'].includes(normalizedStatus)) {
+        header = '<b>✅ BOOKING CONFIRMED • Sabarimala Virtual Q Pass</b>';
+        statusLabel = 'Confirmed / Success';
+        const refStr = bookingData.officialReference || 'AUTHORITATIVE_CONFIRMED';
+        detailsLine = `🎟 <b>Official Booking Ref:</b> <code>${refStr}</code>`;
+      }
+
+      const dateStr = bookingData.requestedDate
+        ? new Date(bookingData.requestedDate).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', timeZone: 'Asia/Kolkata' })
+        : '';
+
+      const lines = [
+        header,
+        ``,
+        `🆔 <b>Booking ID:</b> <code>#${bookingCode}</code>`,
+        `📊 <b>Status:</b> <b>${statusLabel}</b>`,
+        detailsLine,
+        bookingData.centreName ? `🏢 <b>Centre:</b> ${bookingData.centreName}` : '',
+        bookingData.operatorName ? `👤 <b>Operator:</b> ${bookingData.operatorName}` : '',
+        bookingData.district ? `📍 <b>District:</b> ${bookingData.district}` : '',
+        bookingData.mobile ? `📞 <b>Contact:</b> <code>${bookingData.mobile}</code>` : '',
+        bookingData.route ? `🛣 <b>Route:</b> ${bookingData.route}` : '',
+        dateStr ? `📅 <b>Darshan Date:</b> ${dateStr}` : '',
+        bookingData.selectedTime ? `⏰ <b>Time Slot:</b> ${bookingData.selectedTime}` : '',
+        bookingData.pilgrimCount ? `👥 <b>Devotees:</b> ${bookingData.pilgrimCount} Pilgrim${bookingData.pilgrimCount !== 1 ? 's' : ''}` : '',
+        bookingData.machineCode ? `💻 <b>Worker Machine:</b> <code>${bookingData.machineCode}</code>` : '',
+        ``,
+        `⏱ <b>Alert Time:</b> ${timeStr} IST`,
+        ``,
+        `👉 <b>Central Queue:</b> <a href="${actionUrl}">Open Central Booking Queue &amp; Dispatch</a>`,
+        `🔍 <b>Inspect Pass:</b> <a href="${directBookingUrl}">View Full Booking Record</a>`,
+      ].filter(Boolean);
+
+      const text = lines.join('\n');
+
+      const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text,
+          parse_mode: 'HTML',
+          disable_web_page_preview: false,
+        }),
+      });
+
+      const resJson: any = await res.json();
+      if (resJson.ok) {
+        this.logger.log(`[Telegram Bot] Booking notification #${bookingCode} (${statusLabel}) dispatched to chat ${chatId}`);
+      } else {
+        this.logger.error(`[Telegram Bot] Failed to send booking notification: ${JSON.stringify(resJson)}`);
+      }
+
+      return { success: resJson.ok, response: resJson };
+    } catch (err: any) {
+      this.logger.error(`[Telegram Booking Alert] Failed: ${err.message}`);
+      return { success: false, error: err.message };
+    }
+  }
+
+  /**
    * Test Telegram connection with provided credentials or stored config
    */
   async testTelegramNotification(botToken?: string, chatId?: string) {
@@ -319,10 +488,10 @@ export class NotificationsService {
 
     const timeStr = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
     const text = [
-      `<b>🚀 TicketAssist Telegram Bot Connected!</b>`,
+      `<b>🚀 TicketAssist Telegram Notifier Bot Connected!</b>`,
       ``,
-      `Your payment notification bot is working properly.`,
-      `Whenever a centre, distributor, or partner completes an onboarding payment or wallet top-up, instant alerts will arrive here.`,
+      `Your notification bot is working properly.`,
+      `Whenever a booking status changes in the <b>Central Booking Queue</b> (Action Required, Worker Error, Cancelled, Confirmed Success) or an onboarding payment/top-up is submitted, instant alerts will arrive here.`,
       ``,
       `⏱ <b>Test Time:</b> ${timeStr} IST`,
     ].join('\n');
