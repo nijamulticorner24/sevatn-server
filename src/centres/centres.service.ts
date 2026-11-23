@@ -243,29 +243,37 @@ export class CentresService {
     const sysConfig = await this.prisma.systemConfig.findUnique({ where: { id: 'default' } });
     const centreFeeAmount = Number(sysConfig?.registrationFee || 249);
 
-    // If created by Partner, check Partner wallet
-    let partnerUserId: string | null = null;
+    // If created by Partner or Distributor, check wallet balance
+    let payerUserId: string | null = null;
+    let payerRoleName = '';
     if (actorUser.role === Role.PARTNER) {
-      partnerUserId = actorUser.id;
-      const partnerWallet = await this.prisma.wallet.findUnique({ where: { userId: partnerUserId } });
-      const currentAvailable = Number(partnerWallet?.availableBalance || 0);
+      payerUserId = actorUser.id;
+      payerRoleName = 'Partner';
+    } else if (actorUser.role === Role.DISTRIBUTOR) {
+      payerUserId = actorUser.id;
+      payerRoleName = 'Distributor';
+    }
+
+    if (payerUserId) {
+      const payerWallet = await this.prisma.wallet.findUnique({ where: { userId: payerUserId } });
+      const currentAvailable = Number(payerWallet?.availableBalance || 0);
       if (currentAvailable < centreFeeAmount) {
         throw new BadRequestException(
-          `Insufficient Partner Wallet Balance: Your available balance is ₹${currentAvailable.toFixed(2)}, but the Centre Onboarding Fee is ₹${centreFeeAmount.toFixed(2)}. Please recharge your partner wallet to proceed with onboarding.`,
+          `Insufficient ${payerRoleName} Wallet Balance: Your available balance is ₹${currentAvailable.toFixed(2)}, but the Centre Onboarding Fee is ₹${centreFeeAmount.toFixed(2)}. Please recharge your wallet to proceed with onboarding.`,
         );
       }
     }
 
     // 5. Execute Transactional Creation
     const result = await this.prisma.$transaction(async (tx) => {
-      // Deduct Centre Onboarding Fee from Partner's Wallet if creator is Partner
-      let partnerWalletUpdated: any = null;
-      if (actorUser.role === Role.PARTNER && partnerUserId) {
-        let pWallet = await tx.wallet.findUnique({ where: { userId: partnerUserId } });
+      // Deduct Centre Onboarding Fee from Partner's or Distributor's Wallet if creator is Partner/Distributor
+      let payerWalletUpdated: any = null;
+      if (payerUserId) {
+        let pWallet = await tx.wallet.findUnique({ where: { userId: payerUserId } });
         if (!pWallet) {
           pWallet = await tx.wallet.create({
             data: {
-              userId: partnerUserId,
+              userId: payerUserId,
               availableBalance: new Prisma.Decimal(0),
               reservedBalance: new Prisma.Decimal(0),
             },
@@ -274,11 +282,11 @@ export class CentresService {
         const prevBal = Number(pWallet.availableBalance);
         if (prevBal < centreFeeAmount) {
           throw new BadRequestException(
-            `Insufficient Partner Wallet Balance: Your available balance is ₹${prevBal.toFixed(2)}, but the Centre Onboarding Fee is ₹${centreFeeAmount.toFixed(2)}. Please recharge your partner wallet.`,
+            `Insufficient ${payerRoleName} Wallet Balance: Your available balance is ₹${prevBal.toFixed(2)}, but the Centre Onboarding Fee is ₹${centreFeeAmount.toFixed(2)}. Please recharge your wallet.`,
           );
         }
         const newBal = prevBal - centreFeeAmount;
-        partnerWalletUpdated = await tx.wallet.update({
+        payerWalletUpdated = await tx.wallet.update({
           where: { id: pWallet.id },
           data: { availableBalance: new Prisma.Decimal(newBal) },
         });
@@ -286,7 +294,7 @@ export class CentresService {
         await tx.walletTransaction.create({
           data: {
             walletId: pWallet.id,
-            userId: partnerUserId,
+            userId: payerUserId,
             type: TransactionType.ADJUSTMENT,
             amount: new Prisma.Decimal(-centreFeeAmount),
             status: TransactionStatus.COMPLETED,
@@ -298,6 +306,7 @@ export class CentresService {
               feeAmount: centreFeeAmount,
               previousBalance: prevBal,
               newBalance: newBal,
+              payerRole: payerRoleName,
             },
           },
         });
@@ -331,7 +340,7 @@ export class CentresService {
           pincode: dto.pincode?.trim() || null,
           feePaid: true,
           registrationFee: new Prisma.Decimal(centreFeeAmount),
-          feeTransactionId: actorUser.role === Role.PARTNER ? `CTR-FEE-${centreCode}` : null,
+          feeTransactionId: payerUserId ? `CTR-FEE-${centreCode}` : null,
           status: initialStatus,
         },
       });
@@ -368,14 +377,14 @@ export class CentresService {
         });
       }
 
-      return { user, centre, wallet, partnerWalletUpdated };
+      return { user, centre, wallet, payerWalletUpdated };
     });
 
-    if (result.partnerWalletUpdated && this.eventsGateway && partnerUserId) {
+    if (result.payerWalletUpdated && this.eventsGateway && payerUserId) {
       try {
-        this.eventsGateway.notifyWalletUpdated(partnerUserId, {
-          availableBalance: Number(result.partnerWalletUpdated.availableBalance),
-          reservedBalance: Number(result.partnerWalletUpdated.reservedBalance),
+        this.eventsGateway.notifyWalletUpdated(payerUserId, {
+          availableBalance: Number(result.payerWalletUpdated.availableBalance),
+          reservedBalance: Number(result.payerWalletUpdated.reservedBalance),
         });
       } catch (_) {}
     }

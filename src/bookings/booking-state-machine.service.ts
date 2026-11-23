@@ -793,8 +793,8 @@ export class BookingStateMachineService {
     [BookingStatus.SUCCESS]: [],
     [BookingStatus.COMPLETED]: [],
     [BookingStatus.FAILED]: [BookingStatus.PENDING, BookingStatus.QUEUED, BookingStatus.CANCELLED], // Allow re-try or cancellation by admin
-    [BookingStatus.CANCELLED]: [],
-    [BookingStatus.EXPIRED]: [BookingStatus.PENDING, BookingStatus.CANCELLED],
+    [BookingStatus.CANCELLED]: [BookingStatus.PENDING, BookingStatus.QUEUED],
+    [BookingStatus.EXPIRED]: [BookingStatus.PENDING, BookingStatus.QUEUED, BookingStatus.CANCELLED],
   };
 
   constructor(

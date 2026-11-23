@@ -56,6 +56,14 @@ export class BookingsController {
     return this.bookingsService.getBookingConfig();
   }
 
+  @Post('restart-all')
+  async restartAllBookings(
+    @CurrentUser() user: any,
+    @Body() dto?: { bookingIds?: string[] },
+  ) {
+    return this.bookingsService.restartAllBookings(user, dto);
+  }
+
   @Get(':id')
   async getBookingById(@Param('id') id: string, @CurrentUser() user: any) {
     return this.bookingsService.getBookingById(id, user);
@@ -64,6 +72,11 @@ export class BookingsController {
   @Post(':id/cancel')
   async cancelBooking(@Param('id') id: string, @CurrentUser() user: any) {
     return this.bookingsService.cancelBooking(id, user);
+  }
+
+  @Post(':id/restart')
+  async restartBooking(@Param('id') id: string, @CurrentUser() user: any) {
+    return this.bookingsService.restartBooking(id, user);
   }
 
   @Post(':id/resolve-human')

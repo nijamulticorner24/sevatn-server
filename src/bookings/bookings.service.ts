@@ -1011,6 +1011,365 @@ export class BookingsService {
   }
 
   /**
+   * Restart an individual failed or cancelled booking
+   */
+  async restartBooking(id: string, user: any) {
+    const booking = await this.prisma.bookingRequest.findUnique({
+      where: { id },
+      include: {
+        user: {
+          include: {
+            centre: {
+              include: { distributor: true },
+            },
+            distributor: true,
+          },
+        },
+      },
+    });
+
+    if (!booking) {
+      throw new NotFoundException(`Booking #${id} not found`);
+    }
+
+    // Role-based authorization
+    if (user.role === Role.CENTRE && booking.userId !== user.id) {
+      throw new ForbiddenException('Access denied to other centres booking data');
+    }
+
+    if (user.role === Role.DISTRIBUTOR) {
+      const distributorId = user.distributorProfile?.id || user.distributorId;
+      const isOwner = booking.userId === user.id;
+      const isSubordinate = distributorId && (booking.user?.distributorId === distributorId || (booking.user as any)?.centre?.distributorId === distributorId);
+      if (!isOwner && !isSubordinate) {
+        throw new ForbiddenException('Access denied to bookings outside your authorized distributor network');
+      }
+    }
+
+    if (user.role === Role.PARTNER) {
+      const partnerId = user.partnerProfile?.id || user.partnerId;
+      const isOwner = booking.userId === user.id;
+      const isFranchise = partnerId && (
+        booking.user?.partnerId === partnerId ||
+        booking.user?.distributor?.partnerId === partnerId ||
+        (booking.user?.centre as any)?.distributor?.partnerId === partnerId
+      );
+      if (!isOwner && !isFranchise) {
+        throw new ForbiddenException('Access denied to bookings outside your authorized partner franchise');
+      }
+    }
+
+    // Do not restart if confirmed / completed
+    if (
+      ([BookingStatus.SUCCESS, BookingStatus.COMPLETED, BookingStatus.BOOKING_CONFIRMED] as BookingStatus[]).includes(booking.status) ||
+      Boolean(booking.officialBookingReference || booking.officialReference)
+    ) {
+      throw new BadRequestException(`Cannot restart an already confirmed booking (#${booking.bookingCode})`);
+    }
+
+    // Only CANCELLED and FAILED bookings can be restarted
+    const allowedRestartStatuses: BookingStatus[] = [
+      BookingStatus.CANCELLED,
+      BookingStatus.FAILED,
+      BookingStatus.LOGIN_FAILED,
+      BookingStatus.SITE_ERROR,
+      BookingStatus.WORKER_ERROR,
+      BookingStatus.NO_AVAILABILITY,
+      BookingStatus.DATE_UNAVAILABLE,
+      BookingStatus.ROUTE_UNAVAILABLE,
+      BookingStatus.EXPIRED,
+      BookingStatus.TIMEOUT as any,
+      BookingStatus.LOADER_TIMEOUT,
+      BookingStatus.RETRYABLE_FAILURE,
+      BookingStatus.HOLD_INVALID_NOMINEE,
+      BookingStatus.DATE_SELECTION_FAILED,
+      BookingStatus.DATE_VERIFICATION_FAILED,
+      BookingStatus.PILGRIM_SELECTION_FAILED,
+      BookingStatus.SUBMIT_FAILED,
+      BookingStatus.WISHLIST_MISMATCH,
+    ];
+    if (!allowedRestartStatuses.includes(booking.status)) {
+      throw new BadRequestException(
+        `Only cancelled and failed bookings can be restarted. Booking #${booking.bookingCode} is in ${booking.status} state.`,
+      );
+    }
+
+    // Reject restart if Darshan date has passed / finished
+    const todayIST = getTodayISTDateString();
+    const dateToCheck = booking.requestedDateStr || booking.requestedDate;
+    if (isDateInPast(dateToCheck, todayIST)) {
+      throw new BadRequestException(
+        `Cannot restart booking #${booking.bookingCode} because the Darshan date (${booking.requestedDateStr || 'past'}) has already finished/passed. Only bookings with upcoming dates can be restarted.`,
+      );
+    }
+
+    // Financial ledger check: determine if hold is active
+    const reserveTxs = await this.prisma.walletTransaction.findMany({
+      where: {
+        bookingId: booking.id,
+        type: { in: ['RESERVE', 'RELEASE', 'CAPTURE', 'REFUND'] },
+        status: 'COMPLETED',
+      },
+    });
+
+    let currentHeld = 0;
+    for (const tx of reserveTxs) {
+      const amt = Number(tx.amount);
+      if (tx.type === 'RESERVE') currentHeld += amt;
+      if (tx.type === 'RELEASE' || tx.type === 'REFUND' || tx.type === 'CAPTURE') currentHeld -= amt;
+    }
+
+    const lastReserve = [...reserveTxs].reverse().find((tx) => tx.type === 'RESERVE');
+    const feeAmount = lastReserve
+      ? Number(lastReserve.amount)
+      : ((Number(booking.finalTicketPrice) || 20) * (booking.pilgrimCount || 1));
+
+    const now = new Date();
+    const updated = await this.prisma.$transaction(async (tx) => {
+      // If funds are not held (e.g. was cancelled and refunded), verify available balance and re-reserve
+      if (currentHeld <= 0 && feeAmount > 0) {
+        const wallet = await tx.wallet.findUnique({ where: { userId: booking.userId } });
+        if (!wallet || Number(wallet.availableBalance) < feeAmount) {
+          throw new BadRequestException(
+            `Insufficient wallet balance to restart booking #${booking.bookingCode}. Required: ₹${feeAmount}, Available: ₹${wallet?.availableBalance || 0}`,
+          );
+        }
+
+        await tx.wallet.update({
+          where: { userId: booking.userId },
+          data: {
+            availableBalance: { decrement: feeAmount },
+            reservedBalance: { increment: feeAmount },
+          },
+        });
+
+        const newReserveTx = await tx.walletTransaction.create({
+          data: {
+            walletId: wallet.id,
+            userId: booking.userId,
+            bookingId: booking.id,
+            type: 'RESERVE',
+            amount: new Prisma.Decimal(feeAmount),
+            status: 'COMPLETED',
+            reference: `RES-RESTART-${booking.bookingCode}-${Date.now().toString().slice(-4)}`,
+            metadata: { bookingId: booking.id, restart: true },
+          },
+        });
+
+        const txAny = tx as any;
+        if (txAny.walletLedgerEntry) {
+          await txAny.walletLedgerEntry.createMany({
+            data: [
+              {
+                walletId: wallet.id,
+                userId: booking.userId,
+                bookingId: booking.id,
+                transactionId: newReserveTx.id,
+                account: 'CENTRE_AVAILABLE',
+                entryType: 'DEBIT',
+                amount: new Prisma.Decimal(feeAmount),
+                reference: `LEDGER-RES-DEBIT-${booking.id.slice(0, 8)}`,
+              },
+              {
+                walletId: wallet.id,
+                userId: booking.userId,
+                bookingId: booking.id,
+                transactionId: newReserveTx.id,
+                account: 'CENTRE_RESERVED',
+                entryType: 'CREDIT',
+                amount: new Prisma.Decimal(feeAmount),
+                reference: `LEDGER-RES-CREDIT-${booking.id.slice(0, 8)}`,
+              },
+            ],
+          });
+        }
+      }
+
+      // Transition booking back to PENDING (or QUEUED)
+      const transitionRes = await this.stateMachine.transition(
+        {
+          bookingId: id,
+          targetStatus: BookingStatus.PENDING,
+          targetExecutionStatus: 'IDLE',
+          targetFinancialStatus: 'RESERVED' as any,
+          expectedVersion: booking.version,
+          note: `Restarted by ${user.role} (${user.email || user.username || user.id})`,
+          force: true,
+        },
+        tx,
+      );
+
+      // Clear previous worker/error states on bookingRequest
+      await tx.bookingRequest.update({
+        where: { id },
+        data: {
+          assignedMachineId: null,
+          failureReason: null,
+          requiresHumanNote: null,
+        },
+      });
+
+      // Authoritative reset/requeue of BookingJob (strictly 1:1 with bookingRequestId)
+      await tx.bookingJob.upsert({
+        where: {
+          bookingRequestId: booking.id,
+        },
+        create: {
+          jobType: JobType.BOOKING_EXECUTION,
+          bookingRequestId: booking.id,
+          accountId: booking.accountId || null,
+          status: BookingStatus.QUEUED,
+          workerId: null,
+          leaseExpiresAt: null,
+          leaseGeneration: 0,
+          leaseId: null,
+          fencingToken: null,
+          errorCode: null,
+          errorMessage: null,
+          attempt: 0,
+        },
+        update: {
+          jobType: JobType.BOOKING_EXECUTION,
+          accountId: booking.accountId || null,
+          status: BookingStatus.QUEUED,
+          workerId: null,
+          leaseExpiresAt: null,
+          leaseGeneration: { increment: 1 },
+          leaseId: null,
+          fencingToken: null,
+          errorCode: null,
+          errorMessage: null,
+          attempt: 0,
+          completedAt: null,
+        },
+      });
+
+      return transitionRes.booking;
+    });
+
+    this.eventsGateway.notifyBookingUpdated(booking.id, booking.userId, {
+      bookingId: booking.id,
+      bookingCode: booking.bookingCode,
+      status: BookingStatus.PENDING,
+    });
+
+    this.logger.log(`[BOOKING RESTART] Booking #${booking.bookingCode} restarted and returned to active queue by ${user.role}`);
+
+    return {
+      message: `Booking #${booking.bookingCode} restarted successfully and returned to queue`,
+      booking: updated,
+    };
+  }
+
+  /**
+   * Restart all eligible failed, cancelled, or error bookings in bulk
+   */
+  async restartAllBookings(user: any, dto?: { bookingIds?: string[] }) {
+    const where: Prisma.BookingRequestWhereInput = {};
+
+    if (user.role === Role.CENTRE) {
+      where.userId = user.id;
+    } else if (user.role === Role.DISTRIBUTOR) {
+      const distributorId = user.distributorProfile?.id || user.distributorId;
+      where.OR = [
+        { userId: user.id },
+        { user: { distributorId } },
+        { user: { centre: { distributorId } } },
+      ];
+    } else if (user.role === Role.PARTNER) {
+      const partnerId = user.partnerProfile?.id || user.partnerId;
+      where.OR = [
+        { userId: user.id },
+        { user: { partnerId } },
+        { user: { distributor: { partnerId } } },
+        { user: { centre: { distributor: { partnerId } } } },
+      ];
+    }
+
+    // Only restart failed, cancelled, or error bookings (never confirmed/in-flight)
+    const restartableStatuses: BookingStatus[] = [
+      BookingStatus.CANCELLED,
+      BookingStatus.FAILED,
+      BookingStatus.LOGIN_FAILED,
+      BookingStatus.SITE_ERROR,
+      BookingStatus.WORKER_ERROR,
+      BookingStatus.NO_AVAILABILITY,
+      BookingStatus.DATE_UNAVAILABLE,
+      BookingStatus.ROUTE_UNAVAILABLE,
+      BookingStatus.EXPIRED,
+      BookingStatus.TIMEOUT as any,
+      BookingStatus.LOADER_TIMEOUT,
+      BookingStatus.RETRYABLE_FAILURE,
+      BookingStatus.HOLD_INVALID_NOMINEE,
+      BookingStatus.DATE_SELECTION_FAILED,
+      BookingStatus.DATE_VERIFICATION_FAILED,
+      BookingStatus.PILGRIM_SELECTION_FAILED,
+      BookingStatus.SUBMIT_FAILED,
+      BookingStatus.WISHLIST_MISMATCH,
+    ];
+
+    where.status = { in: restartableStatuses };
+    where.officialBookingReference = null;
+    where.officialReference = null;
+
+    if (dto?.bookingIds && dto.bookingIds.length > 0) {
+      where.id = { in: dto.bookingIds };
+    }
+
+    const candidateBookings = await this.prisma.bookingRequest.findMany({
+      where,
+      select: {
+        id: true,
+        bookingCode: true,
+        status: true,
+        requestedDate: true,
+        requestedDateStr: true,
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    if (candidateBookings.length === 0) {
+      return {
+        message: 'No failed or cancelled bookings found to restart',
+        total: 0,
+        restarted: 0,
+        skipped: 0,
+        skippedReasons: [],
+      };
+    }
+
+    let restartedCount = 0;
+    let skippedCount = 0;
+    const skippedReasons: string[] = [];
+    const todayIST = getTodayISTDateString();
+
+    for (const b of candidateBookings) {
+      const dateToCheck = b.requestedDateStr || b.requestedDate;
+      if (isDateInPast(dateToCheck, todayIST)) {
+        skippedCount++;
+        skippedReasons.push(`#${b.bookingCode}: Darshan date (${b.requestedDateStr || 'past'}) has passed`);
+        continue;
+      }
+
+      try {
+        await this.restartBooking(b.id, user);
+        restartedCount++;
+      } catch (err: any) {
+        skippedCount++;
+        skippedReasons.push(`#${b.bookingCode}: ${err.message}`);
+      }
+    }
+
+    return {
+      message: `Restart completed: ${restartedCount} booking(s) restarted, ${skippedCount} skipped.`,
+      total: candidateBookings.length,
+      restarted: restartedCount,
+      skipped: skippedCount,
+      skippedReasons,
+    };
+  }
+
+  /**
    * Resolve a booking in REQUIRES_HUMAN state
    */
   async resolveHumanAction(id: string, dto: ResolveHumanActionDto, user: any) {
@@ -1107,13 +1466,28 @@ export class BookingsService {
       });
       const updated = transitionRes.booking;
 
-      // Create new retry job
-      await this.prisma.bookingJob.create({
-        data: {
+      // Reset or create retry job
+      await this.prisma.bookingJob.upsert({
+        where: {
+          bookingRequestId: booking.id,
+        },
+        create: {
           jobType: JobType.BOOKING_EXECUTION,
           bookingRequestId: booking.id,
           accountId: booking.accountId,
           status: BookingStatus.QUEUED,
+          workerId: null,
+          leaseExpiresAt: null,
+        },
+        update: {
+          jobType: JobType.BOOKING_EXECUTION,
+          accountId: booking.accountId,
+          status: BookingStatus.QUEUED,
+          workerId: null,
+          leaseExpiresAt: null,
+          errorCode: null,
+          errorMessage: null,
+          completedAt: null,
         },
       });
 

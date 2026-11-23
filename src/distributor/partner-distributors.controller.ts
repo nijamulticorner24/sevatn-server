@@ -71,5 +71,15 @@ export class PartnerDistributorsController {
     const partnerId = this.resolvePartnerId(req);
     return this.distributorService.updateDistributorStatus(partnerId, id, dto, req.user);
   }
+
+  @Post(':id/regenerate-password')
+  async regenerateDistributorPassword(
+    @Request() req: any,
+    @Param('id') id: string,
+  ) {
+    const partnerId = this.resolvePartnerId(req);
+    return this.distributorService.regenerateDistributorPassword(partnerId, id, req.user);
+  }
 }
+
 

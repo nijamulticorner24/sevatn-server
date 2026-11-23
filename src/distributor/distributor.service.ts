@@ -236,12 +236,17 @@ export class DistributorService {
       message: 'Distributor created successfully',
       distributor: {
         ...result.distributor,
+        name: result.user.name,
+        email: result.user.email,
+        mobile: result.user.mobile,
+        businessName: dto.businessName?.trim() || null,
         markup: Number(result.distributor.markup),
         commissionPercentage: Number(result.distributor.commissionPercentage),
       },
       credentials: {
         identifier: cleanMobile,
         temporaryPassword: dto.password ? 'User Defined' : rawPassword,
+        portalUrl: '/auth/login',
       },
     };
   }
@@ -478,6 +483,70 @@ export class DistributorService {
       },
     };
   }
+
+  /**
+   * Regenerate temporary password for a Distributor by their Partner franchise
+   */
+  async regenerateDistributorPassword(partnerId: string, distributorId: string, partnerUser: any) {
+    const distributor = await this.prisma.distributor.findFirst({
+      where: { id: distributorId, partnerId },
+      include: { user: true },
+    });
+    if (!distributor) {
+      throw new NotFoundException('Distributor not found or access denied');
+    }
+    if (!distributor.userId) {
+      throw new BadRequestException('Distributor does not have an associated login user account');
+    }
+
+    const cleanMobile = distributor.mobile.trim();
+    // Generate secure temporary password, e.g. Dist@ followed by 4 random digits
+    const randomDigits = Math.floor(1000 + Math.random() * 9000);
+    const tempPassword = `Dist@${randomDigits}`;
+    const passwordHash = await bcrypt.hash(tempPassword, 10);
+
+    await this.prisma.user.update({
+      where: { id: distributor.userId },
+      data: {
+        passwordHash,
+        mustChangePassword: true,
+      },
+    });
+
+    await this.audit.log({
+      actorId: partnerUser?.id,
+      actorType: 'USER',
+      action: 'DISTRIBUTOR_PASSWORD_REGENERATED',
+      entity: 'Distributor',
+      entityId: distributorId,
+      metadata: {
+        partnerId,
+        distributorCode: distributor.distributorCode,
+        distributorName: distributor.name,
+        mobile: cleanMobile,
+      },
+    });
+
+    this.logger.log(`[Password Regenerated] Distributor ${distributor.distributorCode} (${distributor.name}) by partner ${partnerId}`);
+
+    return {
+      message: 'Temporary password regenerated successfully',
+      distributor: {
+        id: distributor.id,
+        distributorCode: distributor.distributorCode,
+        name: distributor.name,
+        businessName: distributor.businessName,
+        mobile: cleanMobile,
+        email: distributor.email,
+      },
+      credentials: {
+        identifier: cleanMobile,
+        temporaryPassword: tempPassword,
+        portalUrl: '/auth/login',
+      },
+    };
+  }
+
 
   // =========================================================================
   // DISTRIBUTOR PORTAL METHODS (DISTRIBUTOR SELF-SERVICE)
