@@ -4443,7 +4443,7 @@ export class WorkersService {
                     balance: { increment: new Prisma.Decimal(commRate) },
                   },
                 });
-                this.logger.log(`Credited ₹${commRate} commission (${commPct}% of ₹${feeAmount} service fee) to partner ${partner.id} for completed booking ${br.id}`);
+                this.logger.log(`Credited 🪙 ${commRate} commission (${commPct}% of 🪙 ${feeAmount} service fee) to partner ${partner.id} for completed booking ${br.id}`);
               }
             }
           } catch (commErr: any) {
@@ -4454,7 +4454,7 @@ export class WorkersService {
         // Notify Centre and Customer with complete official booking confirmation details
         const dateDisplay = br.requestedDateStr || (br.requestedDate instanceof Date ? br.requestedDate.toISOString().split('T')[0] : String(br.requestedDate).split('T')[0]);
         const slotDisplay = br.selectedTime || br.timeSlot || 'Standard';
-        const grandTotalDisplay = dto.confirmationData?.grandTotal || '₹0.00';
+        const grandTotalDisplay = dto.confirmationData?.grandTotal || '🪙 0.00';
         const receiptUrlDisplay = dto.confirmationData?.receiptUrl || 'https://sabarimalaonline.org/#/booking-history';
 
         await this.notifications.send({

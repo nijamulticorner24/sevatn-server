@@ -113,7 +113,7 @@ export class NotificationsService {
 
       const title = typeTitles[payload.paymentType] || payload.paymentType;
       const refStr = payload.paymentReference || 'RECEIPT_PROOF_ATTACHED';
-      const formattedAmount = `₹${Number(payload.amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
+      const formattedAmount = `🪙 ${Number(payload.amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
       const timeStr = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
 
       let header = '<b>🔔 New Payment Submitted • Verification Required</b>';
@@ -260,7 +260,7 @@ export class NotificationsService {
       }
 
       const timeStr = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-      const formatCurr = (n: number) => `₹${Number(n).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
+      const formatCurr = (n: number) => `🪙 ${Number(n).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
 
       const lines = [
         `<b>📋 Financial Ledger • Pending Action Items Alert</b>`,

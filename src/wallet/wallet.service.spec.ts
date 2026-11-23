@@ -50,7 +50,7 @@ describe('WalletService & Immutable Financial Ledger', () => {
   });
 
   describe('reserve funds', () => {
-    it('should hold ₹100 from available to reserved balance', async () => {
+    it('should hold 🪙 100 from available to reserved balance', async () => {
       mockPrisma.wallet.findUnique.mockResolvedValue({
         id: 'w-1',
         userId: 'u-1',
@@ -88,8 +88,8 @@ describe('WalletService & Immutable Financial Ledger', () => {
     });
   });
 
-  describe('capture funds & ₹80/₹20 revenue split', () => {
-    it('should capture ₹100 and split ₹80 to Yuktron and ₹20 to Worker PC', async () => {
+  describe('capture funds & 🪙 80/🪙 20 revenue split', () => {
+    it('should capture 🪙 100 and split 🪙 80 to Yuktron and 🪙 20 to Worker PC', async () => {
       mockPrisma.walletTransaction.findUnique.mockResolvedValue(null);
       mockPrisma.walletTransaction.findFirst.mockResolvedValue(null); // No previous capture
       mockPrisma.wallet.findUnique.mockResolvedValue({

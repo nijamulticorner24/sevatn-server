@@ -540,7 +540,7 @@ export class DiagnosticsService {
       },
       {
         title: 'Authoritative Collection Status',
-        description: `₹${actualCollectedAmount.toFixed(2)} collected through ledger CAPTUREs. Platform attributed Yuktron share is ₹${platformRevenueAmount.toFixed(2)}.`,
+        description: `🪙 ${actualCollectedAmount.toFixed(2)} collected through ledger CAPTUREs. Platform attributed Yuktron share is 🪙 ${platformRevenueAmount.toFixed(2)}.`,
         trend: collectedAmountChangePct >= 0 ? 'UP' : 'DOWN',
         changePct: collectedAmountChangePct,
       },
@@ -715,7 +715,7 @@ export class DiagnosticsService {
         type: 'TRANSACTION',
         title: `Wallet ${t.type}`,
         date: t.createdAt.toISOString(),
-        details: `Amount: ₹${Number(t.amount).toFixed(2)}, Status: ${t.status}`,
+        details: `Amount: 🪙 ${Number(t.amount).toFixed(2)}, Status: ${t.status}`,
         status: t.status,
       });
     });

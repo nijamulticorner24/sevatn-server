@@ -86,7 +86,7 @@ export class DistributorService {
     const markupValue = Number(dto.markup || 0);
     if (markupValue < 0 || markupValue > config.maxDistributorMarkup) {
       throw new BadRequestException(
-        `Distributor markup (₹${markupValue}) must be between ₹0 and the Super Admin cap (₹${config.maxDistributorMarkup}).`,
+        `Distributor markup (🪙 ${markupValue}) must be between 🪙 0 and the Super Admin cap (🪙 ${config.maxDistributorMarkup}).`,
       );
     }
 
@@ -103,7 +103,7 @@ export class DistributorService {
       const currentAvailable = Number(pWallet?.availableBalance || 0);
       if (currentAvailable < distributorFeeAmount) {
         throw new BadRequestException(
-          `Insufficient Partner Wallet Balance: Your available balance is ₹${currentAvailable.toFixed(2)}, but the Distributor License Fee is ₹${distributorFeeAmount.toFixed(2)}. Please recharge your partner wallet to onboard this distributor.`,
+          `Insufficient Partner Wallet Balance: Your available balance is 🪙 ${currentAvailable.toFixed(2)}, but the Distributor License Fee is 🪙 ${distributorFeeAmount.toFixed(2)}. Please recharge your partner wallet to onboard this distributor.`,
         );
       }
     }
@@ -129,7 +129,7 @@ export class DistributorService {
         const prevBal = Number(pWallet.availableBalance);
         if (prevBal < distributorFeeAmount) {
           throw new BadRequestException(
-            `Insufficient Partner Wallet Balance: Your available balance is ₹${prevBal.toFixed(2)}, but the Distributor License Fee is ₹${distributorFeeAmount.toFixed(2)}. Please recharge your partner wallet.`,
+            `Insufficient Partner Wallet Balance: Your available balance is 🪙 ${prevBal.toFixed(2)}, but the Distributor License Fee is 🪙 ${distributorFeeAmount.toFixed(2)}. Please recharge your partner wallet.`,
           );
         }
         const newBal = prevBal - distributorFeeAmount;
@@ -375,7 +375,7 @@ export class DistributorService {
       const markupNum = Number(dto.markup);
       if (markupNum < 0 || markupNum > config.maxDistributorMarkup) {
         throw new BadRequestException(
-          `Markup (₹${markupNum}) must be between ₹0 and the Super Admin cap (₹${config.maxDistributorMarkup}).`,
+          `Markup (🪙 ${markupNum}) must be between 🪙 0 and the Super Admin cap (🪙 ${config.maxDistributorMarkup}).`,
         );
       }
       updateData.markup = new Prisma.Decimal(markupNum);
@@ -923,7 +923,7 @@ export class DistributorService {
       } else {
         if (prevAvailable < amount) {
           throw new BadRequestException(
-            `Cannot deduct ₹${amount}: Insufficient available balance (Current balance: ₹${prevAvailable.toFixed(2)}).`,
+            `Cannot deduct 🪙 ${amount}: Insufficient available balance (Current balance: 🪙 ${prevAvailable.toFixed(2)}).`,
           );
         }
         newAvailable = prevAvailable - amount;
@@ -988,7 +988,7 @@ export class DistributorService {
 
       return {
         success: true,
-        message: `Successfully ${dto.action === 'CREDIT' ? 'credited' : 'deducted'} ₹${amount.toFixed(2)} ${dto.action === 'CREDIT' ? 'to' : 'from'} ${distributor.name}'s wallet. New balance: ₹${newAvailable.toFixed(2)}.`,
+        message: `Successfully ${dto.action === 'CREDIT' ? 'credited' : 'deducted'} 🪙 ${amount.toFixed(2)} ${dto.action === 'CREDIT' ? 'to' : 'from'} ${distributor.name}'s wallet. New balance: 🪙 ${newAvailable.toFixed(2)}.`,
         availableBalance: newAvailable,
         wallet: updatedWallet,
         transaction,
@@ -1214,7 +1214,7 @@ export class DistributorService {
       const distPrevAvailable = Number(distWallet.availableBalance);
       if (distPrevAvailable < amount) {
         throw new BadRequestException(
-          `Insufficient wallet balance: Your available balance is ₹${distPrevAvailable.toFixed(2)}, cannot transfer ₹${amount.toFixed(2)}.`,
+          `Insufficient wallet balance: Your available balance is 🪙 ${distPrevAvailable.toFixed(2)}, cannot transfer 🪙 ${amount.toFixed(2)}.`,
         );
       }
 
@@ -1325,7 +1325,7 @@ export class DistributorService {
 
       return {
         success: true,
-        message: `Successfully transferred ₹${amount.toFixed(2)} to ${centre.centreName} (${centre.centreCode})`,
+        message: `Successfully transferred 🪙 ${amount.toFixed(2)} to ${centre.centreName} (${centre.centreCode})`,
         transferRef,
         amount,
         newBalance: distNewAvailable,
@@ -1466,7 +1466,7 @@ export class DistributorService {
 
     const amount = Number(dto.amount);
     if (!amount || amount < minWithdrawal) {
-      throw new BadRequestException(`Minimum withdrawal amount is ₹${minWithdrawal}`);
+      throw new BadRequestException(`Minimum withdrawal amount is 🪙 ${minWithdrawal}`);
     }
 
     const cleanUpi = dto.upiId?.trim();
@@ -1477,7 +1477,7 @@ export class DistributorService {
     const summary = await this.getDistributorPayouts(distributorId);
     if (amount > summary.availableBalance) {
       throw new BadRequestException(
-        `Requested amount (₹${amount}) exceeds available balance (₹${summary.availableBalance})`,
+        `Requested amount (🪙 ${amount}) exceeds available balance (🪙 ${summary.availableBalance})`,
       );
     }
 

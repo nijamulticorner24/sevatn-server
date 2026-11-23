@@ -29,6 +29,7 @@ describe('Sniper Match-Pending & Shared Status Specification Suite', () => {
     active: true,
     adminStatus: 'ENABLED',
     desiredState: 'RUNNING',
+    capabilities: ['BOOKING_EXECUTION'],
     maxConcurrentJobs: 3,
     currentActiveJobs: 0,
     status: WorkerStatus.IDLE,

@@ -259,7 +259,7 @@ export class CentresService {
       const currentAvailable = Number(payerWallet?.availableBalance || 0);
       if (currentAvailable < centreFeeAmount) {
         throw new BadRequestException(
-          `Insufficient ${payerRoleName} Wallet Balance: Your available balance is ₹${currentAvailable.toFixed(2)}, but the Centre Onboarding Fee is ₹${centreFeeAmount.toFixed(2)}. Please recharge your wallet to proceed with onboarding.`,
+          `Insufficient ${payerRoleName} Wallet Balance: Your available balance is 🪙 ${currentAvailable.toFixed(2)}, but the Centre Onboarding Fee is 🪙 ${centreFeeAmount.toFixed(2)}. Please recharge your wallet to proceed with onboarding.`,
         );
       }
     }
@@ -282,7 +282,7 @@ export class CentresService {
         const prevBal = Number(pWallet.availableBalance);
         if (prevBal < centreFeeAmount) {
           throw new BadRequestException(
-            `Insufficient ${payerRoleName} Wallet Balance: Your available balance is ₹${prevBal.toFixed(2)}, but the Centre Onboarding Fee is ₹${centreFeeAmount.toFixed(2)}. Please recharge your wallet.`,
+            `Insufficient ${payerRoleName} Wallet Balance: Your available balance is 🪙 ${prevBal.toFixed(2)}, but the Centre Onboarding Fee is 🪙 ${centreFeeAmount.toFixed(2)}. Please recharge your wallet.`,
           );
         }
         const newBal = prevBal - centreFeeAmount;
@@ -764,7 +764,7 @@ export class CentresService {
       } else {
         if (prevAvailable < amount) {
           throw new BadRequestException(
-            `Cannot deduct ₹${amount}: Insufficient available balance (Current balance: ₹${prevAvailable.toFixed(2)}).`,
+            `Cannot deduct 🪙 ${amount}: Insufficient available balance (Current balance: 🪙 ${prevAvailable.toFixed(2)}).`,
           );
         }
         newAvailable = prevAvailable - amount;
@@ -822,7 +822,7 @@ export class CentresService {
 
       return {
         success: true,
-        message: `Successfully ${dto.action === 'CREDIT' ? 'credited' : 'deducted'} ₹${amount.toFixed(2)} ${dto.action === 'CREDIT' ? 'to' : 'from'} ${centre.centreName}'s wallet.`,
+        message: `Successfully ${dto.action === 'CREDIT' ? 'credited' : 'deducted'} 🪙 ${amount.toFixed(2)} ${dto.action === 'CREDIT' ? 'to' : 'from'} ${centre.centreName}'s wallet.`,
         wallet: updatedWallet,
         transaction,
       };

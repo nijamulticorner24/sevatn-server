@@ -247,7 +247,7 @@ describe('BookingsService - Booking Readiness & Queue Protection', () => {
     });
 
     it('TEST 5B: Calculates pricing based on serviceFee * pilgrimCount and enforces max 10 pilgrims', async () => {
-      // 2 pilgrims = ₹40 fee
+      // 2 pilgrims = 🪙 40 fee
       const dto2: any = {
         ...validDto,
         pilgrimCount: 2,

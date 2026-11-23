@@ -196,33 +196,15 @@ export function isDateInPast(dateStrOrObj: string | Date | null | undefined, tod
   return dateStr < today;
 }
 
-/**
- * Normalizes route into canonical token (PAMBA, ERUMELY, VANDIPERIYAR).
- */
-export function normalizeRouteCanonical(route?: string | null): string {
-  if (!route) return 'PAMBA';
-  const lower = route.toLowerCase();
-  if (lower.includes('erumely')) return 'ERUMELY';
-  if (lower.includes('vandiperiyar') || lower.includes('sathram')) return 'VANDIPERIYAR';
-  if (lower.includes('pamba')) return 'PAMBA';
-  return route.trim().toUpperCase().replace(/[^A-Z0-9]/g, '_').slice(0, 15) || 'ROUTE';
-}
-
-/**
- * Compares candidate route with target route, handling portal formatting variations
- * (e.g. 'Pamba (Regular Footpath Route)' vs 'Pamba - Marakkoottam - 4 Kms').
- */
-export function isRouteMatching(candidateRoute?: string | null, targetRoute?: string | null): boolean {
-  if (!targetRoute || !targetRoute.trim()) return true;
-  if (!candidateRoute || !candidateRoute.trim()) return false;
-  const c = candidateRoute.trim().toLowerCase();
-  const t = targetRoute.trim().toLowerCase();
-  if (c === t) return true;
-  const cCanonical = normalizeRouteCanonical(candidateRoute);
-  const tCanonical = normalizeRouteCanonical(targetRoute);
-  if (cCanonical === tCanonical) return true;
-  return c.includes(t) || t.includes(c);
-}
+export {
+  SabarimalaRoute,
+  normalizeSabarimalaRoute,
+  normalizeRouteCanonical,
+  getOfficialSabarimalaRouteLabel,
+  getOfficialSabarimalaRouteValue,
+  isSameSabarimalaRoute,
+  isRouteMatching,
+} from './constants/sabarimala-routes';
 
 /**
  * Unified evaluator for whether a booking request is open and eligible for claiming/scanning.

@@ -3,7 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AccountLockService } from './account-lock.service';
 import { BookingStateMachineService } from '../bookings/booking-state-machine.service';
 import { BookingStatus, JobType, AccountStatus } from '@prisma/client';
-import { CLAIMABLE_OPEN_REQUEST_STATUSES, isDateInPast } from '../common/booking-status.constants';
+import { CLAIMABLE_OPEN_REQUEST_STATUSES, isDateInPast, isRouteMatching } from '../common/booking-status.constants';
 
 export interface AvailabilityEventPayload {
   date: string; // YYYY-MM-DD
@@ -183,18 +183,14 @@ export class SmartMatcherService {
       },
     });
 
-    // 2. Query all eligible pending bookings strictly for this requestedDate (and matching route)
+    // 2. Query all eligible pending bookings strictly for this requestedDate
     // Ordered deterministically by createdAt ASC (Fairness: oldest first)
-    const pendingBookings = await this.prisma.bookingRequest.findMany({
+    const rawPendingBookings = await this.prisma.bookingRequest.findMany({
       where: {
         OR: [
           { requestedDateStr: canonicalDateStr },
           { requestedDate: { gte: targetDateStart, lte: targetDateEnd } },
         ],
-        route: {
-          contains: event.route.split(' ')[0], // matches 'Pamba' in 'Pamba (Regular Footpath Route)'
-          mode: 'insensitive',
-        },
         status: {
           in: CLAIMABLE_OPEN_REQUEST_STATUSES,
         },
@@ -205,6 +201,9 @@ export class SmartMatcherService {
         pilgrims: true,
       },
     });
+
+    // Authoritative route matching using canonical route logic
+    const pendingBookings = rawPendingBookings.filter((b) => isRouteMatching(b.route, event.route));
 
     const pendingCount = pendingBookings.length;
     this.logger.log(`[MATCHER] Found ${pendingCount} pending bookings for ${canonicalDateStr}`);

@@ -131,7 +131,7 @@ async function main() {
       },
     });
   }
-  console.log('✓ Wallets purged. Super Admin wallet balance reset to ₹0.00.');
+  console.log('✓ Wallets purged. Super Admin wallet balance reset to 🪙 0.00.');
 
   // 5. Delete all users EXCEPT Super Admin
   const deletedUsers = await prisma.user.deleteMany({

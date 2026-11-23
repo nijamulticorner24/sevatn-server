@@ -15,7 +15,7 @@ import { AccountLockService } from '../availability/account-lock.service';
 import { CreateBookingDto, ResolveHumanActionDto } from './dto/booking.dto';
 import { BookingStatus, JobType, AccountStatus, Role, Prisma } from '@prisma/client';
 import { calculateHaversineDistanceKm } from '../common/utils/geo';
-import { getTodayISTDateString, isDateInPast } from '../common/booking-status.constants';
+import { getTodayISTDateString, isDateInPast, SabarimalaRoute, normalizeSabarimalaRoute, getOfficialSabarimalaRouteLabel, isRouteMatching } from '../common/booking-status.constants';
 
 import { EventsGateway } from '../events/events.gateway';
 import { SmartAllocatorService } from '../workers/smart-allocator.service';
@@ -55,6 +55,14 @@ export class BookingsService {
     if (!dto.requestedDate || !dto.route) {
       throw new BadRequestException('Preferred Darshan Date and Route are required');
     }
+
+    const canonicalRouteEnum = normalizeSabarimalaRoute(dto.route);
+    if (!canonicalRouteEnum) {
+      throw new BadRequestException(
+        `Unsupported or unrecognized route "${dto.route}". Must match one of the official Sabarimala Darshan routes (Pamba, Erumely Traditional, or Vandiperiyar/Pulmedu).`,
+      );
+    }
+    const validatedOfficialRoute = getOfficialSabarimalaRouteLabel(canonicalRouteEnum);
 
     // 1. Optional Pilgrim Details Validation (if explicitly supplied)
     if (dto.pilgrims && Array.isArray(dto.pilgrims) && dto.pilgrims.length > 0) {
@@ -339,7 +347,7 @@ export class BookingsService {
 
       if (!wallet || Number(wallet.availableBalance) < feeAmount) {
         throw new BadRequestException(
-          `Insufficient wallet balance. Required: ₹${feeAmount} (₹${unitPrice} × ${pilgrimCount} pilgrim${pilgrimCount > 1 ? 's' : ''}), Available: ₹${wallet?.availableBalance || 0}`,
+          `Insufficient wallet balance. Required: 🪙 ${feeAmount} (🪙 ${unitPrice} × ${pilgrimCount} pilgrim${pilgrimCount > 1 ? 's' : ''}), Available: 🪙 ${wallet?.availableBalance || 0}`,
         );
       }
 
@@ -391,16 +399,13 @@ export class BookingsService {
 
       // Only attempt immediate execution dispatch if account is already confirmed VERIFIED
       if (!isNewAccountCredentials && accountId) {
-        const availableOpp = await tx.availabilityOpportunity.findFirst({
+        const availableOpps = await tx.availabilityOpportunity.findMany({
           where: {
             date: rawDateStr,
-            route: {
-              contains: dto.route.split(' ')[0],
-              mode: 'insensitive',
-            },
             status: 'AVAILABLE',
           },
         });
+        const availableOpp = availableOpps.find((opp) => isRouteMatching(opp.route, validatedOfficialRoute));
 
         if (availableOpp) {
           const isLocked = await this.accountLockService.isLocked(accountId);
@@ -427,7 +432,7 @@ export class BookingsService {
           accountId: accountId || null,
           requestedDate: canonicalDate,
           requestedDateStr: rawDateStr,
-          route: dto.route,
+          route: validatedOfficialRoute,
           pilgrimCount,
           timeSlot: dto.timeSlot || 'Any Slot',
           selectedTime: matchedTimeSlot || undefined,
@@ -1131,7 +1136,7 @@ export class BookingsService {
         const wallet = await tx.wallet.findUnique({ where: { userId: booking.userId } });
         if (!wallet || Number(wallet.availableBalance) < feeAmount) {
           throw new BadRequestException(
-            `Insufficient wallet balance to restart booking #${booking.bookingCode}. Required: ₹${feeAmount}, Available: ₹${wallet?.availableBalance || 0}`,
+            `Insufficient wallet balance to restart booking #${booking.bookingCode}. Required: 🪙 ${feeAmount}, Available: 🪙 ${wallet?.availableBalance || 0}`,
           );
         }
 
