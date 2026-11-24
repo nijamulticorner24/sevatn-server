@@ -5204,7 +5204,17 @@ export class WorkersService {
     const worker = await this.prisma.workerMachine.findUnique({ where: { id: machineId } });
     if (!worker) throw new UnauthorizedException('Worker machine not found');
 
-    const sessionId = dto.workerSessionId || 'default';
+    const rawSessionId = dto.workerSessionId ? dto.workerSessionId.trim() : '';
+    const isProduction = process.env.NODE_ENV === 'production';
+
+    // Enforce valid worker session ID: reject empty or default worker session IDs in production
+    if (!rawSessionId || rawSessionId === 'default') {
+      if (isProduction || !rawSessionId) {
+        throw new BadRequestException('Invalid workerSessionId: Session ID cannot be empty or default in production');
+      }
+    }
+    const sessionId = rawSessionId;
+
     let newRefreshesCount = 0;
     let fullCount = 0;
     let availableCount = 0;
@@ -5215,22 +5225,6 @@ export class WorkersService {
     for (const event of dto.events || []) {
       const demandKey = event.demandKey;
       const pollSeq = event.pollSeq;
-
-      // Idempotency check: same worker session, demandKey, and poll sequence
-      const existing = await this.prisma.monitoringPollEvent.findUnique({
-        where: {
-          workerId_workerSessionId_demandKey_pollSequence: {
-            workerId: machineId,
-            workerSessionId: sessionId,
-            demandKey,
-            pollSequence: pollSeq,
-          },
-        },
-      });
-
-      if (existing) {
-        continue; // Already processed idempotently
-      }
 
       // Determine associated booking requests
       let targetBookingIds = event.bookingRequestIds || [];
@@ -5255,6 +5249,7 @@ export class WorkersService {
 
       const primaryBookingId = targetBookingIds.length > 0 ? targetBookingIds[0] : null;
 
+      // Atomic insertion protected by @@unique([workerId, workerSessionId, demandKey, pollSequence])
       try {
         await this.prisma.monitoringPollEvent.create({
           data: {
@@ -5271,31 +5266,64 @@ export class WorkersService {
             errorMessage: event.errorMessage || null,
           },
         });
-        newRefreshesCount++;
-        if (event.state === 'FULL') fullCount++;
-        else if (event.state === 'AVAILABLE') availableCount++;
-        else if (event.state === 'UNKNOWN' || event.state === 'API_DATE_MISMATCH') unknownCount++;
-        else if (event.state === 'ERROR' || event.state === 'RATE_LIMITED' || event.state === 'BLOCKED') errorCount++;
       } catch (createErr: any) {
-        continue;
+        // Explicitly handle Prisma P2002 unique constraint violation as an expected idempotent duplicate
+        if (createErr?.code === 'P2002' || (createErr instanceof Prisma.PrismaClientKnownRequestError && createErr.code === 'P2002')) {
+          this.logger.debug(
+            `[MONITOR_TELEMETRY] Duplicate poll event skipped: worker=${machineId} session=${sessionId} key=${demandKey} seq=${pollSeq}`
+          );
+          // Do not increment counters or update booking requests on duplicate
+          continue;
+        }
+
+        // Log and propagate all other unexpected database errors
+        this.logger.error(
+          `[MONITOR_TELEMETRY] Database error recording poll event: worker=${machineId} session=${sessionId} key=${demandKey} seq=${pollSeq} error=${createErr?.message || createErr}`,
+          createErr?.stack
+        );
+        throw createErr;
       }
 
-      // Concurrently update each associated booking request
+      // Successfully inserted fresh unique event - track counters exactly once
+      newRefreshesCount++;
+      if (event.state === 'FULL') fullCount++;
+      else if (event.state === 'AVAILABLE') availableCount++;
+      else if (event.state === 'UNKNOWN' || event.state === 'API_DATE_MISMATCH') unknownCount++;
+      else if (event.state === 'ERROR' || event.state === 'RATE_LIMITED' || event.state === 'BLOCKED') errorCount++;
+
+      // Update associated booking requests without allowing out-of-order sequences to overwrite newer data
       if (targetBookingIds.length > 0) {
-        await this.prisma.bookingRequest.updateMany({
-          where: { id: { in: targetBookingIds } },
-          data: {
-            totalRefreshCount: { increment: 1 },
-            lastPollSequence: pollSeq,
-            lastRefreshAt: now,
-            lastRefreshResult: event.state,
-            lastSuccessfulRefreshAt: (event.state !== 'ERROR' && event.state !== 'BLOCKED') ? now : undefined,
-            lastError: event.errorMessage || (event.state === 'ERROR' ? 'Poll error' : null),
-          },
-        });
+        for (const bookingId of targetBookingIds) {
+          try {
+            const currentReq = await this.prisma.bookingRequest.findUnique({
+              where: { id: bookingId },
+              select: { lastPollSequence: true },
+            });
+            const isMonotonicOrEqual = !currentReq?.lastPollSequence || pollSeq >= currentReq.lastPollSequence;
+
+            await this.prisma.bookingRequest.update({
+              where: { id: bookingId },
+              data: {
+                totalRefreshCount: { increment: 1 },
+                ...(isMonotonicOrEqual
+                  ? {
+                      lastPollSequence: pollSeq,
+                      lastRefreshAt: now,
+                      lastRefreshResult: event.state,
+                      lastSuccessfulRefreshAt: event.state !== 'ERROR' && event.state !== 'BLOCKED' ? now : undefined,
+                      lastError: event.errorMessage || (event.state === 'ERROR' ? 'Poll error' : null),
+                    }
+                  : {}),
+              },
+            });
+          } catch (reqErr: any) {
+            this.logger.warn(`[MONITOR_TELEMETRY] Failed updating booking #${bookingId} refresh counter: ${reqErr?.message}`);
+          }
+        }
       }
     }
 
+    // Atomically increment WorkerMachine telemetry counters if any fresh events were recorded
     if (newRefreshesCount > 0) {
       await this.prisma.workerMachine.update({
         where: { id: machineId },
