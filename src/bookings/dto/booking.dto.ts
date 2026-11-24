@@ -1,4 +1,5 @@
 import {
+  ArrayMaxSize,
   IsArray,
   IsBoolean,
   IsDateString,
@@ -7,6 +8,7 @@ import {
   IsNumber,
   IsOptional,
   IsString,
+  Max,
   Min,
   ValidateNested,
 } from 'class-validator';
@@ -114,6 +116,7 @@ export class CreateBookingDto {
   @IsOptional()
   @IsInt()
   @Min(1)
+  @Max(5, { message: 'A maximum of 5 pilgrims is permitted per booking' })
   pilgrimCount?: number;
 
   @IsOptional()
@@ -125,6 +128,7 @@ export class CreateBookingDto {
 
   @IsOptional()
   @IsArray()
+  @ArrayMaxSize(5, { message: 'A maximum of 5 pilgrims is permitted per booking' })
   @ValidateNested({ each: true })
   @Type(() => PilgrimDto)
   pilgrims?: PilgrimDto[];

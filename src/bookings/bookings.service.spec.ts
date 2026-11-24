@@ -246,7 +246,7 @@ describe('BookingsService - Booking Readiness & Queue Protection', () => {
       expect(mockPrisma.bookingRequest.create).toHaveBeenCalled();
     });
 
-    it('TEST 5B: Calculates pricing based on serviceFee * pilgrimCount and enforces max 10 pilgrims', async () => {
+    it('TEST 5B: Calculates pricing based on serviceFee * pilgrimCount and enforces max 5 pilgrims', async () => {
       // 2 pilgrims = 🪙 40 fee
       const dto2: any = {
         ...validDto,
@@ -255,13 +255,13 @@ describe('BookingsService - Booking Readiness & Queue Protection', () => {
       const result2 = await bookingsService.createBooking('user-1', dto2);
       expect(result2.pilgrimCount).toBe(2);
 
-      // 11 pilgrims = rejects with max 10 error
-      const dto11: any = {
+      // 6 pilgrims = rejects with max 5 error
+      const dto6: any = {
         ...validDto,
-        pilgrimCount: 11,
+        pilgrimCount: 6,
       };
-      await expect(bookingsService.createBooking('user-1', dto11)).rejects.toThrow(
-        new BadRequestException('Sabarimala portal allows a maximum of 10 pilgrims per booking.'),
+      await expect(bookingsService.createBooking('user-1', dto6)).rejects.toThrow(
+        new BadRequestException('Sabarimala portal allows a maximum of 5 pilgrims per booking.'),
       );
     });
 

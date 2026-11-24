@@ -66,8 +66,8 @@ export class BookingsService {
 
     // 1. Optional Pilgrim Details Validation (if explicitly supplied)
     if (dto.pilgrims && Array.isArray(dto.pilgrims) && dto.pilgrims.length > 0) {
-      if (dto.pilgrims.length > 10) {
-        throw new BadRequestException('A maximum of 10 pilgrims is permitted per booking.');
+      if (dto.pilgrims.length > 5) {
+        throw new BadRequestException('A maximum of 5 pilgrims is permitted per booking.');
       }
 
       for (let i = 0; i < dto.pilgrims.length; i++) {
@@ -328,8 +328,8 @@ export class BookingsService {
     const baseServiceFee = Number(config?.serviceFee ?? 20);
 
     const rawPilgrimCount = Number(dto.pilgrimCount) || (dto.pilgrims && dto.pilgrims.length > 0 ? dto.pilgrims.length : 1);
-    if (rawPilgrimCount > 10) {
-      throw new BadRequestException('Sabarimala portal allows a maximum of 10 pilgrims per booking.');
+    if (rawPilgrimCount > 5) {
+      throw new BadRequestException('Sabarimala portal allows a maximum of 5 pilgrims per booking.');
     }
     const pilgrimCount = Math.max(1, rawPilgrimCount);
 
