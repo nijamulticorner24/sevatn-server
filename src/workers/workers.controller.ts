@@ -24,6 +24,7 @@ import {
   ActivityLogQueryDto,
   UpdateWorkerCapacityDto,
   AllocationQueryDto,
+  FailJobDto,
 } from './dto/worker.dto';
 import { AuthorizePaymentDto } from './dto/authorize-payment.dto';
 import { Role } from '@prisma/client';
@@ -428,7 +429,7 @@ export class WorkersController {
   async failJob(
     @Param('id') jobId: string,
     @CurrentMachine() machine: any,
-    @Body() dto: { status: any; errorCode?: string; errorMessage?: string },
+    @Body() dto: FailJobDto,
   ) {
     return this.workersService.failJob(jobId, machine.id, dto);
   }

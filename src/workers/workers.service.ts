@@ -4540,7 +4540,15 @@ export class WorkersService {
   async failJob(
     jobId: string,
     machineId: string,
-    dto: { status: BookingStatus; errorCode?: string; errorMessage?: string; leaseGeneration?: number; fencingToken?: string; protocolVersion?: string },
+    dto: {
+      status: BookingStatus;
+      errorCode?: string;
+      errorMessage?: string;
+      screenshot?: string;
+      leaseGeneration?: number;
+      fencingToken?: string;
+      protocolVersion?: string;
+    },
   ) {
     // Protocol Version Guard
     if (dto.protocolVersion && dto.protocolVersion !== 'v2.0-fenced') {
@@ -4832,6 +4840,10 @@ export class WorkersService {
 
       if (dto.status === BookingStatus.REQUIRES_HUMAN || (dto.status as string) === 'UNKNOWN_RESULT') {
         // Quarantine ambiguous outcome without releasing wallet hold (FIND-002)
+        const interventionNote = (dto.status as string) === 'UNKNOWN_RESULT'
+          ? `[MANUAL RECONCILIATION] ${dto.errorMessage || 'Official booking unconfirmed after submission. Wallet hold retained for operator verification.'}`
+          : (dto.errorMessage || 'Official portal requires verification (CAPTCHA / OTP)');
+
         try {
           await this.stateMachine.transition({
             bookingId: br.id,
@@ -4840,9 +4852,9 @@ export class WorkersService {
             workerId: machineId,
             leaseGeneration: job.leaseGeneration,
             milestone: 'REQUIRES_HUMAN',
-            note: (dto.status as string) === 'UNKNOWN_RESULT'
-              ? `[MANUAL RECONCILIATION] ${dto.errorMessage || 'Official booking unconfirmed after submission. Wallet hold retained for operator verification.'}`
-              : (dto.errorMessage || 'Official portal requires verification (CAPTCHA / OTP)'),
+            screenshot: dto.screenshot,
+            confirmationEvidence: dto.screenshot ? { screenshot: dto.screenshot } : undefined,
+            note: interventionNote,
           });
         } catch (smErr: any) {
           this.logger.warn(`[STATE_MACHINE] Fail transition to REQUIRES_HUMAN fallback: ${smErr.message}`);
@@ -4850,13 +4862,21 @@ export class WorkersService {
             where: { id: br.id },
             data: {
               status: BookingStatus.REQUIRES_HUMAN,
-              requiresHumanNote: (dto.status as string) === 'UNKNOWN_RESULT'
-                ? `[MANUAL RECONCILIATION] ${dto.errorMessage || 'Official booking unconfirmed after submission. Wallet hold retained for operator verification.'}`
-                : (dto.errorMessage || 'Official portal requires verification (CAPTCHA / OTP)'),
+              requiresHumanNote: interventionNote,
+              confirmationEvidence: dto.screenshot ? { screenshot: dto.screenshot } : undefined,
             },
           });
+          // Dispatch Telegram notification with screenshot directly on state machine fallback
+          await this.notifications.sendTelegramBookingNotification({
+            bookingId: br.id,
+            status: BookingStatus.REQUIRES_HUMAN,
+            requiresHumanNote: interventionNote,
+            screenshotUrl: dto.screenshot,
+            workerId: machineId,
+          }).catch(() => {});
         }
       } else {
+        const failReason = dto.errorMessage || dto.errorCode || 'Booking execution failed';
         try {
           await this.stateMachine.transition({
             bookingId: br.id,
@@ -4865,7 +4885,9 @@ export class WorkersService {
             workerId: machineId,
             leaseGeneration: job.leaseGeneration,
             milestone: 'FAILED',
-            failureReason: dto.errorMessage || dto.errorCode || 'Booking execution failed',
+            screenshot: dto.screenshot,
+            confirmationEvidence: dto.screenshot ? { screenshot: dto.screenshot } : undefined,
+            failureReason: failReason,
           });
         } catch (smErr: any) {
           this.logger.warn(`[STATE_MACHINE] Fail transition to ${validFailStatus} fallback: ${smErr.message}`);
@@ -4873,11 +4895,20 @@ export class WorkersService {
             where: { id: br.id },
             data: {
               status: validFailStatus,
-              failureReason: dto.errorMessage || dto.errorCode || 'Booking execution failed',
+              failureReason: failReason,
+              confirmationEvidence: dto.screenshot ? { screenshot: dto.screenshot } : undefined,
               assignedMachineId: null,
               leaseExpiresAt: null,
             },
           });
+          // Dispatch Telegram notification with screenshot directly on state machine fallback
+          await this.notifications.sendTelegramBookingNotification({
+            bookingId: br.id,
+            status: validFailStatus,
+            failureReason: failReason,
+            screenshotUrl: dto.screenshot,
+            workerId: machineId,
+          }).catch(() => {});
         }
 
         // Release exact reserved hold only on confirmed failures

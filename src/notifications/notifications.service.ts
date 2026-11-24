@@ -335,6 +335,8 @@ export class NotificationsService {
     operatorName?: string;
     district?: string;
     mobile?: string;
+    screenshot?: string;
+    screenshotUrl?: string;
   }) {
     try {
       const config = await this.prisma.systemConfig.findUnique({ where: { id: 'default' } });
@@ -375,6 +377,7 @@ export class NotificationsService {
               district: payload.district || br.user?.centre?.district,
               mobile: payload.mobile || br.user?.mobile,
               machineCode: payload.machineCode || br.assignedMachine?.machineCode,
+              screenshotUrl: payload.screenshotUrl || payload.screenshot || (br.confirmationEvidence as any)?.screenshot || undefined,
             };
           }
         } catch (dbErr: any) {
@@ -409,6 +412,10 @@ export class NotificationsService {
         header = '<b>🛑 BOOKING CANCELLED • Central Booking Queue</b>';
         statusLabel = 'Cancelled';
         detailsLine = `ℹ️ <b>Reason:</b> ${bookingData.note || bookingData.failureReason || 'Cancelled by operator / admin. Held deposit refunded.'}`;
+      } else if (['BOOKING_FAILED', 'FAILED', 'EXECUTION_FAILED', 'WISHLIST_MISMATCH', 'RETRYABLE_FAILURE'].includes(normalizedStatus)) {
+        header = '<b>🚨 BOOKING FLOW FAILED • Central Booking Queue</b>';
+        statusLabel = 'Booking Flow Issue / Failed';
+        detailsLine = `❌ <b>Error Details:</b> ${bookingData.failureReason || bookingData.note || 'Encountered issue during official Sabarimala booking flow.'}`;
       } else if (['SUCCESS', 'COMPLETED', 'BOOKING_CONFIRMED', 'CONFIRMED'].includes(normalizedStatus)) {
         header = '<b>✅ BOOKING CONFIRMED • Sabarimala Virtual Q Pass</b>';
         statusLabel = 'Confirmed / Success';
@@ -435,6 +442,9 @@ export class NotificationsService {
         bookingData.selectedTime ? `⏰ <b>Time Slot:</b> ${bookingData.selectedTime}` : '',
         bookingData.pilgrimCount ? `👥 <b>Devotees:</b> ${bookingData.pilgrimCount} Pilgrim${bookingData.pilgrimCount !== 1 ? 's' : ''}` : '',
         bookingData.machineCode ? `💻 <b>Worker Machine:</b> <code>${bookingData.machineCode}</code>` : '',
+        (payload.screenshot || payload.screenshotUrl || (bookingData as any).screenshot || (bookingData as any).screenshotUrl)
+          ? `🌐 <b>Live Capture:</b> Official Portal (<code>sabarimalaonline.org</code>)`
+          : '',
         ``,
         `⏱ <b>Alert Time:</b> ${timeStr} IST`,
         ``,
@@ -444,25 +454,96 @@ export class NotificationsService {
 
       const text = lines.join('\n');
 
-      const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text,
-          parse_mode: 'HTML',
-          disable_web_page_preview: false,
-        }),
-      });
+      let sentPhoto = false;
+      const screenshot =
+        payload.screenshot ||
+        payload.screenshotUrl ||
+        (bookingData as any).screenshot ||
+        (bookingData as any).screenshotUrl ||
+        (bookingData as any).confirmationEvidence?.screenshot;
 
-      const resJson: any = await res.json();
-      if (resJson.ok) {
-        this.logger.log(`[Telegram Bot] Booking notification #${bookingCode} (${statusLabel}) dispatched to chat ${chatId}`);
-      } else {
-        this.logger.error(`[Telegram Bot] Failed to send booking notification: ${JSON.stringify(resJson)}`);
+      if (screenshot) {
+        try {
+          let base64Data = screenshot;
+          let mimeType = 'image/jpeg';
+          if (screenshot.startsWith('data:')) {
+            const matches = screenshot.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
+            if (matches && matches.length === 3) {
+              mimeType = matches[1];
+              base64Data = matches[2];
+            } else {
+              base64Data = screenshot.replace(/^data:[^;]+;base64,/, '');
+            }
+          }
+
+          let captionText = text;
+          if (captionText.length > 1020) {
+            captionText = captionText.slice(0, 990) + '...';
+          }
+
+          const formData = new FormData();
+          formData.append('chat_id', chatId);
+
+          if (screenshot.startsWith('http://') || screenshot.startsWith('https://')) {
+            formData.append('photo', screenshot);
+          } else {
+            const buffer = Buffer.from(base64Data, 'base64');
+            const blob = new Blob([buffer], { type: mimeType });
+            formData.append('photo', blob, 'sabarimala_portal_issue.jpg');
+          }
+
+          formData.append('caption', captionText);
+          formData.append('parse_mode', 'HTML');
+
+          const res = await fetch(`https://api.telegram.org/bot${botToken}/sendPhoto`, {
+            method: 'POST',
+            body: formData,
+          });
+          const resJson: any = await res.json();
+          if (resJson.ok) {
+            sentPhoto = true;
+            this.logger.log(`[Telegram Bot] Booking portal screenshot notification #${bookingCode} (${statusLabel}) dispatched to chat ${chatId}`);
+          } else {
+            this.logger.warn(`[Telegram Bot] sendPhoto returned not ok: ${JSON.stringify(resJson)}`);
+          }
+        } catch (photoErr: any) {
+          this.logger.warn(`[Telegram Bot] Failed to send photo, falling back to text message: ${photoErr.message}`);
+        }
       }
 
-      return { success: resJson.ok, response: resJson };
+      if (!sentPhoto) {
+        const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text,
+            parse_mode: 'HTML',
+            disable_web_page_preview: false,
+          }),
+        });
+        const resJson: any = await res.json();
+        if (resJson.ok) {
+          this.logger.log(`[Telegram Bot] Booking notification #${bookingCode} (${statusLabel}) dispatched to chat ${chatId}`);
+        } else {
+          this.logger.error(`[Telegram Bot] Failed to send booking notification: ${JSON.stringify(resJson)}`);
+        }
+        return { success: resJson.ok, response: resJson };
+      } else if (text.length > 1020) {
+        // If photo caption was truncated, follow up with the full details and action links
+        await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text,
+            parse_mode: 'HTML',
+            disable_web_page_preview: false,
+          }),
+        }).catch(() => {});
+      }
+
+      return { success: true };
     } catch (err: any) {
       this.logger.error(`[Telegram Booking Alert] Failed: ${err.message}`);
       return { success: false, error: err.message };

@@ -359,5 +359,38 @@ export class WorkerJobActionDto {
   errorMessage?: string;
 
   @IsOptional()
+  @IsString()
+  screenshot?: string;
+
+  @IsOptional()
   logs?: any;
+}
+
+export class FailJobDto {
+  @IsNotEmpty()
+  status: any;
+
+  @IsOptional()
+  @IsString()
+  errorCode?: string;
+
+  @IsOptional()
+  @IsString()
+  errorMessage?: string;
+
+  @IsOptional()
+  @IsString()
+  screenshot?: string;
+
+  @IsOptional()
+  @IsNumber()
+  leaseGeneration?: number;
+
+  @IsOptional()
+  @IsString()
+  fencingToken?: string;
+
+  @IsOptional()
+  @IsString()
+  protocolVersion?: string;
 }

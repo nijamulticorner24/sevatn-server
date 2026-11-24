@@ -1659,6 +1659,7 @@ export class AdminService {
       district: booking.user?.centre?.district,
       mobile: booking.user?.mobile,
       machineCode: booking.assignedMachine?.machineCode,
+      screenshotUrl: (booking.confirmationEvidence as any)?.screenshot || undefined,
     });
 
     return {

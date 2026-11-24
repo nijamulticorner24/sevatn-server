@@ -37,6 +37,7 @@ export interface TransitionRequest {
   confirmationEvidence?: any;
   confirmedAt?: Date | string;
   confirmationData?: any;
+  screenshot?: string;
   failureReason?: string;
   selectedTime?: string | null;
   assignedMachineId?: string | null;
@@ -1073,7 +1074,7 @@ export class BookingStateMachineService {
       result = await this.prisma.$transaction(run);
     }
 
-    // Trigger real-time Telegram notification if status transitioned to Action Required, Worker Error, Cancel, or Success
+    // Trigger real-time Telegram notification if status transitioned to Action Required, Worker Error, Cancel, Success, or any issue with captured screenshot
     const NOTIFY_STATUSES: BookingStatus[] = [
       BookingStatus.REQUIRES_HUMAN,
       BookingStatus.WORKER_ERROR,
@@ -1081,12 +1082,25 @@ export class BookingStateMachineService {
       BookingStatus.SUCCESS,
       BookingStatus.BOOKING_CONFIRMED,
       BookingStatus.COMPLETED,
+      BookingStatus.BOOKING_FAILED,
+      BookingStatus.FAILED,
+      BookingStatus.WISHLIST_MISMATCH,
     ];
+
+    const hasScreenshot = Boolean(
+      req.screenshot ||
+      (req.confirmationEvidence as any)?.screenshot ||
+      (result.booking?.confirmationEvidence as any)?.screenshot
+    );
+
+    const shouldNotify =
+      NOTIFY_STATUSES.includes(result.newStatus) ||
+      (hasScreenshot && result.newStatus !== BookingStatus.WATCHING && result.newStatus !== BookingStatus.PENDING);
 
     if (
       this.notificationsService &&
-      result.previousStatus !== result.newStatus &&
-      NOTIFY_STATUSES.includes(result.newStatus)
+      (result.previousStatus !== result.newStatus || hasScreenshot) &&
+      shouldNotify
     ) {
       this.notificationsService
         .sendTelegramBookingNotification({
@@ -1094,6 +1108,7 @@ export class BookingStateMachineService {
           bookingCode: result.booking?.bookingCode,
           status: result.newStatus,
           previousStatus: result.previousStatus,
+          screenshotUrl: req.screenshot || (req.confirmationEvidence as any)?.screenshot || (result.booking?.confirmationEvidence as any)?.screenshot,
           officialReference:
             req.officialBookingReference ||
             req.officialReference ||
