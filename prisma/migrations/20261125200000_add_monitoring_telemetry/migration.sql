@@ -43,11 +43,16 @@ CREATE TABLE IF NOT EXISTS "MonitoringPollEvent" (
     CONSTRAINT "MonitoringPollEvent_pkey" PRIMARY KEY ("id")
 );
 
--- 4. Foreign Keys for MonitoringPollEvent (with idempotent existence check)
+-- 4. Foreign Keys for MonitoringPollEvent (scoped to table and schema)
 DO $$
 BEGIN
     IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'MonitoringPollEvent_workerId_fkey'
+        SELECT 1 FROM pg_constraint c
+        JOIN pg_class t ON c.conrelid = t.oid
+        JOIN pg_namespace n ON t.relnamespace = n.oid
+        WHERE c.conname = 'MonitoringPollEvent_workerId_fkey'
+          AND t.relname = 'MonitoringPollEvent'
+          AND n.nspname = CURRENT_SCHEMA()
     ) THEN
         ALTER TABLE "MonitoringPollEvent" ADD CONSTRAINT "MonitoringPollEvent_workerId_fkey"
             FOREIGN KEY ("workerId") REFERENCES "WorkerMachine"("id") ON DELETE CASCADE ON UPDATE CASCADE;
@@ -57,7 +62,12 @@ END $$;
 DO $$
 BEGIN
     IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'MonitoringPollEvent_bookingRequestId_fkey'
+        SELECT 1 FROM pg_constraint c
+        JOIN pg_class t ON c.conrelid = t.oid
+        JOIN pg_namespace n ON t.relnamespace = n.oid
+        WHERE c.conname = 'MonitoringPollEvent_bookingRequestId_fkey'
+          AND t.relname = 'MonitoringPollEvent'
+          AND n.nspname = CURRENT_SCHEMA()
     ) THEN
         ALTER TABLE "MonitoringPollEvent" ADD CONSTRAINT "MonitoringPollEvent_bookingRequestId_fkey"
             FOREIGN KEY ("bookingRequestId") REFERENCES "BookingRequest"("id") ON DELETE CASCADE ON UPDATE CASCADE;
@@ -65,12 +75,23 @@ BEGIN
 END $$;
 
 -- 5. Unique Constraint: (workerId, workerSessionId, demandKey, pollSequence)
+-- Constraint name: 'MonitoringPollEvent_workerId_workerSessionId_demandKey_poll_key' (exactly 63 bytes)
 DO $$
 BEGIN
     IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'MonitoringPollEvent_workerId_workerSessionId_demandKey_pollSeque_key'
+        SELECT 1 FROM pg_constraint c
+        JOIN pg_class t ON c.conrelid = t.oid
+        JOIN pg_namespace n ON t.relnamespace = n.oid
+        WHERE c.conname = 'MonitoringPollEvent_workerId_workerSessionId_demandKey_poll_key'
+          AND t.relname = 'MonitoringPollEvent'
+          AND n.nspname = CURRENT_SCHEMA()
+    ) AND NOT EXISTS (
+        SELECT 1 FROM pg_class c
+        JOIN pg_namespace n ON c.relnamespace = n.oid
+        WHERE c.relname = 'MonitoringPollEvent_workerId_workerSessionId_demandKey_poll_key'
+          AND n.nspname = CURRENT_SCHEMA()
     ) THEN
-        ALTER TABLE "MonitoringPollEvent" ADD CONSTRAINT "MonitoringPollEvent_workerId_workerSessionId_demandKey_pollSeque_key"
+        ALTER TABLE "MonitoringPollEvent" ADD CONSTRAINT "MonitoringPollEvent_workerId_workerSessionId_demandKey_poll_key"
             UNIQUE ("workerId", "workerSessionId", "demandKey", "pollSequence");
     END IF;
 END $$;
