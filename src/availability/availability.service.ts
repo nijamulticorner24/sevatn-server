@@ -4,7 +4,7 @@ import { SmartMatcherService, AvailabilityEventPayload, MatchResult } from './sm
 import { AccountLockService } from './account-lock.service';
 import { DiscoverySchedulerService } from './discovery-scheduler.service';
 import { BookingStateMachineService } from '../bookings/booking-state-machine.service';
-import { BookingStatus } from '@prisma/client';
+import { BookingStatus, Prisma } from '@prisma/client';
 import { Interval } from '@nestjs/schedule';
 import { normalizeDemandKey } from '../common/utils/demand-key';
 import { CLAIMABLE_OPEN_REQUEST_STATUSES, isDateInPast } from '../common/booking-status.constants';
@@ -34,15 +34,21 @@ export class AvailabilityService {
   ) {}
 
   /**
-   * Retrieves the Date Demand Index: all dates and routes with active pending bookings.
-   * This is used by the Availability Discovery workers to know which dates to inspect.
-   * Integrates with DiscoverySchedule to provide intelligent throttling and distributed status.
+   * Retrieves the Date Demand Index: dates and routes with active pending bookings.
+   * If workerMachineId is provided, returns ONLY dates assigned to that specific worker machine.
+   * Preserves all dates, including multiple preferred/alternative dates if present.
    */
-  async getDemandDates(): Promise<DateDemandGroup[]> {
+  async getDemandDates(workerMachineId?: string): Promise<DateDemandGroup[]> {
+    const where: Prisma.BookingRequestWhereInput = {
+      status: { in: CLAIMABLE_OPEN_REQUEST_STATUSES },
+    };
+
+    if (workerMachineId) {
+      where.assignedMonitoringWorkerId = workerMachineId;
+    }
+
     const openBookings = await this.prisma.bookingRequest.findMany({
-      where: {
-        status: { in: CLAIMABLE_OPEN_REQUEST_STATUSES },
-      },
+      where,
       select: {
         id: true,
         bookingCode: true,
@@ -52,6 +58,7 @@ export class AvailabilityService {
         route: true,
         nextCheckAt: true,
         accountId: true,
+        preferences: true,
         jobs: {
           select: {
             id: true,
@@ -70,12 +77,6 @@ export class AvailabilityService {
       const activeJob = (b as any).jobs && (b as any).jobs.length > 0 ? (b as any).jobs[0] : null;
 
       const dateStr = b.requestedDateStr || (b.requestedDate instanceof Date ? b.requestedDate.toISOString().split('T')[0] : String(b.requestedDate).split('T')[0]);
-
-      // Evaluate skip reason codes
-      if (dateStr && isDateInPast(dateStr)) {
-        excludedRequests.push({ code: b.bookingCode, reason: 'PAST_DATE' });
-        continue;
-      }
 
       if (!b.route || b.route.trim().length === 0) {
         excludedRequests.push({ code: b.bookingCode, reason: 'ROUTE_MISMATCH' });
@@ -97,20 +98,37 @@ export class AvailabilityService {
         if (isLocked) {
           const lock = await this.prisma.accountLock.findFirst({ where: { accountId: b.accountId } });
           excludedRequests.push({ code: b.bookingCode, reason: `ACCOUNT_LOCKED_BY(${lock?.bookingId || 'unknown'})` });
-          // Note: still eligible for demand scan so when available, it can trigger
         }
       }
 
-      const key = normalizeDemandKey(dateStr, b.route);
-      const existing = map.get(key);
-      if (existing) {
-        existing.pendingCount++;
-      } else {
-        map.set(key, {
-          date: dateStr,
-          route: b.route,
-          pendingCount: 1,
-        });
+      // Collect all candidate dates for this booking request (including multi-dates in preferences)
+      const candidateDates: string[] = [dateStr].filter(Boolean);
+      const prefDates = (b.preferences as any)?.dates || (b.preferences as any)?.preferredDates || (b.preferences as any)?.alternativeDates;
+      if (Array.isArray(prefDates)) {
+        for (const pd of prefDates) {
+          if (typeof pd === 'string' && pd && !candidateDates.includes(pd)) {
+            candidateDates.push(pd);
+          }
+        }
+      }
+
+      for (const curDate of candidateDates) {
+        if (curDate && isDateInPast(curDate)) {
+          excludedRequests.push({ code: b.bookingCode, reason: 'PAST_DATE' });
+          continue;
+        }
+
+        const key = normalizeDemandKey(curDate, b.route);
+        const existing = map.get(key);
+        if (existing) {
+          existing.pendingCount++;
+        } else {
+          map.set(key, {
+            date: curDate,
+            route: b.route,
+            pendingCount: 1,
+          });
+        }
       }
     }
 

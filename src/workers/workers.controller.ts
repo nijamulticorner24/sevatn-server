@@ -8,6 +8,7 @@ import {
   Param,
   Query,
   UseGuards,
+  UnauthorizedException,
 } from '@nestjs/common';
 import { WorkersService } from './workers.service';
 import { SmartAllocatorService } from './smart-allocator.service';
@@ -25,6 +26,8 @@ import {
   UpdateWorkerCapacityDto,
   AllocationQueryDto,
   FailJobDto,
+  RecordPollEventsBatchDto,
+  WorkerStopDto,
 } from './dto/worker.dto';
 import { AuthorizePaymentDto } from './dto/authorize-payment.dto';
 import { Role } from '@prisma/client';
@@ -150,8 +153,11 @@ export class WorkersController {
    */
   @Get('pending-dates')
   @UseGuards(MachineAuthGuard)
-  async getPendingDates() {
-    return this.workersService.getPendingDates();
+  async getPendingDates(@CurrentMachine() machine: any) {
+    if (!machine || !machine.id) {
+      throw new UnauthorizedException('Valid worker machine authentication is required to access pending dates');
+    }
+    return this.workersService.getPendingDates(machine.id);
   }
 
   /**
@@ -345,6 +351,30 @@ export class WorkersController {
   @UseGuards(MachineAuthGuard)
   async handleHeartbeat(@CurrentMachine() machine: any, @Body() dto: HeartbeatDto) {
     return this.workersService.handleHeartbeat(machine.id, dto);
+  }
+
+  /**
+   * Worker records persistent availability refresh poll events
+   */
+  @Post('monitoring/poll-events')
+  @UseGuards(MachineAuthGuard)
+  async recordPollEvents(
+    @CurrentMachine() machine: any,
+    @Body() dto: RecordPollEventsBatchDto,
+  ) {
+    return this.workersService.recordPollEvents(machine.id, dto);
+  }
+
+  /**
+   * Worker explicit graceful shutdown notification
+   */
+  @Post('stop')
+  @UseGuards(MachineAuthGuard)
+  async handleWorkerStop(
+    @CurrentMachine() machine: any,
+    @Body() dto: WorkerStopDto,
+  ) {
+    return this.workersService.handleWorkerStop(machine.id, dto);
   }
 
   /**

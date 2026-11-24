@@ -952,6 +952,9 @@ export class BookingStateMachineService {
       if (req.targetStatus === BookingStatus.SUCCESS || req.targetStatus === BookingStatus.COMPLETED || req.targetStatus === BookingStatus.BOOKING_CONFIRMED) {
         updateData.completedAt = now;
         updateData.assignedMachineId = null;
+        updateData.assignedMonitoringWorkerId = null;
+        updateData.isWatching = false;
+        updateData.monitoringStoppedAt = now;
         updateData.leaseExpiresAt = null;
       }
 
@@ -962,6 +965,9 @@ export class BookingStateMachineService {
 
       if (isTerminalCancellationOrFailure) {
         updateData.assignedMachineId = null;
+        updateData.assignedMonitoringWorkerId = null;
+        updateData.isWatching = false;
+        updateData.monitoringStoppedAt = now;
         updateData.leaseExpiresAt = null;
         updateData.leaseStartedAt = null;
       }
@@ -1074,8 +1080,9 @@ export class BookingStateMachineService {
       result = await this.prisma.$transaction(run);
     }
 
-    // Trigger real-time Telegram notification if status transitioned to Action Required, Worker Error, Cancel, Success, or any issue with captured screenshot
+    // Trigger real-time Telegram notification if status transitioned to Action Required, Worker Error, Cancel, Success, Executing, Retryable Failure, or any issue with captured screenshot
     const NOTIFY_STATUSES: BookingStatus[] = [
+      BookingStatus.EXECUTING,
       BookingStatus.REQUIRES_HUMAN,
       BookingStatus.WORKER_ERROR,
       BookingStatus.CANCELLED,
@@ -1085,6 +1092,7 @@ export class BookingStateMachineService {
       BookingStatus.BOOKING_FAILED,
       BookingStatus.FAILED,
       BookingStatus.WISHLIST_MISMATCH,
+      BookingStatus.RETRYABLE_FAILURE,
     ];
 
     const hasScreenshot = Boolean(

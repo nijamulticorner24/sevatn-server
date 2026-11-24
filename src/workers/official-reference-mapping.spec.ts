@@ -144,7 +144,7 @@ describe('Official Booking Reference Mapping Regression Suite', () => {
         cartId: '1927413639',
         portalTransactionReference: '1927413639',
         officialReceiptReference: 'IVQ26103022183531421270',
-        confirmationEvidence: { modalFound: true, grandTotal: '🪙 0' },
+        confirmationEvidence: { modalFound: true, grandTotal: '₹ 0' },
         confirmedAt: '2026-10-30T16:48:45.302Z',
         leaseGeneration: 1,
         fencingToken: 'fnc_job-1_gen1',
@@ -160,7 +160,7 @@ describe('Official Booking Reference Mapping Regression Suite', () => {
       expect(mockBookingRequest.cartId).toBe('1927413639');
       expect(mockBookingRequest.portalTransactionReference).toBe('1927413639');
       expect(mockBookingRequest.officialReceiptReference).toBe('IVQ26103022183531421270');
-      expect(mockBookingRequest.confirmationEvidence).toEqual({ modalFound: true, grandTotal: '🪙 0' });
+      expect(mockBookingRequest.confirmationEvidence).toEqual({ modalFound: true, grandTotal: '₹ 0' });
     });
 
     it('customer notification receives authoritative IVQ reference as officialReference and Cart ID separately', async () => {

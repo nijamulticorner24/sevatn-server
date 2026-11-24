@@ -133,14 +133,14 @@ export class BookingsService {
       }
     }
 
-    // Verify user role & registered centre location: Strictly CENTRE role only
+    // Verify user role & registered centre location: Strictly CENTRE, DISTRIBUTOR, or SUPER_ADMIN
     const callingUser = await this.prisma.user.findUnique({
       where: { id: userId },
       select: { id: true, role: true, registeredLocation: true },
     });
-    if (!callingUser || (callingUser.role !== Role.CENTRE && callingUser.role !== Role.DISTRIBUTOR)) {
+    if (!callingUser || (callingUser.role !== Role.CENTRE && callingUser.role !== Role.DISTRIBUTOR && callingUser.role !== Role.SUPER_ADMIN)) {
       throw new ForbiddenException(
-        'Booking creation is exclusively restricted to registered and active Centre operators and Distributors.',
+        'Booking creation is exclusively restricted to registered and active Centre operators, Distributors, and Super Admins.',
       );
     }
 
@@ -178,7 +178,7 @@ export class BookingsService {
       if (!existingAccount) {
         throw new NotFoundException('Selected devotee account was not found.');
       }
-      if (existingAccount.userId !== userId) {
+      if (existingAccount.userId !== userId && callingUser.role !== Role.SUPER_ADMIN) {
         throw new ForbiddenException('You do not have permission to use this devotee account.');
       }
       if (existingAccount.status !== AccountStatus.VERIFIED) {
@@ -343,11 +343,30 @@ export class BookingsService {
 
     const result = await this.prisma.$transaction(async (tx) => {
       // 1. Verify and reserve funds from wallet
-      const wallet = await tx.wallet.findUnique({ where: { userId } });
+      let wallet = await tx.wallet.findUnique({ where: { userId } });
+      const userRecord = await tx.user.findUnique({ where: { id: userId }, select: { role: true } });
+      const isSuperAdmin = userRecord?.role === Role.SUPER_ADMIN;
 
-      if (!wallet || Number(wallet.availableBalance) < feeAmount) {
+      if (!wallet) {
+        wallet = await tx.wallet.create({
+          data: {
+            userId,
+            availableBalance: isSuperAdmin ? 100000 : 0,
+            reservedBalance: 0,
+          },
+        });
+      } else if (isSuperAdmin && Number(wallet.availableBalance) < feeAmount) {
+        wallet = await tx.wallet.update({
+          where: { userId },
+          data: {
+            availableBalance: 100000,
+          },
+        });
+      }
+
+      if (!isSuperAdmin && Number(wallet.availableBalance) < feeAmount) {
         throw new BadRequestException(
-          `Insufficient wallet balance. Required: 🪙 ${feeAmount} (🪙 ${unitPrice} × ${pilgrimCount} pilgrim${pilgrimCount > 1 ? 's' : ''}), Available: 🪙 ${wallet?.availableBalance || 0}`,
+          `Insufficient wallet balance. Required: ₹ ${feeAmount} (₹ ${unitPrice} × ${pilgrimCount} pilgrim${pilgrimCount > 1 ? 's' : ''}), Available: ₹ ${wallet?.availableBalance || 0}`,
         );
       }
 
@@ -687,6 +706,9 @@ export class BookingsService {
                     data: {
                       status: BookingStatus.CANCELLED,
                       assignedMachineId: null,
+                      assignedMonitoringWorkerId: null,
+                      isWatching: false,
+                      monitoringStoppedAt: cancelNow,
                       leaseExpiresAt: null,
                       leaseStartedAt: null,
                     },
@@ -698,6 +720,9 @@ export class BookingsService {
                 data: {
                   status: BookingStatus.CANCELLED,
                   assignedMachineId: null,
+                  assignedMonitoringWorkerId: null,
+                  isWatching: false,
+                  monitoringStoppedAt: cancelNow,
                   leaseExpiresAt: null,
                   leaseStartedAt: null,
                 },
@@ -826,7 +851,8 @@ export class BookingsService {
         include: {
           pilgrims: true,
           account: { select: { id: true, label: true, username: true, status: true } as any },
-          assignedMachine: { select: { machineCode: true, machineName: true, status: true } },
+          assignedMachine: { select: { id: true, machineCode: true, machineName: true, status: true, lastHeartbeat: true, stopReason: true, stoppedAt: true } },
+          monitoringWorker: { select: { id: true, machineCode: true, machineName: true, status: true, lastHeartbeat: true, stopReason: true, stoppedAt: true } },
           user: {
             select: {
               id: true,
@@ -857,6 +883,7 @@ export class BookingsService {
         pilgrims: true,
         account: { select: { id: true, label: true, username: true, status: true } as any },
         assignedMachine: true,
+        monitoringWorker: true,
         attempts: { orderBy: { startedAt: 'desc' } },
         jobs: { orderBy: { createdAt: 'desc' } },
         transactions: true,
@@ -1156,6 +1183,12 @@ export class BookingsService {
       ? Number(lastReserve.amount)
       : ((Number(booking.finalTicketPrice) || 20) * (booking.pilgrimCount || 1));
 
+    // Safely release any stale execution lock held by this account or booking
+    if (booking.accountId) {
+      await this.accountLockService.releaseLock(booking.accountId, booking.bookingCode);
+      await this.accountLockService.releaseLock(booking.accountId, booking.id);
+    }
+
     const now = new Date();
     const updated = await this.prisma.$transaction(async (tx) => {
       // If funds are not held (e.g. was cancelled and refunded), verify available balance and re-reserve
@@ -1163,7 +1196,7 @@ export class BookingsService {
         const wallet = await tx.wallet.findUnique({ where: { userId: booking.userId } });
         if (!wallet || Number(wallet.availableBalance) < feeAmount) {
           throw new BadRequestException(
-            `Insufficient wallet balance to restart booking #${booking.bookingCode}. Required: 🪙 ${feeAmount}, Available: 🪙 ${wallet?.availableBalance || 0}`,
+            `Insufficient wallet balance to restart booking #${booking.bookingCode}. Required: ₹ ${feeAmount}, Available: ₹ ${wallet?.availableBalance || 0}`,
           );
         }
 
@@ -1217,7 +1250,7 @@ export class BookingsService {
         }
       }
 
-      // Transition booking back to PENDING (or QUEUED)
+      // Transition booking back to PENDING (monitoring state)
       const transitionRes = await this.stateMachine.transition(
         {
           bookingId: id,
@@ -1225,45 +1258,44 @@ export class BookingsService {
           targetExecutionStatus: 'IDLE',
           targetFinancialStatus: 'RESERVED' as any,
           expectedVersion: booking.version,
-          note: `Restarted by ${user.role} (${user.email || user.username || user.id})`,
+          note: `Restarted by ${user.role} (${user.email || user.username || user.id}) - entered availability monitoring`,
           force: true,
         },
         tx,
       );
 
-      // Clear previous worker/error states on bookingRequest
+      // Clear previous worker execution states, error states, and reset monitoring cycle on bookingRequest
       await tx.bookingRequest.update({
         where: { id },
         data: {
           assignedMachineId: null,
+          assignedMonitoringWorkerId: null,
+          monitoringAssignedAt: null,
+          monitoringLeaseExpiresAt: null,
+          isWatching: false,
+          leaseExpiresAt: null,
+          leaseStartedAt: null,
           failureReason: null,
           requiresHumanNote: null,
+          lastRefreshResult: null,
+          totalRefreshCount: 0,
+          nextCheckAt: null,
+          selectedTime: null,
         },
       });
 
-      // Authoritative reset/requeue of BookingJob (strictly 1:1 with bookingRequestId)
-      await tx.bookingJob.upsert({
+      // Safely cancel any previous in-flight or non-terminal BookingJob to prevent premature execution
+      // CRITICAL: Do NOT create or claim a booking execution job just because Restart was clicked.
+      // Execution job will only be created when date availability is confirmed AVAILABLE by monitoring.
+      await tx.bookingJob.updateMany({
         where: {
           bookingRequestId: booking.id,
+          status: {
+            notIn: [BookingStatus.SUCCESS, BookingStatus.COMPLETED, BookingStatus.CANCELLED],
+          },
         },
-        create: {
-          jobType: JobType.BOOKING_EXECUTION,
-          bookingRequestId: booking.id,
-          accountId: booking.accountId || null,
-          status: BookingStatus.QUEUED,
-          workerId: null,
-          leaseExpiresAt: null,
-          leaseGeneration: 0,
-          leaseId: null,
-          fencingToken: null,
-          errorCode: null,
-          errorMessage: null,
-          attempt: 0,
-        },
-        update: {
-          jobType: JobType.BOOKING_EXECUTION,
-          accountId: booking.accountId || null,
-          status: BookingStatus.QUEUED,
+        data: {
+          status: BookingStatus.CANCELLED,
           workerId: null,
           leaseExpiresAt: null,
           leaseGeneration: { increment: 1 },
@@ -1271,25 +1303,44 @@ export class BookingsService {
           fencingToken: null,
           errorCode: null,
           errorMessage: null,
-          attempt: 0,
-          completedAt: null,
+          completedAt: now,
         },
       });
 
       return transitionRes.booking;
     });
 
+    // Assign the request to an eligible worker according to its monitoring capacity
+    if (this.smartAllocator) {
+      try {
+        await this.smartAllocator.runMonitoringAllocationSweep();
+      } catch (allocErr: any) {
+        this.logger.warn(`[BOOKING RESTART] Allocation sweep notice for #${booking.bookingCode}: ${allocErr?.message || allocErr}`);
+      }
+    }
+
+    // Fetch updated booking with monitoring worker relation populated
+    const freshBooking = await this.prisma.bookingRequest.findUnique({
+      where: { id },
+      include: {
+        assignedMachine: { select: { id: true, machineCode: true, machineName: true, status: true } },
+        monitoringWorker: { select: { id: true, machineCode: true, machineName: true, status: true } },
+      },
+    });
+
     this.eventsGateway.notifyBookingUpdated(booking.id, booking.userId, {
       bookingId: booking.id,
       bookingCode: booking.bookingCode,
-      status: BookingStatus.PENDING,
+      status: freshBooking?.status || BookingStatus.PENDING,
+      assignedMonitoringWorkerId: freshBooking?.assignedMonitoringWorkerId || null,
+      monitoringWorker: freshBooking?.monitoringWorker || null,
     });
 
-    this.logger.log(`[BOOKING RESTART] Booking #${booking.bookingCode} restarted and returned to active queue by ${user.role}`);
+    this.logger.log(`[BOOKING RESTART] Booking #${booking.bookingCode} restarted and entered availability monitoring by ${user.role}`);
 
     return {
-      message: `Booking #${booking.bookingCode} restarted successfully and returned to queue`,
-      booking: updated,
+      message: `Booking #${booking.bookingCode} restarted successfully and entered availability monitoring`,
+      booking: freshBooking || updated,
     };
   }
 

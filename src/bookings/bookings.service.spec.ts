@@ -11,7 +11,7 @@ import { EventsGateway } from '../events/events.gateway';
 import { BookingStateMachineService } from './booking-state-machine.service';
 import { SmartAllocatorService } from '../workers/smart-allocator.service';
 import { TicketPricingService } from '../pricing/ticket-pricing.service';
-import { BookingStatus, JobType, AccountStatus } from '@prisma/client';
+import { BookingStatus, JobType, AccountStatus, Role } from '@prisma/client';
 
 describe('BookingsService - Booking Readiness & Queue Protection', () => {
   let bookingsService: BookingsService;
@@ -75,6 +75,7 @@ describe('BookingsService - Booking Readiness & Queue Protection', () => {
       },
       availabilityOpportunity: {
         findFirst: jest.fn().mockResolvedValue(null),
+        findMany: jest.fn().mockResolvedValue([]),
         update: jest.fn().mockResolvedValue({}),
       },
       bookingJob: {
@@ -95,6 +96,7 @@ describe('BookingsService - Booking Readiness & Queue Protection', () => {
       walletTransaction: {
         findUnique: jest.fn().mockResolvedValue(null),
         findFirst: jest.fn().mockResolvedValue(null),
+        findMany: jest.fn().mockResolvedValue([]),
         create: jest.fn().mockResolvedValue({ id: 'tx-1' }),
       },
       $transaction: jest.fn().mockImplementation(async (callback) => {
@@ -150,7 +152,12 @@ describe('BookingsService - Booking Readiness & Queue Protection', () => {
         { provide: PrismaService, useValue: mockPrisma },
         { provide: WalletService, useValue: mockWalletService },
         { provide: AuditService, useValue: mockAudit },
-        { provide: NotificationsService, useValue: {} },
+        {
+          provide: NotificationsService,
+          useValue: {
+            sendTelegramBookingNotification: jest.fn().mockResolvedValue(true),
+          },
+        },
         { provide: SmartMatcherService, useValue: {} },
         { provide: AccountLockService, useValue: mockAccountLockService },
         { provide: EventsGateway, useValue: mockEventsGateway },
@@ -247,7 +254,7 @@ describe('BookingsService - Booking Readiness & Queue Protection', () => {
     });
 
     it('TEST 5B: Calculates pricing based on serviceFee * pilgrimCount and enforces max 5 pilgrims', async () => {
-      // 2 pilgrims = 🪙 40 fee
+      // 2 pilgrims = ₹ 40 fee
       const dto2: any = {
         ...validDto,
         pilgrimCount: 2,
@@ -391,13 +398,15 @@ describe('BookingsService - Booking Readiness & Queue Protection', () => {
     });
 
     it('TEST 10: When slot IS available immediately, transitions to EXECUTION_QUEUED and creates BOOKING_EXECUTION job', async () => {
-      mockPrisma.availabilityOpportunity.findFirst.mockResolvedValueOnce({
-        id: 'opp-available-1',
-        date: '2026-11-20',
-        route: 'Pamba',
-        timeSlot: '08:00-09:00',
-        status: 'AVAILABLE',
-      });
+      mockPrisma.availabilityOpportunity.findMany.mockResolvedValueOnce([
+        {
+          id: 'opp-available-1',
+          date: '2026-11-20',
+          route: 'Pamba (Regular Footpath Route)',
+          timeSlot: '08:00-09:00',
+          status: 'AVAILABLE',
+        },
+      ]);
 
       const result = await bookingsService.createBooking('user-1', validDto);
 
@@ -491,10 +500,14 @@ describe('BookingsService - Booking Readiness & Queue Protection', () => {
           status: BookingStatus.PENDING,
         },
       ]);
-      mockPrisma.walletTransaction.findFirst.mockResolvedValueOnce({
-        id: 'tx-res-1',
-        amount: 20,
-      });
+      mockPrisma.walletTransaction.findMany = jest.fn().mockResolvedValue([
+        {
+          id: 'tx-res-1',
+          amount: 20,
+          type: 'RESERVE',
+          status: 'COMPLETED',
+        },
+      ]);
       mockPrisma.bookingJob.updateMany = jest.fn().mockResolvedValue({ count: 1 });
 
       const res = await bookingsService.autoCancelPastPendingBookings('user-1');
@@ -511,14 +524,33 @@ describe('BookingsService - Booking Readiness & Queue Protection', () => {
         version: 1,
         status: BookingStatus.PENDING,
       });
-      mockPrisma.walletTransaction.findFirst.mockResolvedValueOnce({
-        id: 'tx-res-2',
-        amount: 20,
-      });
+      mockPrisma.walletTransaction.findMany = jest.fn().mockResolvedValue([
+        {
+          id: 'tx-res-2',
+          amount: 20,
+          type: 'RESERVE',
+          status: 'COMPLETED',
+        },
+      ]);
       mockPrisma.bookingJob.updateMany = jest.fn().mockResolvedValue({ count: 1 });
 
       const cancelRes = await bookingsService.cancelBooking('booking-cancel-1', { id: 'user-1', role: 'CENTRE' });
       expect(cancelRes.message).toContain('Booking cancelled and funds released');
+    });
+
+    it('TEST 16: Super Admin can create booking successfully without Centre restriction or wallet holds block', async () => {
+      mockPrisma.user.findUnique.mockResolvedValueOnce({
+        id: 'super-admin-user',
+        role: Role.SUPER_ADMIN,
+        registeredLocation: null,
+      });
+
+      const res = await bookingsService.createBooking('super-admin-user', {
+        ...validDto,
+        requestedDate: '2026-11-28',
+      });
+      expect(res).toBeDefined();
+      expect(res.bookingCode).toBeDefined();
     });
   });
 });

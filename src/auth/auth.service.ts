@@ -271,7 +271,7 @@ export class AuthService {
         },
       });
 
-      // Initialize Wallet (Balance: 🪙 0)
+      // Initialize Wallet (Balance: ₹ 0)
       const wallet = await tx.wallet.create({
         data: {
           userId: user.id,
@@ -343,7 +343,7 @@ export class AuthService {
     });
 
     return {
-      message: 'Registration submitted successfully. Please complete the 🪙 249 centre onboarding fee.',
+      message: 'Registration submitted successfully. Please complete the ₹ 249 centre onboarding fee.',
       userId: result.user.id,
       email: result.user.email,
       centreCode: result.centre.centreCode,

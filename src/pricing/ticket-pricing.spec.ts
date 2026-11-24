@@ -58,7 +58,7 @@ describe('TicketPricingService - Three-Level Markup Engine', () => {
   });
 
   describe('Pricing Calculations & Formula Invariants', () => {
-    it('Case 1: Base 🪙 10 + Partner 🪙 0 + Distributor 🪙 0 = Final 🪙 10', async () => {
+    it('Case 1: Base ₹ 10 + Partner ₹ 0 + Distributor ₹ 0 = Final ₹ 10', async () => {
       prisma.user.findUnique.mockResolvedValue({
         id: 'user-centre-1',
         partner: { id: 'p-1', markup: new Prisma.Decimal(0) },
@@ -77,7 +77,7 @@ describe('TicketPricingService - Three-Level Markup Engine', () => {
       expect(result.totalTicketAmount).toBe(10);
     });
 
-    it('Case 2: Base 🪙 10 + Partner 🪙 1 + Distributor 🪙 0 = Final 🪙 11', async () => {
+    it('Case 2: Base ₹ 10 + Partner ₹ 1 + Distributor ₹ 0 = Final ₹ 11', async () => {
       prisma.user.findUnique.mockResolvedValue({
         id: 'user-centre-2',
         partner: { id: 'p-1', markup: new Prisma.Decimal(1) },
@@ -96,7 +96,7 @@ describe('TicketPricingService - Three-Level Markup Engine', () => {
       expect(result.totalTicketAmount).toBe(11);
     });
 
-    it('Case 3: Base 🪙 10 + Partner 🪙 2 + Distributor 🪙 1 = Final 🪙 13', async () => {
+    it('Case 3: Base ₹ 10 + Partner ₹ 2 + Distributor ₹ 1 = Final ₹ 13', async () => {
       prisma.user.findUnique.mockResolvedValue({
         id: 'user-centre-3',
         partner: { id: 'p-1', markup: new Prisma.Decimal(2) },
@@ -115,7 +115,7 @@ describe('TicketPricingService - Three-Level Markup Engine', () => {
       expect(result.totalTicketAmount).toBe(13);
     });
 
-    it('Case 4: Base 🪙 10 + Partner 🪙 2 + Distributor 🪙 2 = Final 🪙 14', async () => {
+    it('Case 4: Base ₹ 10 + Partner ₹ 2 + Distributor ₹ 2 = Final ₹ 14', async () => {
       prisma.user.findUnique.mockResolvedValue({
         id: 'user-centre-4',
         partner: { id: 'p-1', markup: new Prisma.Decimal(2) },
@@ -134,7 +134,7 @@ describe('TicketPricingService - Three-Level Markup Engine', () => {
       expect(result.totalTicketAmount).toBe(14);
     });
 
-    it('Quantity Multiplication: Quantity 3 at 🪙 14 produces 🪙 42 total', async () => {
+    it('Quantity Multiplication: Quantity 3 at ₹ 14 produces ₹ 42 total', async () => {
       prisma.user.findUnique.mockResolvedValue({
         id: 'user-centre-mult',
         partner: { id: 'p-1', markup: new Prisma.Decimal(2) },
@@ -177,7 +177,7 @@ describe('TicketPricingService - Three-Level Markup Engine', () => {
   });
 
   describe('Markup Boundary & Limit Enforcement', () => {
-    it('Partner markup above 🪙 2 is strictly rejected', async () => {
+    it('Partner markup above ₹ 2 is strictly rejected', async () => {
       prisma.partner.findUnique.mockResolvedValue({
         id: 'p-1',
         markup: new Prisma.Decimal(0),
@@ -194,7 +194,7 @@ describe('TicketPricingService - Three-Level Markup Engine', () => {
       ).rejects.toThrow(BadRequestException);
     });
 
-    it('Distributor markup above 🪙 2 is strictly rejected', async () => {
+    it('Distributor markup above ₹ 2 is strictly rejected', async () => {
       prisma.distributor.findUnique.mockResolvedValue({
         id: 'd-1',
         markup: new Prisma.Decimal(0),

@@ -195,4 +195,19 @@ export class AdminController {
   ) {
     return this.adminService.completeWithReference(id, officialReference, adminUser);
   }
+
+  @Post('fleet/bookings/:id/pin')
+  @Roles(Role.SUPER_ADMIN)
+  async pinBookingToWorker(
+    @Param('id') bookingId: string,
+    @Body('workerMachineId') workerMachineId?: string | null,
+  ) {
+    return this.adminService.pinBookingToWorker(bookingId, workerMachineId || null);
+  }
+
+  @Get('fleet/monitoring-status')
+  @Roles(Role.SUPER_ADMIN)
+  async getFleetMonitoringStatus() {
+    return this.adminService.getFleetMonitoringStatus();
+  }
 }

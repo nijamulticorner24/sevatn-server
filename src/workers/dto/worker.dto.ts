@@ -122,6 +122,11 @@ export class HeartbeatDto {
 
   @IsOptional()
   @IsNumber()
+  @Min(0)
+  browserContextCount?: number;
+
+  @IsOptional()
+  @IsNumber()
   @Min(1)
   @Max(20)
   maxConcurrentJobs?: number;
@@ -133,6 +138,12 @@ export class UpdateWorkerCapacityDto {
   @Min(1)
   @Max(20)
   maxConcurrentJobs?: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(1)
+  @Max(100)
+  maxMonitoringRequests?: number;
 
   @IsOptional()
   @IsString()
@@ -394,3 +405,62 @@ export class FailJobDto {
   @IsString()
   protocolVersion?: string;
 }
+
+export class RecordPollEventDto {
+  @IsString()
+  @IsNotEmpty()
+  demandKey: string;
+
+  @IsString()
+  @IsNotEmpty()
+  date: string;
+
+  @IsString()
+  @IsNotEmpty()
+  route: string;
+
+  @IsNumber()
+  @Min(0)
+  pollSeq: number;
+
+  @IsOptional()
+  @IsString()
+  workerSessionId?: string;
+
+  @IsString()
+  @IsNotEmpty()
+  state: string;
+
+  @IsOptional()
+  @IsNumber()
+  durationMs?: number;
+
+  @IsOptional()
+  @IsString()
+  errorMessage?: string;
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  bookingRequestIds?: string[];
+}
+
+export class RecordPollEventsBatchDto {
+  @IsString()
+  @IsNotEmpty()
+  workerSessionId: string;
+
+  @IsArray()
+  events: RecordPollEventDto[];
+}
+
+export class WorkerStopDto {
+  @IsOptional()
+  @IsString()
+  reason?: string;
+
+  @IsOptional()
+  @IsString()
+  workerSessionId?: string;
+}
+

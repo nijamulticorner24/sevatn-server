@@ -79,7 +79,7 @@ export class WalletService {
         // Zero active bookings, but wallet has reservedBalance > 0! All holds are orphaned from cancelled bookings.
         const orphanedAmount = Number(wallet.reservedBalance);
         this.logger.log(
-          `[WALLET RECONCILE] User ${userId} has 0 active bookings but 🪙 ${orphanedAmount} reserved. Auto-releasing orphaned holds.`,
+          `[WALLET RECONCILE] User ${userId} has 0 active bookings but ₹ ${orphanedAmount} reserved. Auto-releasing orphaned holds.`,
         );
 
         await this.prisma.$transaction(async (tx) => {
@@ -141,7 +141,7 @@ export class WalletService {
     } = dto;
 
     if (!amount || amount < 100) {
-      throw new BadRequestException('Topup amount must be at least 🪙 100');
+      throw new BadRequestException('Topup amount must be at least ₹ 100');
     }
 
     const cleanRef =
@@ -508,7 +508,7 @@ export class WalletService {
 
       if (Number(wallet.availableBalance) < amount) {
         throw new BadRequestException(
-          `Insufficient available balance. Required: 🪙 ${amount}, Available: 🪙 ${wallet.availableBalance}`,
+          `Insufficient available balance. Required: ₹ ${amount}, Available: ₹ ${wallet.availableBalance}`,
         );
       }
 
@@ -583,7 +583,7 @@ export class WalletService {
   }
 
   /**
-   * CAPTURE: Finalize charge on verified booking success with 🪙 80/🪙 20 revenue split
+   * CAPTURE: Finalize charge on verified booking success with ₹ 80/₹ 20 revenue split
    */
   async capture(dto: CaptureFundsDto, txClient?: Prisma.TransactionClient) {
     const { userId, bookingId, amount, workerMachineId, idempotencyKey } = dto;

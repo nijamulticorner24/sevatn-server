@@ -84,11 +84,13 @@ export class SmartAllocatorService {
    * 1. Safely recover stale/expired worker leases back to queue.
    * 2. Sweep queued pending jobs and assign to eligible idle workers.
    */
-  @Interval(30000)
+  @Interval(10000)
   async handlePeriodicAllocationAndRecovery() {
     try {
       await this.recoverStaleLeases();
       await this.runAllocationSweep();
+      await this.recoverStaleMonitoringLeases();
+      await this.runMonitoringAllocationSweep();
     } catch (err: any) {
       this.logger.warn(`Periodic allocator background sweep notice: ${err?.message || err}`);
     }
@@ -1090,6 +1092,7 @@ export class SmartAllocatorService {
                   currentJobId: null,
                   currentBookingId: null,
                   currentActivity: 'IDLE',
+                  activityDetails: 'Idle, waiting for assignments',
                 }
               : {}),
           },
@@ -1707,11 +1710,14 @@ export class SmartAllocatorService {
 
   /**
    * Updates worker capacity and deployment configuration by admin.
+   * Supports dynamic monitoring capacity (maxMonitoringRequests) independently of execution concurrency.
+   * Gracefully drains if capacity is lowered below active assignments; triggers proactive allocation on upscale.
    */
   async updateWorkerCapacity(
     workerId: string,
     dto: {
       maxConcurrentJobs?: number;
+      maxMonitoringRequests?: number;
       deploymentType?: string;
       capabilities?: string[];
       adminStatus?: string;
@@ -1724,10 +1730,25 @@ export class SmartAllocatorService {
       throw new NotFoundException(`Worker machine ${workerId} not found`);
     }
 
+    const currentAssigned = typeof this.prisma.bookingRequest?.count === 'function'
+      ? await this.prisma.bookingRequest.count({
+          where: {
+            assignedMonitoringWorkerId: workerId,
+            status: { in: [BookingStatus.PENDING, BookingStatus.WATCHING, BookingStatus.WAITING_FOR_DATE_AVAILABILITY, BookingStatus.FAST_BOOKING_QUEUED] },
+          },
+        })
+      : 0;
+
+    const targetMonitoringCap = dto.maxMonitoringRequests !== undefined ? dto.maxMonitoringRequests : worker.maxMonitoringRequests;
+    const isDraining = targetMonitoringCap < currentAssigned;
+
     const updated = await this.prisma.workerMachine.update({
       where: { id: workerId },
       data: {
         maxConcurrentJobs: dto.maxConcurrentJobs !== undefined ? dto.maxConcurrentJobs : undefined,
+        maxMonitoringRequests: dto.maxMonitoringRequests !== undefined ? dto.maxMonitoringRequests : undefined,
+        currentAssignedMonitoring: currentAssigned,
+        monitoringDraining: isDraining,
         deploymentType: dto.deploymentType || undefined,
         capabilities: dto.capabilities || undefined,
         adminStatus: dto.adminStatus || undefined,
@@ -1735,10 +1756,221 @@ export class SmartAllocatorService {
     });
 
     this.logger.log(
-      `Worker ${worker.machineCode} capacity updated: max=${updated.maxConcurrentJobs}, deployment=${updated.deploymentType}`,
+      `Worker ${worker.machineCode} capacity updated: maxConcurrentJobs=${updated.maxConcurrentJobs}, maxMonitoringRequests=${updated.maxMonitoringRequests}, assigned=${currentAssigned}, draining=${isDraining}`,
     );
 
+    // If monitoring capacity was increased, immediately trigger proactive allocation sweep to drain pending queue
+    if (dto.maxMonitoringRequests !== undefined && dto.maxMonitoringRequests > worker.maxMonitoringRequests) {
+      setImmediate(() => {
+        this.runMonitoringAllocationSweep().catch((err) => {
+          this.logger.warn(`Post-capacity update monitoring sweep notice: ${err?.message || err}`);
+        });
+      });
+    }
+
     return updated;
+  }
+
+  private isMonitoringSweepRunning = false;
+
+  /**
+   * Periodic & Event-Driven Authoritative Monitoring Allocation Engine
+   * Allocates unassigned PENDING/WATCHING requests across healthy workers
+   * according to their independently configured maxMonitoringRequests.
+   * Concurrency-safe: uses row-level locking (FOR UPDATE SKIP LOCKED) within a transaction.
+   */
+  async runMonitoringAllocationSweep(): Promise<{ allocatedCount: number; pendingCount: number }> {
+    if (this.isMonitoringSweepRunning) {
+      return { allocatedCount: 0, pendingCount: 0 };
+    }
+    this.isMonitoringSweepRunning = true;
+
+    try {
+      const now = new Date();
+      const healthyCutoff = new Date(now.getTime() - 35000); // 35 seconds heartbeat freshness
+
+      // 1. Fetch eligible online workers ordered by priority: Cloud (DOCKER/CLOUD_VM) first, then Local (LOCAL_PC)
+      const workers = await this.prisma.workerMachine.findMany({
+        where: {
+          status: WorkerStatus.ONLINE,
+          active: true,
+          adminStatus: { notIn: ['REVOKED', 'RETIRED', 'PAUSED', 'DISABLED'] },
+          desiredState: 'RUNNING',
+          lastHeartbeat: { gte: healthyCutoff },
+        },
+        orderBy: [
+          { deploymentType: 'asc' }, // CLOUD_VM/DOCKER sorts before LOCAL_PC
+          { createdAt: 'asc' },
+        ],
+      });
+
+      let totalAllocated = 0;
+
+      for (const worker of workers) {
+        // Resource-aware throttling: skip if CPU or Memory is saturated (> 85%)
+        if ((worker.cpuUsage && worker.cpuUsage > 85) || (worker.memoryUsage && worker.memoryUsage > 85)) {
+          await this.prisma.workerMachine.update({
+            where: { id: worker.id },
+            data: { resourceWarning: true },
+          }).catch(() => {});
+          this.logger.warn(
+            `[MONITORING ALLOCATOR] Skipping worker ${worker.machineCode} due to resource saturation (CPU: ${worker.cpuUsage}%, Mem: ${worker.memoryUsage}%)`
+          );
+          continue;
+        } else if (worker.resourceWarning) {
+          await this.prisma.workerMachine.update({
+            where: { id: worker.id },
+            data: { resourceWarning: false },
+          }).catch(() => {});
+        }
+
+        // Count current active assignments for this worker
+        const currentAssigned = await this.prisma.bookingRequest.count({
+          where: {
+            assignedMonitoringWorkerId: worker.id,
+            status: { in: [BookingStatus.PENDING, BookingStatus.WATCHING, BookingStatus.WAITING_FOR_DATE_AVAILABILITY, BookingStatus.FAST_BOOKING_QUEUED] },
+          },
+        });
+
+        const maxCap = worker.maxMonitoringRequests ?? 10;
+        const freeSlots = Math.max(0, maxCap - currentAssigned);
+        const isDraining = currentAssigned > maxCap;
+
+        // Keep cached counters in sync
+        if (worker.currentAssignedMonitoring !== currentAssigned || worker.monitoringDraining !== isDraining) {
+          await this.prisma.workerMachine.update({
+            where: { id: worker.id },
+            data: {
+              currentAssignedMonitoring: currentAssigned,
+              monitoringDraining: isDraining,
+            },
+          }).catch(() => {});
+        }
+
+        if (freeSlots <= 0) {
+          continue; // Worker is full or draining
+        }
+
+        // Concurrency-safe atomic claim using raw SQL row locking (FOR UPDATE SKIP LOCKED)
+        const candidates = await this.prisma.$queryRaw<Array<{ id: string }>>`
+          SELECT id FROM "BookingRequest"
+          WHERE "status" IN ('PENDING', 'WATCHING', 'FAST_BOOKING_QUEUED')
+            AND "assignedMonitoringWorkerId" IS NULL
+            AND "isManuallyAssigned" = false
+          ORDER BY "createdAt" ASC
+          LIMIT ${freeSlots}
+          FOR UPDATE SKIP LOCKED
+        `;
+
+        if (!candidates || candidates.length === 0) {
+          continue;
+        }
+
+        const candidateIds = candidates.map((c) => c.id);
+        const leaseExpiry = new Date(now.getTime() + 60000); // 60s fencing lease
+
+        const updateResult = await this.prisma.bookingRequest.updateMany({
+          where: {
+            id: { in: candidateIds },
+            assignedMonitoringWorkerId: null, // Double CAS barrier
+          },
+          data: {
+            assignedMonitoringWorkerId: worker.id,
+            monitoringAssignedAt: now,
+            monitoringLeaseExpiresAt: leaseExpiry,
+            status: BookingStatus.WATCHING,
+            isWatching: true,
+          },
+        });
+
+        totalAllocated += updateResult.count;
+
+        await this.prisma.workerMachine.update({
+          where: { id: worker.id },
+          data: {
+            currentAssignedMonitoring: currentAssigned + updateResult.count,
+          },
+        }).catch(() => {});
+
+        this.logger.log(
+          `[MONITORING ALLOCATOR] Assigned ${updateResult.count} requests to ${worker.machineCode} (${worker.deploymentType}). New Load: ${currentAssigned + updateResult.count}/${maxCap}`
+        );
+      }
+
+      // Count unassigned pending monitoring requests in central queue
+      const pendingCount = await this.prisma.bookingRequest.count({
+        where: {
+          status: { in: [BookingStatus.PENDING, BookingStatus.WATCHING, BookingStatus.FAST_BOOKING_QUEUED] },
+          assignedMonitoringWorkerId: null,
+        },
+      });
+
+      return { allocatedCount: totalAllocated, pendingCount };
+    } catch (err: any) {
+      this.logger.error(`[MONITORING ALLOCATOR] Sweep error: ${err?.message || err}`);
+      return { allocatedCount: 0, pendingCount: 0 };
+    } finally {
+      this.isMonitoringSweepRunning = false;
+    }
+  }
+
+  /**
+   * Safely recovers stale monitoring leases when a worker goes offline or stops sending heartbeats.
+   * Does NOT cancel requests; returns them cleanly to central queue for reallocation.
+   */
+  async recoverStaleMonitoringLeases(): Promise<{ recoveredCount: number }> {
+    try {
+      const now = new Date();
+      const deadCutoff = new Date(now.getTime() - 45000); // 45s offline threshold
+
+      // Find workers that are offline or haven't sent a heartbeat in > 45s
+      const deadWorkers = await this.prisma.workerMachine.findMany({
+        where: {
+          OR: [
+            { status: WorkerStatus.OFFLINE },
+            { status: WorkerStatus.ERROR },
+            { lastHeartbeat: { lt: deadCutoff } },
+            { lastHeartbeat: null },
+          ],
+        },
+        select: { id: true, machineCode: true },
+      });
+
+      const deadWorkerIds = deadWorkers.map((w) => w.id);
+
+      // Reclaim unpinned requests assigned to dead workers OR with expired lease
+      const updateResult = await this.prisma.bookingRequest.updateMany({
+        where: {
+          isManuallyAssigned: false,
+          status: { in: [BookingStatus.PENDING, BookingStatus.WATCHING, BookingStatus.WAITING_FOR_DATE_AVAILABILITY, BookingStatus.FAST_BOOKING_QUEUED] },
+          OR: [
+            ...(deadWorkerIds.length > 0 ? [{ assignedMonitoringWorkerId: { in: deadWorkerIds } }] : []),
+            {
+              monitoringLeaseExpiresAt: { lt: now },
+              assignedMonitoringWorkerId: { not: null },
+            },
+          ],
+        },
+        data: {
+          assignedMonitoringWorkerId: null,
+          monitoringAssignedAt: null,
+          monitoringLeaseExpiresAt: null,
+        },
+      });
+
+      if (updateResult.count > 0) {
+        this.logger.warn(`[MONITORING RECOVERY] Recovered ${updateResult.count} orphaned monitoring requests back to central queue.`);
+        // Immediately sweep to assign them to surviving healthy workers
+        setImmediate(() => {
+          this.runMonitoringAllocationSweep().catch(() => {});
+        });
+      }
+
+      return { recoveredCount: updateResult.count };
+    } catch (err: any) {
+      this.logger.error(`[MONITORING RECOVERY] Error recovering stale monitoring leases: ${err?.message || err}`);
+      return { recoveredCount: 0 };
+    }
   }
 }
 

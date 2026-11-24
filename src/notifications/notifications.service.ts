@@ -14,6 +14,8 @@ export interface SendNotificationDto {
 @Injectable()
 export class NotificationsService {
   private readonly logger = new Logger(NotificationsService.name);
+  private readonly dedupAlertCache = new Map<string, number>();
+  private readonly DEDUP_COOLDOWN_MS = 60 * 1000; // 60s cooldown for identical alerts
 
   constructor(private prisma: PrismaService) {}
 
@@ -113,7 +115,7 @@ export class NotificationsService {
 
       const title = typeTitles[payload.paymentType] || payload.paymentType;
       const refStr = payload.paymentReference || 'RECEIPT_PROOF_ATTACHED';
-      const formattedAmount = `🪙 ${Number(payload.amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
+      const formattedAmount = `₹ ${Number(payload.amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
       const timeStr = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
 
       let header = '<b>🔔 New Payment Submitted • Verification Required</b>';
@@ -266,7 +268,7 @@ export class NotificationsService {
       }
 
       const timeStr = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-      const formatCurr = (n: number) => `🪙 ${Number(n).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
+      const formatCurr = (n: number) => `₹ ${Number(n).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
 
       const lines = [
         `<b>📋 Financial Ledger • Pending Action Items Alert</b>`,
@@ -396,10 +398,41 @@ export class NotificationsService {
 
       const normalizedStatus = String(payload.status).toUpperCase();
 
+      // Deduplicate alerts to avoid spamming the admin on repeated polling failures
+      const dedupKey = `booking:${payload.bookingId}:${normalizedStatus}:${(bookingData.failureReason || bookingData.note || '').slice(0, 40)}`;
+      const nowTs = Date.now();
+      const lastSent = this.dedupAlertCache.get(dedupKey);
+      if (lastSent && (nowTs - lastSent < this.DEDUP_COOLDOWN_MS)) {
+        this.logger.log(`[Telegram Bot] Deduplicating repeated booking alert for #${bookingCode} (${normalizedStatus})`);
+        return { skipped: true, reason: 'Deduplicated duplicate alert' };
+      }
+      this.dedupAlertCache.set(dedupKey, nowTs);
+
       if (payload.isNew || normalizedStatus === 'NEW_BOOKING' || (normalizedStatus === 'NEW' && payload.isNew)) {
         header = '<b>🆕 NEW BOOKING RECEIVED • Central Booking Queue</b>';
         statusLabel = 'New Booking Queued';
         detailsLine = `📥 <b>Queue Status:</b> Received &amp; queued for Sabarimala slot discovery and auto-dispatch.`;
+      } else if (normalizedStatus === 'EXECUTING' || normalizedStatus === 'BOOKING_STARTED') {
+        header = '<b>⚡ BOOKING EXECUTION STARTED • Official Portal Dispatch</b>';
+        statusLabel = 'Booking Execution Started';
+        const workerTag = bookingData.machineCode ? `Worker <code>${bookingData.machineCode}</code>` : 'Local Worker PC-001';
+        detailsLine = `🚀 <b>Execution:</b> ${workerTag} claimed booking and started automated portal submission.`;
+      } else if (normalizedStatus === 'LOGIN_FAILED' || normalizedStatus === 'INVALID_CREDENTIALS') {
+        header = '<b>🔐 LOGIN FAILED • Official Sabarimala Portal</b>';
+        statusLabel = 'Login Failed / Invalid Credentials';
+        detailsLine = `❌ <b>Auth Error:</b> ${bookingData.failureReason || 'Official portal login failed. Please update portal credentials in Admin settings.'}`;
+      } else if (normalizedStatus === 'PORTAL_AVAILABILITY_MISMATCH') {
+        header = '<b>⚠️ PORTAL AVAILABILITY MISMATCH • Candidate Slot Not Selectable</b>';
+        statusLabel = 'Portal Availability Mismatch';
+        detailsLine = `⚠️ <b>Mismatch Details:</b> ${bookingData.failureReason || 'Availability API reported candidate slot, but official portal calendar marked date as DISABLED or FULL. Returned safely to monitoring.'}`;
+      } else if (normalizedStatus === 'DATE_FULL' || normalizedStatus === 'DATE_UNAVAILABLE') {
+        header = '<b>📅 REQUESTED DATE FULL / DISABLED • Central Booking Queue</b>';
+        statusLabel = 'Date Full / Unavailable';
+        detailsLine = `ℹ️ <b>Calendar Status:</b> ${bookingData.failureReason || 'Requested darshan date is marked FULL or DISABLED in official portal calendar. Watching engine active.'}`;
+      } else if (normalizedStatus === 'RETRYABLE_FAILURE') {
+        header = '<b>🔄 RETRYABLE FAILURE • Will Re-attempt Automatically</b>';
+        statusLabel = 'Retryable Failure';
+        detailsLine = `🔄 <b>Retry Details:</b> ${bookingData.failureReason || bookingData.note || 'Temporary condition encountered during booking flow. Preserving watch window and retrying safely.'}`;
       } else if (normalizedStatus === 'REQUIRES_HUMAN') {
         header = '<b>⚠️ ACTION REQUIRED • Central Booking Queue</b>';
         statusLabel = 'Action Required';
@@ -412,7 +445,7 @@ export class NotificationsService {
         header = '<b>🛑 BOOKING CANCELLED • Central Booking Queue</b>';
         statusLabel = 'Cancelled';
         detailsLine = `ℹ️ <b>Reason:</b> ${bookingData.note || bookingData.failureReason || 'Cancelled by operator / admin. Held deposit refunded.'}`;
-      } else if (['BOOKING_FAILED', 'FAILED', 'EXECUTION_FAILED', 'WISHLIST_MISMATCH', 'RETRYABLE_FAILURE'].includes(normalizedStatus)) {
+      } else if (['BOOKING_FAILED', 'FAILED', 'EXECUTION_FAILED', 'WISHLIST_MISMATCH'].includes(normalizedStatus)) {
         header = '<b>🚨 BOOKING FLOW FAILED • Central Booking Queue</b>';
         statusLabel = 'Booking Flow Issue / Failed';
         detailsLine = `❌ <b>Error Details:</b> ${bookingData.failureReason || bookingData.note || 'Encountered issue during official Sabarimala booking flow.'}`;
@@ -597,5 +630,76 @@ export class NotificationsService {
       message: 'Test notification sent successfully to Telegram!',
       chatId: chat,
     };
+  }
+
+  /**
+   * Dispatches real-time Telegram notification for Worker machine state transitions (STOPPED / OFFLINE)
+   */
+  async sendTelegramWorkerNotification(payload: {
+    workerId: string;
+    machineCode: string;
+    machineName?: string;
+    status: 'STOPPED' | 'OFFLINE';
+    reason?: string;
+  }) {
+    try {
+      const config = await this.prisma.systemConfig.findUnique({ where: { id: 'default' } });
+      if (!config || !config.telegramBotEnabled || !config.telegramBotToken || !config.telegramChatId) {
+        return { skipped: true, reason: 'Telegram notifications not enabled or missing credentials' };
+      }
+
+      // Deduplication check: 5 minutes cooldown for identical worker alerts
+      const dedupKey = `worker:${payload.machineCode}:${payload.status}`;
+      const now = Date.now();
+      const lastSent = this.dedupAlertCache.get(dedupKey);
+      if (lastSent && (now - lastSent < 5 * 60 * 1000)) {
+        this.logger.log(`[Telegram Bot] Deduplicating worker alert for ${payload.machineCode} (${payload.status})`);
+        return { skipped: true, reason: 'Deduplicated duplicate worker alert' };
+      }
+      this.dedupAlertCache.set(dedupKey, now);
+
+      const botToken = config.telegramBotToken.trim();
+      const chatId = config.telegramChatId.trim();
+      const timeStr = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+
+      const header = payload.status === 'STOPPED'
+        ? '<b>🛑 WORKER STOPPED • Fleet Management Alert</b>'
+        : '<b>⚠️ WORKER OFFLINE • Heartbeat Timeout Alert</b>';
+
+      const lines = [
+        header,
+        '',
+        `💻 <b>Worker Machine:</b> <code>${payload.machineCode}</code>`,
+        payload.machineName ? `🏷 <b>Machine Name:</b> ${payload.machineName}` : '',
+        `📊 <b>Status:</b> <b>${payload.status}</b>`,
+        `ℹ️ <b>Reason:</b> ${payload.reason || (payload.status === 'STOPPED' ? 'Explicit shutdown' : 'Heartbeat connection lost (>45s)')}`,
+        '',
+        `⏱ <b>Alert Time:</b> ${timeStr} IST`,
+        '',
+        `👉 <b>Fleet Overview:</b> <a href="http://localhost:3001/admin/fleet">Open Admin Fleet Dashboard</a>`,
+      ].filter(Boolean);
+
+      const text = lines.join('\n');
+      const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text,
+          parse_mode: 'HTML',
+          disable_web_page_preview: false,
+        }),
+      });
+      const resJson: any = await res.json();
+      if (resJson.ok) {
+        this.logger.log(`[Telegram Bot] Worker ${payload.machineCode} (${payload.status}) alert dispatched to chat ${chatId}`);
+      } else {
+        this.logger.error(`[Telegram Bot] Failed to send worker notification: ${JSON.stringify(resJson)}`);
+      }
+      return { success: resJson.ok, response: resJson };
+    } catch (err: any) {
+      this.logger.error(`[Telegram Worker Alert] Failed: ${err.message}`);
+      return { success: false, error: err.message };
+    }
   }
 }

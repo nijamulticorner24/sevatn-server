@@ -1094,7 +1094,7 @@ export class PartnersService {
 
     const amount = Number(dto.amount);
     if (!amount || amount < minWithdrawal) {
-      throw new BadRequestException(`Minimum withdrawal amount is 🪙 ${minWithdrawal}`);
+      throw new BadRequestException(`Minimum withdrawal amount is ₹ ${minWithdrawal}`);
     }
 
     const cleanUpi = dto.upiId?.trim();
@@ -1104,7 +1104,7 @@ export class PartnersService {
 
     const partnerSummary = await this.getPartnerPayouts(partnerId);
     if (amount > partnerSummary.availableBalance) {
-      throw new BadRequestException(`Requested amount (🪙 ${amount}) exceeds available balance (🪙 ${partnerSummary.availableBalance})`);
+      throw new BadRequestException(`Requested amount (₹ ${amount}) exceeds available balance (₹ ${partnerSummary.availableBalance})`);
     }
 
     const payout = await (this.prisma as any).partnerPayout.create({
@@ -1891,7 +1891,7 @@ export class PartnersService {
       const partnerPrevAvailable = Number(partnerWallet.availableBalance);
       if (partnerPrevAvailable < amount) {
         throw new BadRequestException(
-          `Insufficient wallet balance: Your available balance is 🪙 ${partnerPrevAvailable.toFixed(2)}, cannot transfer 🪙 ${amount.toFixed(2)}.`,
+          `Insufficient wallet balance: Your available balance is ₹ ${partnerPrevAvailable.toFixed(2)}, cannot transfer ₹ ${amount.toFixed(2)}.`,
         );
       }
 
@@ -2006,7 +2006,7 @@ export class PartnersService {
         recipientLabel,
         partnerRemainingBalance: partnerNewAvailable,
         recipientNewBalance: recipientNewAvailable,
-        message: `Successfully transferred 🪙 ${amount.toFixed(2)} to ${recipientLabel}.`,
+        message: `Successfully transferred ₹ ${amount.toFixed(2)} to ${recipientLabel}.`,
       };
     }, {
       maxWait: 15000,

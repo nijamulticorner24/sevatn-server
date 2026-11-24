@@ -25,12 +25,12 @@ export class BookingsController {
   constructor(private readonly bookingsService: BookingsService) {}
 
   @Post()
-  @Roles(Role.CENTRE, Role.DISTRIBUTOR)
+  @Roles(Role.CENTRE, Role.DISTRIBUTOR, Role.SUPER_ADMIN)
   @UseGuards(RolesGuard, ServiceAccessGuard)
   @RequireService('TICKET_ASSIST')
   async createBooking(@CurrentUser() user: any, @Body() dto: CreateBookingDto) {
-    if (user.role !== Role.CENTRE && user.role !== Role.DISTRIBUTOR) {
-      throw new ForbiddenException('Only registered and authorized Centre operators and Distributors are permitted to create bookings.');
+    if (user.role !== Role.CENTRE && user.role !== Role.DISTRIBUTOR && user.role !== Role.SUPER_ADMIN) {
+      throw new ForbiddenException('Only registered and authorized Centre operators, Distributors, and Super Admins are permitted to create bookings.');
     }
     return this.bookingsService.createBooking(user.id, dto);
   }

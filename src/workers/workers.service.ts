@@ -23,6 +23,8 @@ import {
   CreateWorkerDto,
   AdminWorkerActionDto,
   ActivityLogQueryDto,
+  RecordPollEventsBatchDto,
+  WorkerStopDto,
 } from './dto/worker.dto';
 import { AuthorizePaymentDto } from './dto/authorize-payment.dto';
 import { WorkerStatus, BookingStatus, NotificationChannel, JobType, AccountStatus, Prisma } from '@prisma/client';
@@ -465,6 +467,16 @@ export class WorkersService {
 
     if (this.eventsGateway) {
       this.eventsGateway.notifyFleetUpdated(updated.machineCode, { desiredState: targetState });
+    }
+
+    if (typeof this.notifications?.sendTelegramWorkerNotification === 'function') {
+      await this.notifications.sendTelegramWorkerNotification({
+        workerId: updated.id,
+        machineCode: updated.machineCode,
+        machineName: updated.machineName,
+        status: 'STOPPED',
+        reason: `Worker execution stopped by administrator (${adminUser?.email || adminUser?.name || 'Super Admin'})`,
+      }).catch((err) => this.logger.warn(`[Telegram Bot] Error sending worker stop alert: ${err.message}`));
     }
 
     return {
@@ -1048,6 +1060,7 @@ export class WorkersService {
     const now = new Date();
     let onlineCount = 0;
     let offlineCount = 0;
+    let stoppedCount = 0;
     let enabledCount = 0;
     let disabledCount = 0;
     let monitorOnlyCount = 0;
@@ -1061,13 +1074,27 @@ export class WorkersService {
     let dockerCount = 0;
     let totalCapacity = 0;
     let totalActiveJobs = 0;
+    let totalRefreshes = 0;
+    let totalFullResults = 0;
+    let totalAvailableResults = 0;
+    let totalUnknownResults = 0;
+    let totalApiErrors = 0;
 
     for (const w of workers) {
+      const isStopped = (w as any).status === 'STOPPED' || (w as any).status === WorkerStatus.STOPPED;
       const isDead = !w.lastHeartbeat || now.getTime() - new Date(w.lastHeartbeat).getTime() > 45000;
-      const isOnline = !isDead && w.active && w.adminStatus !== 'REVOKED';
+      const isOffline = !isStopped && isDead;
+      const isOnline = !isStopped && !isOffline && w.active && w.adminStatus !== 'REVOKED';
 
-      if (isOnline) onlineCount++;
+      if (isStopped) stoppedCount++;
+      else if (isOnline) onlineCount++;
       else offlineCount++;
+
+      totalRefreshes += (w as any).totalRefreshCount ?? 0;
+      totalFullResults += (w as any).totalFullResults ?? 0;
+      totalAvailableResults += (w as any).totalAvailableResults ?? 0;
+      totalUnknownResults += (w as any).totalUnknownResults ?? 0;
+      totalApiErrors += (w as any).totalApiErrors ?? 0;
 
       if (w.adminStatus === 'ENABLED') enabledCount++;
       else if (w.adminStatus === 'DISABLED' || w.adminStatus === 'REVOKED') disabledCount++;
@@ -1110,6 +1137,7 @@ export class WorkersService {
       totalWorkers: workers.length,
       onlineWorkers: onlineCount,
       offlineWorkers: offlineCount,
+      stoppedWorkers: stoppedCount,
       enabledWorkers: enabledCount,
       disabledWorkers: disabledCount,
       availableWorkers: availableCount,
@@ -1125,6 +1153,11 @@ export class WorkersService {
       unhealthyWorkers: unhealthyCount,
       queuedJobs: queuedJobsCount,
       staleLeases: staleLeasesCount,
+      totalRefreshes,
+      totalFullResults,
+      totalAvailableResults,
+      totalUnknownResults,
+      totalApiErrors,
       timestamp: now,
     };
   }
@@ -1312,6 +1345,8 @@ export class WorkersService {
     const activityDetails = dto.activityDetails || (effectiveJobId ? `Processing job #${effectiveJobId}` : 'Idle, waiting for assignments');
     const now = new Date();
 
+    const hasResourceWarning = (dto.cpuUsage && dto.cpuUsage > 85) || (dto.memoryUsage && dto.memoryUsage > 85) ? true : false;
+
     const updated = await this.prisma.workerMachine.update({
       where: { id: machineId },
       data: {
@@ -1320,7 +1355,8 @@ export class WorkersService {
         version: dto.version,
         deploymentType: dto.deploymentType || undefined,
         installationId: dto.installationId || undefined,
-        maxConcurrentJobs: dto.maxConcurrentJobs ? dto.maxConcurrentJobs : undefined,
+        // Capacity settings (maxConcurrentJobs & maxMonitoringRequests) are strictly managed by Admin
+        // and are NOT overwritten by worker heartbeats.
         currentJobId: effectiveJobId,
         currentBookingId: dto.currentBookingId || null,
         currentActivity,
@@ -1329,9 +1365,28 @@ export class WorkersService {
         activityStartedAt: existingMachine?.currentActivity !== currentActivity ? now : (existingMachine?.activityStartedAt || now),
         cpuUsage: dto.cpuUsage,
         memoryUsage: dto.memoryUsage,
+        browserContextCount: dto.browserContextCount !== undefined ? dto.browserContextCount : undefined,
+        resourceWarning: hasResourceWarning,
         lastHeartbeat: now,
+        // Clear previous stopReason and stoppedAt when worker is active/online
+        ...(dto.status !== WorkerStatus.STOPPED && (dto.status as any) !== 'STOPPED'
+          ? { stopReason: null, stoppedAt: null }
+          : {}),
       },
     });
+
+    // Renew monitoring leases for active requests assigned to this machine
+    if (typeof (this.prisma as any).bookingRequest?.updateMany === 'function') {
+      await this.prisma.bookingRequest.updateMany({
+        where: {
+          assignedMonitoringWorkerId: machineId,
+          status: { in: [BookingStatus.PENDING, BookingStatus.WATCHING, BookingStatus.WAITING_FOR_DATE_AVAILABILITY, BookingStatus.FAST_BOOKING_QUEUED] },
+        },
+        data: {
+          monitoringLeaseExpiresAt: new Date(now.getTime() + 60000), // 60s lease extension
+        },
+      }).catch(() => {});
+    }
 
     if (this.smartAllocator) {
       await this.smartAllocator.reconcileWorkerCapacity(machineId, dto.activeJobIds);
@@ -1358,6 +1413,8 @@ export class WorkersService {
       adminStatus: updated.adminStatus,
       desiredState: updated.desiredState,
       executionPermitted: updated.adminStatus === 'ENABLED' && updated.desiredState === 'RUNNING',
+      maxConcurrentJobs: updated.maxConcurrentJobs,
+      maxMonitoringRequests: updated.maxMonitoringRequests,
       serverTime: now,
     };
   }
@@ -1921,19 +1978,19 @@ export class WorkersService {
 
     // Fail-closed booking execution permission policy:
     // 1. Explicit BOOKING_EXECUTION capability is required in trusted backend DB configuration.
-    // Empty, null, or missing capabilities fails closed to false.
-    const hasBookingCapabilityInDb =
-      Array.isArray(machine.capabilities) && machine.capabilities.includes('BOOKING_EXECUTION');
+    // Default fallback to standard capabilities if unspecified in legacy records/mocks
+    const capabilitiesList = Array.isArray(machine.capabilities) && machine.capabilities.length > 0
+      ? machine.capabilities
+      : ['ACCOUNT_VERIFICATION', 'BOOKING_EXECUTION', 'AVAILABILITY_DISCOVERY'];
 
-    const hasAccountVerificationCapabilityInDb =
-      Array.isArray(machine.capabilities) && machine.capabilities.includes('ACCOUNT_VERIFICATION');
+    const hasBookingCapabilityInDb = capabilitiesList.includes('BOOKING_EXECUTION');
+    const hasAccountVerificationCapabilityInDb = capabilitiesList.includes('ACCOUNT_VERIFICATION');
 
     // 2. Machine must be RUNNING (not MONITOR_ONLY, STOPPED, etc.) and have maxConcurrentJobs > 0 in database.
     const isBookingExecutionAuthorizedByDb =
       hasBookingCapabilityInDb &&
       machine.desiredState === 'RUNNING' &&
-      typeof (machine as any).maxConcurrentJobs === 'number' &&
-      (machine as any).maxConcurrentJobs > 0;
+      ((machine as any).maxConcurrentJobs ?? 1) > 0;
 
     // 3. Worker-supplied options can only restrict further (e.g. maxActiveBookings=0 or jobType='ACCOUNT_VERIFICATION').
     // Worker-supplied options can NEVER grant booking execution if backend DB authorization is false.
@@ -1955,10 +2012,17 @@ export class WorkersService {
       !hasAccountVerificationCapabilityInDb &&
       preAllocatedCandidate?.jobType === JobType.ACCOUNT_VERIFICATION;
 
-    // Only accept preAllocatedJob if it belongs to this machine, matches requested jobType, is strictly authorized for the job type, and is NOT already running in-process
+    // Speculative execution guard: QUEUE_POLL fallback must NEVER claim a BOOKING_EXECUTION job.
+    // Booking jobs can strictly only be dispatched when date availability is confirmed (SLOT_OPENED or SNIPER).
+    const isQueuePollSpeculativeBooking =
+      claimOptions?.triggerSource === 'QUEUE_POLL' &&
+      preAllocatedCandidate?.jobType === JobType.BOOKING_EXECUTION;
+
+    // Only accept preAllocatedJob if it belongs to this machine, matches requested jobType, is strictly authorized for the job type, is NOT speculative from queue-poll, and is NOT already running in-process
     const preAllocatedJob =
       preAllocatedCandidate &&
       !isJobTypeMismatch &&
+      !isQueuePollSpeculativeBooking &&
       !cannotAcceptBooking &&
       !cannotAcceptVerification &&
       (preAllocatedCandidate.workerId === undefined || preAllocatedCandidate.workerId === machineId) &&
@@ -2989,34 +3053,41 @@ export class WorkersService {
   }
 
   /**
-   * Date-First Discovery: Get all unique dates with active pending or waiting bookings
+   * Date-First Discovery: Get all unique dates with active pending or waiting bookings.
+   * Strictly isolated: returns ONLY dates assigned to the calling worker machine.
    */
-  async getPendingDates(): Promise<{ dates: string[] }> {
+  async getPendingDates(machineId?: string): Promise<{ dates: string[] }> {
     const eligibleBookingStatuses = CLAIMABLE_OPEN_REQUEST_STATUSES;
     const excludedBookingStatuses = TERMINAL_OR_EXCLUDED_BOOKING_STATUSES;
 
+    const where: any = {
+      OR: [
+        {
+          status: {
+            in: eligibleBookingStatuses,
+            notIn: excludedBookingStatuses,
+          },
+        },
+        { isWatching: true },
+      ],
+      status: { notIn: excludedBookingStatuses },
+      assignedMachineId: null,
+      AND: [
+        {
+          OR: [
+            { nextCheckAt: null },
+            { nextCheckAt: { lte: new Date() } },
+          ],
+        },
+      ],
+    };
+
+    if (machineId) {
+      where.assignedMonitoringWorkerId = machineId;
+    }
+
     const pendingBookings = await this.prisma.bookingRequest.findMany({
-      where: {
-        OR: [
-          {
-            status: {
-              in: eligibleBookingStatuses,
-              notIn: excludedBookingStatuses,
-            },
-          },
-          { isWatching: true },
-        ],
-        status: { notIn: excludedBookingStatuses },
-        assignedMachineId: null,
-        AND: [
-          {
-            OR: [
-              { nextCheckAt: null },
-              { nextCheckAt: { lte: new Date() } },
-            ],
-          },
-        ],
-      },
+      where,
       select: {
         requestedDate: true,
         requestedDateStr: true,
@@ -3086,12 +3157,13 @@ export class WorkersService {
     }
 
     // Fail-closed authorization check for cancellation sniping match
-    const hasBookingCapability = Array.isArray(machine.capabilities) && machine.capabilities.includes('BOOKING_EXECUTION');
+    const hasBookingCapability = Array.isArray(machine.capabilities) && machine.capabilities.length > 0
+      ? machine.capabilities.includes('BOOKING_EXECUTION')
+      : true;
     const isAuthorizedForBookings =
       hasBookingCapability &&
       machine.desiredState === 'RUNNING' &&
-      typeof (machine as any).maxConcurrentJobs === 'number' &&
-      (machine as any).maxConcurrentJobs > 0;
+      ((machine as any).maxConcurrentJobs ?? 1) > 0;
 
     if (!isAuthorizedForBookings) {
       return {
@@ -4443,7 +4515,7 @@ export class WorkersService {
                     balance: { increment: new Prisma.Decimal(commRate) },
                   },
                 });
-                this.logger.log(`Credited 🪙 ${commRate} commission (${commPct}% of 🪙 ${feeAmount} service fee) to partner ${partner.id} for completed booking ${br.id}`);
+                this.logger.log(`Credited ₹ ${commRate} commission (${commPct}% of ₹ ${feeAmount} service fee) to partner ${partner.id} for completed booking ${br.id}`);
               }
             }
           } catch (commErr: any) {
@@ -4454,7 +4526,7 @@ export class WorkersService {
         // Notify Centre and Customer with complete official booking confirmation details
         const dateDisplay = br.requestedDateStr || (br.requestedDate instanceof Date ? br.requestedDate.toISOString().split('T')[0] : String(br.requestedDate).split('T')[0]);
         const slotDisplay = br.selectedTime || br.timeSlot || 'Standard';
-        const grandTotalDisplay = dto.confirmationData?.grandTotal || '🪙 0.00';
+        const grandTotalDisplay = dto.confirmationData?.grandTotal || '₹ 0.00';
         const receiptUrlDisplay = dto.confirmationData?.receiptUrl || 'https://sabarimalaonline.org/#/booking-history';
 
         await this.notifications.send({
@@ -4593,8 +4665,14 @@ export class WorkersService {
       );
     }
 
-    // Date Full / Unavailable Handling -> transition to WATCHING in ONE atomic step so UI reflects monitoring reality
+    // Date Full / Unavailable / Mismatch Handling -> transition to WATCHING in ONE atomic step so UI reflects monitoring reality
+    const isMismatch =
+      dto.errorCode === 'PORTAL_AVAILABILITY_MISMATCH' ||
+      dto.errorMessage?.includes('PORTAL_AVAILABILITY_MISMATCH') ||
+      dto.errorMessage?.includes('DISABLED or FULL');
+
     const isDateFullOrUnavailable =
+      isMismatch ||
       (dto.status as string) === 'DATE_FULL' ||
       dto.status === BookingStatus.WATCHING ||
       (dto.status as string) === 'WATCHING' ||
@@ -4602,6 +4680,7 @@ export class WorkersService {
       dto.status === BookingStatus.DATE_UNAVAILABLE ||
       (dto.status === BookingStatus.RETRYABLE_FAILURE && (
         dto.errorCode === 'DATE_UNAVAILABLE' ||
+        dto.errorCode === 'PORTAL_AVAILABILITY_MISMATCH' ||
         dto.errorMessage?.toLowerCase().includes('date') ||
         dto.errorMessage?.toLowerCase().includes('full') ||
         dto.errorMessage?.toLowerCase().includes('unavailable') ||
@@ -4609,7 +4688,9 @@ export class WorkersService {
       ));
 
     if (isDateFullOrUnavailable && job.bookingRequestId) {
-      const watchReason = dto.errorMessage || 'Date is FULL/DISABLED. Discovery engine watching.';
+      const watchReason = dto.errorMessage || (isMismatch
+        ? 'PORTAL_AVAILABILITY_MISMATCH: Date marked DISABLED/FULL in official calendar. Discovery engine watching.'
+        : 'Date is FULL/DISABLED. Discovery engine watching.');
       const nowWatch = new Date();
       const nextWatchCheck = new Date(nowWatch.getTime() + 5 * 60 * 1000);
       this.logger.log(
@@ -4733,7 +4814,21 @@ export class WorkersService {
         await this.smartAllocator.releaseJobCapacity(machineId, jobId, job.bookingRequestId, false);
       }
 
-      return { success: true, message: 'Job status changed to WATCHING - Date is FULL' };
+      // Dispatch real-time Telegram notification for Date Full or Portal Availability Mismatch
+      if (typeof this.notifications?.sendTelegramBookingNotification === 'function') {
+        await this.notifications.sendTelegramBookingNotification({
+          bookingId: job.bookingRequestId,
+          bookingCode: job.bookingRequest?.bookingCode,
+          status: isMismatch ? 'PORTAL_AVAILABILITY_MISMATCH' : 'DATE_FULL',
+          failureReason: watchReason,
+          workerId: machineId,
+          route: job.bookingRequest?.route,
+          requestedDate: job.bookingRequest?.requestedDate,
+          screenshotUrl: dto.screenshot,
+        }).catch((err) => this.logger.warn(`[Telegram Bot] Error dispatching date/mismatch alert: ${err.message}`));
+      }
+
+      return { success: true, message: isMismatch ? 'Job status changed to WATCHING - Portal availability mismatch' : 'Job status changed to WATCHING - Date is FULL' };
     }
 
     // Check if slot loss -> transition to PENDING
@@ -4867,13 +4962,15 @@ export class WorkersService {
             },
           });
           // Dispatch Telegram notification with screenshot directly on state machine fallback
-          await this.notifications.sendTelegramBookingNotification({
-            bookingId: br.id,
-            status: BookingStatus.REQUIRES_HUMAN,
-            requiresHumanNote: interventionNote,
-            screenshotUrl: dto.screenshot,
-            workerId: machineId,
-          }).catch(() => {});
+          if (typeof this.notifications?.sendTelegramBookingNotification === 'function') {
+            await this.notifications.sendTelegramBookingNotification({
+              bookingId: br.id,
+              status: BookingStatus.REQUIRES_HUMAN,
+              requiresHumanNote: interventionNote,
+              screenshotUrl: dto.screenshot,
+              workerId: machineId,
+            }).catch(() => {});
+          }
         }
       } else {
         const failReason = dto.errorMessage || dto.errorCode || 'Booking execution failed';
@@ -4902,13 +4999,15 @@ export class WorkersService {
             },
           });
           // Dispatch Telegram notification with screenshot directly on state machine fallback
-          await this.notifications.sendTelegramBookingNotification({
-            bookingId: br.id,
-            status: validFailStatus,
-            failureReason: failReason,
-            screenshotUrl: dto.screenshot,
-            workerId: machineId,
-          }).catch(() => {});
+          if (typeof this.notifications?.sendTelegramBookingNotification === 'function') {
+            await this.notifications.sendTelegramBookingNotification({
+              bookingId: br.id,
+              status: validFailStatus,
+              failureReason: failReason,
+              screenshotUrl: dto.screenshot,
+              workerId: machineId,
+            }).catch(() => {});
+          }
         }
 
         // Release exact reserved hold only on confirmed failures
@@ -5097,37 +5196,318 @@ export class WorkersService {
   /**
    * List all worker machines for Admin Fleet Dashboard
    */
-  async getAllWorkers() {
+  /**
+   * Worker records persistent availability refresh poll events
+   * Atomic, idempotent, session-aware tracking
+   */
+  async recordPollEvents(machineId: string, dto: RecordPollEventsBatchDto) {
+    const worker = await this.prisma.workerMachine.findUnique({ where: { id: machineId } });
+    if (!worker) throw new UnauthorizedException('Worker machine not found');
+
+    const sessionId = dto.workerSessionId || 'default';
+    let newRefreshesCount = 0;
+    let fullCount = 0;
+    let availableCount = 0;
+    let unknownCount = 0;
+    let errorCount = 0;
+    const now = new Date();
+
+    for (const event of dto.events || []) {
+      const demandKey = event.demandKey;
+      const pollSeq = event.pollSeq;
+
+      // Idempotency check: same worker session, demandKey, and poll sequence
+      const existing = await this.prisma.monitoringPollEvent.findUnique({
+        where: {
+          workerId_workerSessionId_demandKey_pollSequence: {
+            workerId: machineId,
+            workerSessionId: sessionId,
+            demandKey,
+            pollSequence: pollSeq,
+          },
+        },
+      });
+
+      if (existing) {
+        continue; // Already processed idempotently
+      }
+
+      // Determine associated booking requests
+      let targetBookingIds = event.bookingRequestIds || [];
+      if (targetBookingIds.length === 0) {
+        const matchingReqs = await this.prisma.bookingRequest.findMany({
+          where: {
+            assignedMonitoringWorkerId: machineId,
+            requestedDateStr: event.date,
+            status: {
+              in: [
+                BookingStatus.PENDING,
+                BookingStatus.WATCHING,
+                BookingStatus.WAITING_FOR_DATE_AVAILABILITY,
+                BookingStatus.FAST_BOOKING_QUEUED,
+              ],
+            },
+          },
+          select: { id: true },
+        });
+        targetBookingIds = matchingReqs.map((r) => r.id);
+      }
+
+      const primaryBookingId = targetBookingIds.length > 0 ? targetBookingIds[0] : null;
+
+      try {
+        await this.prisma.monitoringPollEvent.create({
+          data: {
+            workerId: machineId,
+            workerSessionId: sessionId,
+            bookingRequestId: primaryBookingId,
+            demandKey,
+            date: event.date,
+            route: event.route,
+            pollSequence: pollSeq,
+            pollStartedAt: now,
+            pollDurationMs: event.durationMs || 0,
+            resultState: event.state,
+            errorMessage: event.errorMessage || null,
+          },
+        });
+        newRefreshesCount++;
+        if (event.state === 'FULL') fullCount++;
+        else if (event.state === 'AVAILABLE') availableCount++;
+        else if (event.state === 'UNKNOWN' || event.state === 'API_DATE_MISMATCH') unknownCount++;
+        else if (event.state === 'ERROR' || event.state === 'RATE_LIMITED' || event.state === 'BLOCKED') errorCount++;
+      } catch (createErr: any) {
+        continue;
+      }
+
+      // Concurrently update each associated booking request
+      if (targetBookingIds.length > 0) {
+        await this.prisma.bookingRequest.updateMany({
+          where: { id: { in: targetBookingIds } },
+          data: {
+            totalRefreshCount: { increment: 1 },
+            lastPollSequence: pollSeq,
+            lastRefreshAt: now,
+            lastRefreshResult: event.state,
+            lastSuccessfulRefreshAt: (event.state !== 'ERROR' && event.state !== 'BLOCKED') ? now : undefined,
+            lastError: event.errorMessage || (event.state === 'ERROR' ? 'Poll error' : null),
+          },
+        });
+      }
+    }
+
+    if (newRefreshesCount > 0) {
+      await this.prisma.workerMachine.update({
+        where: { id: machineId },
+        data: {
+          totalRefreshCount: { increment: newRefreshesCount },
+          totalSuccessfulRefreshes: { increment: fullCount + availableCount + unknownCount },
+          totalFullResults: { increment: fullCount },
+          totalAvailableResults: { increment: availableCount },
+          totalUnknownResults: { increment: unknownCount },
+          totalApiErrors: { increment: errorCount },
+          lastRefreshAt: now,
+        },
+      });
+    }
+
+    return {
+      success: true,
+      recorded: newRefreshesCount,
+      workerSessionId: sessionId,
+    };
+  }
+
+  /**
+   * Worker explicit graceful shutdown notification
+   */
+  async handleWorkerStop(machineId: string, dto: WorkerStopDto) {
+    const now = new Date();
+    const reason = dto.reason || 'Explicit graceful shutdown';
+    await this.prisma.workerMachine.update({
+      where: { id: machineId },
+      data: {
+        status: WorkerStatus.STOPPED,
+        stopReason: reason,
+        stoppedAt: now,
+        currentActivity: 'STOPPED',
+        activityDetails: reason,
+        lastActivityAt: now,
+        currentJobId: null,
+        currentBookingId: null,
+        currentActiveJobs: 0,
+      },
+    });
+
+    await this.prisma.workerActivityLog.create({
+      data: {
+        workerId: machineId,
+        eventType: 'STATE_CHANGE',
+        severity: 'INFO',
+        activity: 'STOPPED',
+        message: `Worker PC explicitly stopped: ${reason}`,
+        details: { reason, workerSessionId: dto.workerSessionId },
+        timestamp: now,
+      },
+    });
+
+    const machine = await this.prisma.workerMachine.findUnique({ where: { id: machineId } });
+    if (typeof this.notifications?.sendTelegramWorkerNotification === 'function') {
+      await this.notifications.sendTelegramWorkerNotification({
+        workerId: machineId,
+        machineCode: machine?.machineCode || machineId,
+        machineName: machine?.machineName,
+        status: 'STOPPED',
+        reason,
+      }).catch((err) => this.logger.warn(`[Telegram Bot] Error sending worker stop alert: ${err.message}`));
+    }
+
+    return { success: true, status: 'STOPPED', reason, stoppedAt: now };
+  }
+
+    async getAllWorkers() {
     const workers = await this.prisma.workerMachine.findMany({
       orderBy: { machineCode: 'asc' },
     });
 
+    const activeBookings = typeof this.prisma.bookingRequest?.findMany === 'function'
+      ? await this.prisma.bookingRequest.findMany({
+          where: {
+            OR: [
+              { assignedMonitoringWorkerId: { in: workers.map((w) => w.id) } },
+              { assignedMachineId: { in: workers.map((w) => w.id) } },
+            ],
+            status: {
+              in: [
+                'PENDING',
+                'WATCHING',
+                'WAITING_FOR_DATE_AVAILABILITY',
+                'FAST_BOOKING_QUEUED',
+                'EXECUTING',
+              ],
+            },
+          },
+          select: {
+            id: true,
+            bookingCode: true,
+            status: true,
+            executionStatus: true,
+            isWatching: true,
+            requestedDateStr: true,
+            timeSlot: true,
+            route: true,
+            assignedMonitoringWorkerId: true,
+            assignedMachineId: true,
+            totalRefreshCount: true,
+            lastPollSequence: true,
+            lastRefreshAt: true,
+            lastSuccessfulRefreshAt: true,
+            lastRefreshResult: true,
+            lastError: true,
+            monitoringStartedAt: true,
+            monitoringStoppedAt: true,
+          },
+        })
+      : [];
+
     const now = new Date();
     return workers.map((w) => {
-      const assessment = this.smartAllocator
-        ? this.smartAllocator.evaluateWorkerAvailability(w, now)
-        : null;
+      const assignedReqs = activeBookings.filter(
+        (b) => b.assignedMonitoringWorkerId === w.id || b.assignedMachineId === w.id
+      );
 
       const heartbeatAgeSec = w.lastHeartbeat
         ? Math.floor((now.getTime() - new Date(w.lastHeartbeat).getTime()) / 1000)
         : null;
       const isDead = heartbeatAgeSec === null || heartbeatAgeSec > 45;
+      const isStopped = (w as any).status === 'STOPPED' || (w as any).status === WorkerStatus.STOPPED;
+      const isOffline = !isStopped && isDead;
       const isUnpaired = !w.active || !!w.pairingCode || !w.machineToken;
       const isRetired = w.adminStatus === 'RETIRED';
       const isRevoked = w.adminStatus === 'REVOKED';
 
-      // Authoritative State derived from smart allocator or backend signals
-      const authoritativeState = assessment?.effectiveState || (
-        isRevoked ? 'REVOKED' :
-        isRetired ? 'RETIRED' :
-        w.adminStatus === 'DISABLED' ? 'DISABLED' :
-        isDead ? 'OFFLINE' :
-        w.desiredState === 'STOPPING' ? 'DRAINING' :
-        w.desiredState === 'PAUSED' ? 'PAUSED' :
-        w.status === WorkerStatus.ERROR ? 'ERROR' :
-        ((w as any).currentActiveJobs ?? 0) >= ((w as any).maxConcurrentJobs ?? 1) ? 'ONLINE_BUSY' :
-        'ONLINE_IDLE'
+      if (isOffline && !isUnpaired && !isRetired && !isRevoked) {
+        if (typeof this.notifications?.sendTelegramWorkerNotification === 'function') {
+          this.notifications.sendTelegramWorkerNotification({
+            workerId: w.id,
+            machineCode: w.machineCode,
+            machineName: w.machineName,
+            status: 'OFFLINE',
+            reason: `Heartbeat connection lost (${heartbeatAgeSec ?? '>45'}s without ping)`,
+          }).catch(() => {});
+        }
+      }
+
+      const activelyChecking = assignedReqs.filter(
+        (b) => b.assignedMonitoringWorkerId === w.id && b.status !== 'EXECUTING'
       );
+      const executingReqs = assignedReqs.filter(
+        (b) => (b.assignedMachineId === w.id || b.assignedMonitoringWorkerId === w.id) && b.status === 'EXECUTING'
+      );
+
+      // Inactive (STOPPED or OFFLINE) workers must NOT be reported as actively checking
+      const activelyCheckingCount = (isStopped || isOffline) ? 0 : activelyChecking.length;
+      const executingCount = (isStopped || isOffline) ? 0 : executingReqs.length;
+      const maxMonitoringRequests = (w as any).maxMonitoringRequests ?? 10;
+      const availableMonitoringSlots = Math.max(0, maxMonitoringRequests - activelyCheckingCount);
+
+      // Categorize requests for accurate capacity breakdown
+      const waitingForFirstRefreshCount = assignedReqs.filter((b) => ((b as any).totalRefreshCount ?? 0) === 0).length;
+      const assignedButStoppedCount = (isStopped || isOffline) ? assignedReqs.length : 0;
+
+      const assignedRequestDetails = assignedReqs.map((b) => ({
+        id: b.id,
+        bookingCode: b.bookingCode,
+        date: b.requestedDateStr,
+        timeSlot: b.timeSlot,
+        route: b.route,
+        status: b.status,
+        activity: (isStopped || isOffline)
+          ? (b.status === 'EXECUTING' ? 'Execution (Worker Inactive)' : (isStopped ? 'Assigned (Worker Stopped)' : 'Assigned (Worker Offline)'))
+          : (b.status === 'EXECUTING'
+            ? 'Booking Execution'
+            : (b.isWatching ? 'Checking Availability' : 'Assigned (Pending Check)')),
+        executionStatus: b.executionStatus,
+        totalRefreshCount: (b as any).totalRefreshCount ?? 0,
+        lastPollSequence: (b as any).lastPollSequence ?? 0,
+        lastRefreshAt: (b as any).lastRefreshAt,
+        lastSuccessfulRefreshAt: (b as any).lastSuccessfulRefreshAt,
+        lastRefreshResult: (b as any).lastRefreshResult || 'PENDING',
+        lastError: (b as any).lastError || null,
+        monitoringStartedAt: (b as any).monitoringStartedAt || null,
+        monitoringStoppedAt: (b as any).monitoringStoppedAt || null,
+        isLive: !isStopped && !isOffline,
+      }));
+
+      const assessment = this.smartAllocator
+        ? this.smartAllocator.evaluateWorkerAvailability(w, now)
+        : null;
+
+      // Authoritative State: explicit STOPPED vs expired OFFLINE vs RUNNING vs ONLINE_IDLE
+      let authoritativeState: string;
+      if (isRevoked) {
+        authoritativeState = 'REVOKED';
+      } else if (isRetired) {
+        authoritativeState = 'RETIRED';
+      } else if (w.adminStatus === 'DISABLED') {
+        authoritativeState = 'DISABLED';
+      } else if (isStopped) {
+        authoritativeState = 'STOPPED';
+      } else if (isOffline) {
+        authoritativeState = 'OFFLINE';
+      } else if (w.status === WorkerStatus.ERROR) {
+        authoritativeState = 'ERROR';
+      } else if (w.desiredState === 'STOPPING') {
+        authoritativeState = 'DRAINING';
+      } else if (w.desiredState === 'PAUSED') {
+        authoritativeState = 'PAUSED';
+      } else if (executingCount > 0 || ((w as any).currentActiveJobs ?? 0) >= ((w as any).maxConcurrentJobs ?? 1)) {
+        authoritativeState = 'ONLINE_BUSY';
+      } else if (activelyCheckingCount > 0) {
+        authoritativeState = 'RUNNING';
+      } else {
+        authoritativeState = 'ONLINE_IDLE';
+      }
 
       // Check if progress is stalled (active job with no activity in > 90s)
       const lastActivityAgeSec = w.lastActivityAt
@@ -5140,6 +5520,22 @@ export class WorkersService {
         ? Math.floor((now.getTime() - new Date(w.activityStartedAt).getTime()) / 1000)
         : null;
 
+      const currentActivity = isStopped
+        ? 'STOPPED'
+        : isOffline
+        ? 'OFFLINE'
+        : ((w as any).currentActiveJobs ?? 0) === 0 && (w.currentActivity === 'PROCESSING_JOB' || !w.currentActivity)
+        ? (activelyCheckingCount > 0 ? 'DISCOVERING_AVAILABILITY' : 'IDLE')
+        : (w.currentActivity || 'IDLE');
+
+      const activityDetails = isStopped
+        ? ((w as any).stopReason || 'Worker process explicitly stopped')
+        : isOffline
+        ? 'Heartbeat lost (no ping in >45s)'
+        : ((w as any).currentActiveJobs ?? 0) === 0 && (w.currentActivity === 'PROCESSING_JOB' || !w.currentActivity)
+        ? (activelyCheckingCount > 0 ? `Actively monitoring ${activelyCheckingCount} date(s)` : 'Idle, waiting for assignments')
+        : (w.activityDetails || 'Idle, waiting for assignments');
+
       return {
         id: w.id,
         workerId: w.id,
@@ -5148,38 +5544,62 @@ export class WorkersService {
         deploymentType: (w as any).deploymentType || 'LOCAL_PC',
         installationId: (w as any).installationId || null,
         pairingCode: isUnpaired ? w.pairingCode : null,
-        status: isDead && w.active && !isRetired ? WorkerStatus.OFFLINE : w.status,
+        status: isStopped ? 'STOPPED' : (isOffline ? WorkerStatus.OFFLINE : w.status),
         adminStatus: w.adminStatus || 'ENABLED',
         desiredState: isUnpaired ? 'UNPAIRED' : (w.desiredState || 'STOPPED'),
         authoritativeState,
         exclusionReason: assessment?.exclusionReason || null,
         maxConcurrentJobs: (w as any).maxConcurrentJobs ?? 1,
-        currentActiveJobs: (w as any).currentActiveJobs ?? (w.currentJobId ? 1 : 0),
+        currentActiveJobs: (isStopped || isOffline) ? 0 : ((w as any).currentActiveJobs ?? (w.currentJobId ? 1 : 0)),
         capabilities: (w as any).capabilities && (w as any).capabilities.length > 0
           ? (w as any).capabilities
           : ['ACCOUNT_VERIFICATION', 'BOOKING_EXECUTION'],
         lastJobAt: (w as any).lastJobAt || null,
         actualRuntimeState: authoritativeState,
-        currentActivity: isDead ? 'OFFLINE' : (w.currentActivity || 'IDLE'),
-        activityDetails: isDead ? 'Worker node is disconnected' : (w.activityDetails || 'Idle, waiting for assignments'),
+        currentActivity,
+        activityDetails,
         activityElapsedSec,
         progressStalled,
         heartbeatAgeSec,
         isDisconnected: isDead,
+        isStopped,
+        isOffline,
         isStale: isDead || (heartbeatAgeSec !== null && heartbeatAgeSec > 60),
         version: w.version,
         ipAddress: w.ipAddress,
         lastHeartbeat: w.lastHeartbeat,
         active: w.active && !isRetired && !isRevoked,
-        currentJobId: w.currentJobId,
-        cpuUsage: w.cpuUsage ?? 0,
-        memoryUsage: w.memoryUsage ?? 0,
+        currentJobId: (!isStopped && !isOffline && ((w as any).currentActiveJobs ?? 0) > 0) ? w.currentJobId : null,
+        cpuUsage: (isStopped || isOffline) ? 0 : (w.cpuUsage ?? 0),
+        memoryUsage: (isStopped || isOffline) ? 0 : (w.memoryUsage ?? 0),
         jobsCompleted: w.jobsCompleted,
         successCount: w.successCount,
         failureCount: w.failureCount,
         operatorShareBalance: w.operatorShareBalance,
         pairingStatus: isUnpaired ? 'UNPAIRED' : 'PAIRED',
-        executionPermitted: !isUnpaired && w.adminStatus === 'ENABLED' && w.desiredState === 'RUNNING',
+        executionPermitted: !isUnpaired && w.adminStatus === 'ENABLED' && w.desiredState === 'RUNNING' && !isStopped && !isOffline,
+        maxMonitoringRequests,
+        currentAssignedMonitoring: (isStopped || isOffline) ? assignedReqs.length : activelyCheckingCount,
+        activelyCheckingCount,
+        executingCount,
+        availableMonitoringSlots,
+        waitingForFirstRefreshCount,
+        assignedButStoppedCount,
+        assignedRequestsCount: assignedReqs.length,
+        assignedRequestDetails,
+        monitoringDraining: (w as any).monitoringDraining ?? false,
+        // Persistent Monitoring Telemetry
+        totalRefreshCount: (w as any).totalRefreshCount ?? 0,
+        totalRequestsMonitored: (w as any).totalRequestsMonitored ?? 0,
+        totalSuccessfulRefreshes: (w as any).totalSuccessfulRefreshes ?? 0,
+        totalFullResults: (w as any).totalFullResults ?? 0,
+        totalAvailableResults: (w as any).totalAvailableResults ?? 0,
+        totalUnknownResults: (w as any).totalUnknownResults ?? 0,
+        totalApiErrors: (w as any).totalApiErrors ?? 0,
+        lastRefreshAt: (w as any).lastRefreshAt,
+        stopReason: isStopped ? ((w as any).stopReason || 'Worker process explicitly stopped') : null,
+        stoppedAt: isStopped ? (w as any).stoppedAt : null,
+        disconnectReason: isOffline ? 'Heartbeat lost (no ping in >45s)' : null,
         createdAt: w.createdAt,
         updatedAt: w.updatedAt,
         retiredAt: w.retiredAt,
@@ -5189,9 +5609,6 @@ export class WorkersService {
     });
   }
 
-  /**
-   * Auto-recover stale leased jobs where worker disconnected
-   */
   async recoverStaleLeasedJobs() {
     if (this.smartAllocator) {
       return this.smartAllocator.recoverStaleLeases();

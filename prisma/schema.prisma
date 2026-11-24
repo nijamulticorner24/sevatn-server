@@ -389,7 +389,14 @@ model BookingRequest {
   reconciliationStatus String?
   lastMilestone     String?
   assignedMachineId String?
-  assignedMachine   WorkerMachine?  @relation(fields: [assignedMachineId], references: [id], onDelete: SetNull)
+  assignedMachine   WorkerMachine?  @relation("AssignedExecutionMachine", fields: [assignedMachineId], references: [id], onDelete: SetNull)
+  
+  // Dynamic Worker Monitoring Capacity & Assignment
+  assignedMonitoringWorkerId String?
+  monitoringWorker           WorkerMachine?  @relation("AssignedMonitoringWorker", fields: [assignedMonitoringWorkerId], references: [id], onDelete: SetNull)
+  isManuallyAssigned         Boolean         @default(false)
+  monitoringAssignedAt       DateTime?
+  monitoringLeaseExpiresAt   DateTime?
   
   // Job Leasing & Watcher fields
   leaseStartedAt    DateTime?
@@ -428,6 +435,16 @@ model BookingRequest {
   pricingConfigVersion Int?            @default(1)
   pricingSnapshot      Json?
 
+  // Monitoring Telemetry & Historical Refresh Auditing
+  totalRefreshCount        Int             @default(0)
+  lastPollSequence         Int             @default(0)
+  lastRefreshAt            DateTime?
+  lastSuccessfulRefreshAt  DateTime?
+  lastRefreshResult        String?
+  lastError                String?
+  monitoringStartedAt      DateTime?
+  monitoringStoppedAt      DateTime?
+
   createdAt         DateTime        @default(now())
   updatedAt         DateTime        @updatedAt
 
@@ -438,10 +455,13 @@ model BookingRequest {
   ledgerEntries     WalletLedgerEntry[]
   reconciliationRecord BookingReconciliation?
   milestones        BookingMilestone[]
+  monitoringPollEvents MonitoringPollEvent[]
 
   @@index([userId, status])
   @@index([status, nextCheckAt])
   @@index([assignedMachineId])
+  @@index([assignedMonitoringWorkerId, status])
+  @@index([status, isManuallyAssigned, requestedDateStr])
   @@index([requestedDate, route])
   @@index([requestedDate, status, createdAt])
   @@index([requestedDate, route, status, createdAt])
@@ -547,17 +567,63 @@ model WorkerMachine {
   capabilities   String[]       @default(["ACCOUNT_VERIFICATION", "BOOKING_EXECUTION", "AVAILABILITY_DISCOVERY"])
   lastJobAt      DateTime?
 
-  assignedBookings BookingRequest[]
+  // Dynamic Worker Monitoring Capacity
+  maxMonitoringRequests     Int     @default(10)
+  currentAssignedMonitoring Int     @default(0)
+  monitoringDraining        Boolean @default(false)
+  browserContextCount       Int     @default(0)
+  resourceWarning           Boolean @default(false)
+
+  // Persistent Refresh & Monitoring Telemetry
+  totalRefreshCount         Int       @default(0)
+  totalRequestsMonitored     Int       @default(0)
+  totalSuccessfulRefreshes   Int       @default(0)
+  totalFullResults          Int       @default(0)
+  totalAvailableResults     Int       @default(0)
+  totalUnknownResults       Int       @default(0)
+  totalApiErrors            Int       @default(0)
+  lastRefreshAt             DateTime?
+  stopReason                String?
+  stoppedAt                 DateTime?
+
+  assignedBookings           BookingRequest[] @relation("AssignedExecutionMachine")
+  assignedMonitoringRequests BookingRequest[] @relation("AssignedMonitoringWorker")
   assignedJobs     BookingJob[]
   attempts         BookingAttempt[]
   activityLogs     WorkerActivityLog[]
   allocationLogs   JobAllocationLog[]
+  pollEvents       MonitoringPollEvent[]
 
   @@index([status])
   @@index([active])
   @@index([adminStatus])
   @@index([machineCode])
   @@index([deploymentType])
+  @@index([maxMonitoringRequests, currentAssignedMonitoring])
+}
+
+model MonitoringPollEvent {
+  id               String         @id @default(uuid())
+  workerId         String
+  worker           WorkerMachine  @relation(fields: [workerId], references: [id], onDelete: Cascade)
+  bookingRequestId String?
+  bookingRequest   BookingRequest? @relation(fields: [bookingRequestId], references: [id], onDelete: Cascade)
+  workerSessionId  String         @default("default")
+  demandKey        String
+  date             String
+  route            String
+  pollSequence     Int
+  pollStartedAt    DateTime
+  pollDurationMs   Int            @default(0)
+  resultState      String
+  errorMessage     String?
+  createdAt        DateTime       @default(now())
+
+  @@unique([workerId, workerSessionId, demandKey, pollSequence])
+  @@index([workerId, createdAt])
+  @@index([bookingRequestId, createdAt])
+  @@index([demandKey, createdAt])
+  @@index([workerId, workerSessionId])
 }
 
 model WorkerActivityLog {

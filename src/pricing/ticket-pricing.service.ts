@@ -38,7 +38,7 @@ export class TicketPricingService {
 
   /**
    * Retrieves active global pricing configuration or initializes defaults:
-   * Base = 🪙 10.00, Max Partner Markup = 🪙 2.00, Max Distributor Markup = 🪙 2.00
+   * Base = ₹ 10.00, Max Partner Markup = ₹ 2.00, Max Distributor Markup = ₹ 2.00
    */
   async getPricingConfig() {
     let config = await this.prisma.pricingConfig.findUnique({
@@ -56,7 +56,7 @@ export class TicketPricingService {
           version: 1,
         },
       });
-      this.logger.log('Initialized default global pricing configuration (Base: 🪙 10, Max Partner: 🪙 2, Max Dist: 🪙 2)');
+      this.logger.log('Initialized default global pricing configuration (Base: ₹ 10, Max Partner: ₹ 2, Max Dist: ₹ 2)');
     }
 
     const baseTicketPrice = Number(config.baseTicketPrice);
@@ -127,7 +127,7 @@ export class TicketPricingService {
     });
 
     this.logger.log(
-      `[Pricing] Config updated by ${adminUser?.email}: Base=🪙 ${dto.baseTicketPrice}, MaxPartner=🪙 ${dto.maxPartnerMarkup}, MaxDist=🪙 ${dto.maxDistributorMarkup}`,
+      `[Pricing] Config updated by ${adminUser?.email}: Base=₹ ${dto.baseTicketPrice}, MaxPartner=₹ ${dto.maxPartnerMarkup}, MaxDist=₹ ${dto.maxDistributorMarkup}`,
     );
 
     return this.getPricingConfig();
@@ -187,7 +187,7 @@ export class TicketPricingService {
     }
     if (markupValue > config.maxPartnerMarkup) {
       throw new BadRequestException(
-        `Partner markup (🪙 ${markupValue}) cannot exceed Super Admin limit (🪙 ${config.maxPartnerMarkup}).`,
+        `Partner markup (₹ ${markupValue}) cannot exceed Super Admin limit (₹ ${config.maxPartnerMarkup}).`,
       );
     }
 
@@ -296,7 +296,7 @@ export class TicketPricingService {
     }
     if (markupValue > config.maxDistributorMarkup) {
       throw new BadRequestException(
-        `Distributor markup (🪙 ${markupValue}) cannot exceed Super Admin limit (🪙 ${config.maxDistributorMarkup}).`,
+        `Distributor markup (₹ ${markupValue}) cannot exceed Super Admin limit (₹ ${config.maxDistributorMarkup}).`,
       );
     }
 

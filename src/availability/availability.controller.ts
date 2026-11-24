@@ -5,10 +5,11 @@ import {
   Body,
   UseGuards,
   Query,
+  UnauthorizedException,
 } from '@nestjs/common';
 import { AvailabilityService } from './availability.service';
 import { MachineAuthGuard, JwtAuthGuard, RolesGuard } from '../common/guards';
-import { Roles } from '../common/decorators';
+import { Roles, CurrentMachine } from '../common/decorators';
 import { PublishAvailabilityDto, BulkPublishAvailabilityDto, ClaimDemandDto, ReleaseDemandDto } from './dto/availability.dto';
 import { Role } from '@prisma/client';
 
@@ -17,12 +18,16 @@ export class AvailabilityController {
   constructor(private readonly availabilityService: AvailabilityService) {}
 
   /**
-   * Worker fetches current date demand index to focus availability discovery
+   * Worker fetches current date demand index to focus availability discovery.
+   * Strictly isolated: returns ONLY requests assigned to the authenticated machine.
    */
   @Get('demand-dates')
   @UseGuards(MachineAuthGuard)
-  async getDemandDates() {
-    return this.availabilityService.getDemandDates();
+  async getDemandDates(@CurrentMachine() machine: any) {
+    if (!machine || !machine.id) {
+      throw new UnauthorizedException('Valid worker machine authentication is required to access demand dates');
+    }
+    return this.availabilityService.getDemandDates(machine.id);
   }
 
   /**

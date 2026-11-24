@@ -515,6 +515,9 @@ export class AdminService {
               data: {
                 status: BookingStatus.CANCELLED,
                 assignedMachineId: null,
+                assignedMonitoringWorkerId: null,
+                isWatching: false,
+                monitoringStoppedAt: cancelNow,
                 leaseExpiresAt: null,
                 leaseStartedAt: null,
                 failureReason: cancelFailureReason,
@@ -527,6 +530,9 @@ export class AdminService {
             data: {
               status: BookingStatus.CANCELLED,
               assignedMachineId: null,
+              assignedMonitoringWorkerId: null,
+              isWatching: false,
+              monitoringStoppedAt: cancelNow,
               leaseExpiresAt: null,
               leaseStartedAt: null,
               failureReason: cancelFailureReason,
@@ -1779,6 +1785,107 @@ export class AdminService {
       success: true,
       message: `Booking #${booking.bookingCode} completed successfully with reference ${cleanRef}`,
       reference: cleanRef,
+    };
+  }
+
+  /**
+   * Super Admin assigns a booking request to a specific worker machine (Cloud or Local),
+   * or returns it to AUTO distribution (workerMachineId = null).
+   */
+  async pinBookingToWorker(bookingId: string, workerMachineId: string | null) {
+    const booking = await this.prisma.bookingRequest.findUnique({
+      where: { id: bookingId },
+    });
+    if (!booking) {
+      throw new NotFoundException(`Booking request ${bookingId} not found`);
+    }
+
+    if (workerMachineId) {
+      const worker = await this.prisma.workerMachine.findUnique({
+        where: { id: workerMachineId },
+      });
+      if (!worker) {
+        throw new NotFoundException(`Worker machine ${workerMachineId} not found`);
+      }
+
+      const updated = await this.prisma.bookingRequest.update({
+        where: { id: bookingId },
+        data: {
+          assignedMonitoringWorkerId: workerMachineId,
+          isManuallyAssigned: true,
+          monitoringAssignedAt: new Date(),
+          monitoringLeaseExpiresAt: new Date(Date.now() + 60000),
+          status: booking.status === BookingStatus.PENDING ? BookingStatus.WATCHING : booking.status,
+          isWatching: true,
+        },
+      });
+
+      this.logger.log(`Booking ${booking.bookingCode} pinned manually to worker ${worker.machineCode}`);
+      return { success: true, mode: 'MANUAL', workerMachineId, booking: updated };
+    } else {
+      // Return to AUTO allocation
+      const updated = await this.prisma.bookingRequest.update({
+        where: { id: bookingId },
+        data: {
+          assignedMonitoringWorkerId: null,
+          isManuallyAssigned: false,
+          monitoringAssignedAt: null,
+          monitoringLeaseExpiresAt: null,
+        },
+      });
+
+      this.logger.log(`Booking ${booking.bookingCode} returned to AUTO allocation`);
+      return { success: true, mode: 'AUTO', workerMachineId: null, booking: updated };
+    }
+  }
+
+  /**
+   * Super Admin views fleet monitoring capacity, assigned counts, pending queue count, and worker health.
+   */
+  async getFleetMonitoringStatus() {
+    const workers = await this.prisma.workerMachine.findMany({
+      where: { active: true },
+      select: {
+        id: true,
+        machineCode: true,
+        machineName: true,
+        deploymentType: true,
+        status: true,
+        desiredState: true,
+        adminStatus: true,
+        maxMonitoringRequests: true,
+        currentAssignedMonitoring: true,
+        monitoringDraining: true,
+        maxConcurrentJobs: true,
+        currentActiveJobs: true,
+        cpuUsage: true,
+        memoryUsage: true,
+        browserContextCount: true,
+        resourceWarning: true,
+        lastHeartbeat: true,
+      },
+      orderBy: [{ deploymentType: 'asc' }, { createdAt: 'asc' }],
+    });
+
+    const pendingQueueCount = await this.prisma.bookingRequest.count({
+      where: {
+        status: { in: [BookingStatus.PENDING, BookingStatus.WATCHING, BookingStatus.WAITING_FOR_DATE_AVAILABILITY, BookingStatus.FAST_BOOKING_QUEUED] },
+        assignedMonitoringWorkerId: null,
+      },
+    });
+
+    const totalAssignedMonitoring = await this.prisma.bookingRequest.count({
+      where: {
+        status: { in: [BookingStatus.PENDING, BookingStatus.WATCHING, BookingStatus.WAITING_FOR_DATE_AVAILABILITY, BookingStatus.FAST_BOOKING_QUEUED] },
+        assignedMonitoringWorkerId: { not: null },
+      },
+    });
+
+    return {
+      workers,
+      pendingQueueCount,
+      totalAssignedMonitoring,
+      totalMonitoringCapacity: workers.reduce((sum, w) => sum + (w.maxMonitoringRequests || 10), 0),
     };
   }
 }
