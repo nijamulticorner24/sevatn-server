@@ -100,6 +100,7 @@ describe('FIX: Restart Booking Must Re-enter Availability Monitoring Suite', () 
     mockSmartAllocator = {
       runAllocationSweep: jest.fn().mockResolvedValue({ allocatedCount: 1, pendingCount: 0 }),
       runMonitoringAllocationSweep: jest.fn().mockResolvedValue({ allocatedCount: 1, pendingCount: 0 }),
+      assignMonitoringWorkerInstantly: jest.fn().mockResolvedValue({ assigned: false }),
     };
 
     mockSmartMatcher = {
@@ -402,5 +403,56 @@ describe('FIX: Restart Booking Must Re-enter Availability Monitoring Suite', () 
 
     // Validates monitoring allocation sweep assigned fresh active worker
     expect(mockSmartAllocator.runMonitoringAllocationSweep).toHaveBeenCalled();
+  });
+
+  // 11. Instant worker assignment on restart: binds directly to online worker and sets WATCHING
+  it('11. Instant worker assignment on restart: binds directly to online worker and sets WATCHING', async () => {
+    mockSmartAllocator.assignMonitoringWorkerInstantly.mockResolvedValueOnce({
+      assigned: true,
+      worker: { id: 'worker-node-1', machineCode: 'WM-001', machineName: 'Cloud-1', status: 'ONLINE' },
+    });
+    mockPrisma.bookingRequest.findUnique
+      .mockResolvedValueOnce(failedBookingFixture)
+      .mockResolvedValueOnce({
+        ...failedBookingFixture,
+        status: BookingStatus.WATCHING,
+        assignedMonitoringWorkerId: 'worker-node-1',
+        monitoringWorker: { id: 'worker-node-1', machineCode: 'WM-001', machineName: 'Cloud-1', status: 'ONLINE' },
+      });
+
+    const res = await bookingsService.restartBooking('bk-failed-1', adminUser);
+
+    expect(mockSmartAllocator.assignMonitoringWorkerInstantly).toHaveBeenCalledWith('bk-failed-1', expect.anything());
+    expect(res.booking.status).toBe(BookingStatus.WATCHING);
+    expect(res.booking.assignedMonitoringWorkerId).toBe('worker-node-1');
+    expect(res.message).toContain('instantly assigned to worker WM-001');
+  });
+
+  // 12. Restart booking in PENDING status: triggers instant worker assignment and transitions to WATCHING
+  it('12. Restart booking in PENDING status: triggers instant worker assignment and transitions to WATCHING', async () => {
+    const pendingBooking = {
+      ...failedBookingFixture,
+      status: BookingStatus.PENDING,
+      assignedMachineId: null,
+      assignedMonitoringWorkerId: null,
+    };
+    mockSmartAllocator.assignMonitoringWorkerInstantly.mockResolvedValueOnce({
+      assigned: true,
+      worker: { id: 'worker-local-1', machineCode: 'PC-001', machineName: 'Local-1', status: 'IDLE' },
+    });
+    mockPrisma.bookingRequest.findUnique
+      .mockResolvedValueOnce(pendingBooking)
+      .mockResolvedValueOnce({
+        ...pendingBooking,
+        status: BookingStatus.WATCHING,
+        assignedMonitoringWorkerId: 'worker-local-1',
+        monitoringWorker: { id: 'worker-local-1', machineCode: 'PC-001', machineName: 'Local-1', status: 'IDLE' },
+      });
+
+    const res = await bookingsService.restartBooking('bk-failed-1', adminUser);
+
+    expect(res.booking.status).toBe(BookingStatus.WATCHING);
+    expect(res.booking.assignedMonitoringWorkerId).toBe('worker-local-1');
+    expect(res.message).toContain('instantly assigned to worker PC-001');
   });
 });

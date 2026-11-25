@@ -391,6 +391,7 @@ export class WorkersController {
       route?: string;
       jobType?: string;
       maxActiveBookings?: number;
+      bookingIds?: string[];
     },
   ) {
     return this.workersService.claimJob(machine.id, dto?.activeJobIds, {
@@ -399,6 +400,7 @@ export class WorkersController {
       route: dto?.route,
       jobType: dto?.jobType,
       maxActiveBookings: dto?.maxActiveBookings,
+      bookingIds: dto?.bookingIds,
     });
   }
 

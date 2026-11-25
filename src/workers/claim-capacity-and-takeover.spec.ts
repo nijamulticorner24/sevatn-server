@@ -583,4 +583,96 @@ describe('Capacity Counting, Same-Owner Takeover, Competing Worker, & Already-Co
       expect((result as any).reason).toBe('ACCOUNT_BUSY(job-live-acc-holder)');
     });
   });
+
+  describe('6. Strict date and route filtering in claimJob', () => {
+    it('claimJob with date filter: strictly claims matching date and does not claim older candidate on different date', async () => {
+      // Setup: Older booking for 2027-01-02, newer booking for 2026-11-26
+      const oldBr = createBooking({
+        id: 'br-old-jan2',
+        bookingCode: 'TA-10001',
+        status: BookingStatus.QUEUED,
+        requestedDateStr: '2027-01-02',
+        requestedDate: new Date('2027-01-02'),
+        createdAt: new Date('2026-10-01T10:00:00Z'),
+      });
+      const targetBr = createBooking({
+        id: 'br-target-nov26',
+        bookingCode: 'TA-10020',
+        status: BookingStatus.QUEUED,
+        requestedDateStr: '2026-11-26',
+        requestedDate: new Date('2026-11-26'),
+        createdAt: new Date('2026-11-20T10:00:00Z'),
+      });
+
+      mockBookings = [oldBr, targetBr];
+      mockJobs = [
+        {
+          id: 'job-old-jan2',
+          bookingRequestId: 'br-old-jan2',
+          jobType: JobType.BOOKING_EXECUTION,
+          workerId: null,
+          status: BookingStatus.QUEUED,
+          leaseExpiresAt: null,
+          leaseGeneration: 0,
+          account: oldBr.account,
+        },
+        {
+          id: 'job-target-nov26',
+          bookingRequestId: 'br-target-nov26',
+          jobType: JobType.BOOKING_EXECUTION,
+          workerId: null,
+          status: BookingStatus.QUEUED,
+          leaseExpiresAt: null,
+          leaseGeneration: 0,
+          account: targetBr.account,
+        },
+      ];
+
+      // Worker detects 2026-11-26 as AVAILABLE and submits claim with date: '2026-11-26'
+      const result = await workersService.claimJob('worker-pc1', [], {
+        triggerSource: 'SLOT_OPENED',
+        date: '2026-11-26',
+        route: 'Pamba (Regular Footpath Route)',
+      });
+
+      expect(result.hasJob).toBe(true);
+      expect(result.job.id).toBe('job-target-nov26');
+      expect(result.job.bookingCode).toBe('TA-10020');
+      expect(result.job.requestedDate).toBe('2026-11-26');
+    });
+
+    it('claimJob with date filter: returns hasJob: false when only different dates exist in candidate jobs', async () => {
+      const oldBr = createBooking({
+        id: 'br-old-jan2',
+        bookingCode: 'TA-10001',
+        status: BookingStatus.QUEUED,
+        requestedDateStr: '2027-01-02',
+        requestedDate: new Date('2027-01-02'),
+        createdAt: new Date('2026-10-01T10:00:00Z'),
+      });
+
+      mockBookings = [oldBr];
+      mockJobs = [
+        {
+          id: 'job-old-jan2',
+          bookingRequestId: 'br-old-jan2',
+          jobType: JobType.BOOKING_EXECUTION,
+          workerId: null,
+          status: BookingStatus.QUEUED,
+          leaseExpiresAt: null,
+          leaseGeneration: 0,
+          account: oldBr.account,
+        },
+      ];
+
+      const result = await workersService.claimJob('worker-pc1', [], {
+        triggerSource: 'SLOT_OPENED',
+        date: '2026-11-26', // Different date requested
+        route: 'Pamba (Regular Footpath Route)',
+      });
+
+      expect(result.hasJob).toBe(false);
+      expect(result.reason).toContain('DATE_MISMATCH');
+    });
+  });
 });

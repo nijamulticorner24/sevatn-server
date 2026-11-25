@@ -2,6 +2,7 @@ import {
   Controller,
   Get,
   Post,
+  Delete,
   Body,
   Param,
   Query,
@@ -86,5 +87,19 @@ export class BookingsController {
     @CurrentUser() user: any,
   ) {
     return this.bookingsService.resolveHumanAction(id, dto, user);
+  }
+
+  @Delete(':id')
+  @Roles(Role.SUPER_ADMIN, Role.CENTRE)
+  @UseGuards(RolesGuard)
+  async deleteBooking(@Param('id') id: string, @CurrentUser() user: any) {
+    return this.bookingsService.deleteBooking(id, user);
+  }
+
+  @Post('bulk-delete')
+  @Roles(Role.SUPER_ADMIN, Role.CENTRE)
+  @UseGuards(RolesGuard)
+  async deleteBookings(@Body() dto: { ids: string[] }, @CurrentUser() user: any) {
+    return this.bookingsService.deleteBookings(dto.ids, user);
   }
 }

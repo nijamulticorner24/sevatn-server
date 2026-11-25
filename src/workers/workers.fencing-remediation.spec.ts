@@ -62,8 +62,16 @@ describe('WorkersService Fencing & Lease Remediation (Phase 3)', () => {
         }),
       },
       workerMachine: {
-        findUnique: jest.fn().mockResolvedValue({ id: 'w-active-1', machineCode: 'PC-ACTIVE-1' }),
+        findUnique: jest.fn().mockResolvedValue({
+          id: 'w-active-1',
+          machineCode: 'PC-ACTIVE-1',
+          active: true,
+          adminStatus: 'ENABLED',
+          desiredState: 'RUNNING',
+          capabilities: ['BOOKING_EXECUTION'],
+        }),
         update: jest.fn().mockResolvedValue({}),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
       walletTransaction: {
         findFirst: jest.fn().mockResolvedValue({ id: 'tx-1', amount: 200 }),
@@ -117,7 +125,7 @@ describe('WorkersService Fencing & Lease Remediation (Phase 3)', () => {
       // Current job has leaseGeneration: 3. Worker reports with generation: 2.
       await expect(
         workersService.completeJob('job-fencing-1', 'w-active-1', {
-          officialReference: 'OFFICIAL-PASS-999',
+          officialReference: 'SAB-2026-SYNTHETIC', // Not a finalized external pass, so fencing check must enforce strictly
           leaseGeneration: 2, // STALE!
           fencingToken: 'fnc_job-fencing-1_gen2_old',
         }),
@@ -131,7 +139,7 @@ describe('WorkersService Fencing & Lease Remediation (Phase 3)', () => {
     it('REJECTS completion when fencingToken does not match the active fencingToken', async () => {
       await expect(
         workersService.completeJob('job-fencing-1', 'w-active-1', {
-          officialReference: 'OFFICIAL-PASS-999',
+          officialReference: 'SAB-2026-SYNTHETIC',
           leaseGeneration: 3,
           fencingToken: 'fnc_mismatched_token', // MISMATCH!
         }),
@@ -143,7 +151,7 @@ describe('WorkersService Fencing & Lease Remediation (Phase 3)', () => {
     it('REJECTS completion if a different machine claims completion', async () => {
       await expect(
         workersService.completeJob('job-fencing-1', 'w-impostor-9', {
-          officialReference: 'OFFICIAL-PASS-999',
+          officialReference: 'SAB-2026-SYNTHETIC',
           leaseGeneration: 3,
           fencingToken: 'fnc_job-fencing-1_gen3_w-active',
         }),
@@ -157,7 +165,7 @@ describe('WorkersService Fencing & Lease Remediation (Phase 3)', () => {
       mockJob.fencingToken = null;
       await expect(
         workersService.completeJob('job-fencing-1', 'w-active-1', {
-          officialReference: 'OFFICIAL-PASS-999',
+          officialReference: 'SAB-2026-SYNTHETIC',
         }),
       ).rejects.toThrow(new ForbiddenException('leaseGeneration is required (LEASE_GENERATION_REQUIRED)'));
 
@@ -181,6 +189,7 @@ describe('WorkersService Fencing & Lease Remediation (Phase 3)', () => {
           workerId: 'w-active-1',
           leaseGeneration: 3,
         }),
+        expect.anything(),
       );
       // Wallet capture invoked
       expect(walletService.capture).toHaveBeenCalled();
@@ -241,6 +250,107 @@ describe('WorkersService Fencing & Lease Remediation (Phase 3)', () => {
           leaseGeneration: 4,
         },
       });
+    });
+  });
+
+  describe('4. updateJobProgress Fencing & Active Lease Preservation', () => {
+    it('ACCEPTS updateJobProgress when leaseGeneration and fencingToken match current job lease', async () => {
+      const res = await workersService.updateJobProgress('job-fencing-1', 'w-active-1', {
+        status: BookingStatus.EXECUTING,
+        leaseGeneration: 3,
+        fencingToken: 'fnc_job-fencing-1_gen3_w-active',
+        note: 'Selecting date',
+      });
+
+      expect(res).toBeDefined();
+      expect(prisma.bookingJob.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'job-fencing-1' },
+          data: expect.objectContaining({
+            status: BookingStatus.EXECUTING,
+          }),
+        }),
+      );
+    });
+
+    it('REJECTS updateJobProgress with HTTP 409 ConflictException when leaseGeneration is stale', async () => {
+      await expect(
+        workersService.updateJobProgress('job-fencing-1', 'w-active-1', {
+          status: BookingStatus.EXECUTING,
+          leaseGeneration: 2, // STALE! current is 3
+          fencingToken: 'fnc_job-fencing-1_gen3_w-active',
+          note: 'Selecting date',
+        }),
+      ).rejects.toThrow(ConflictException);
+
+      await expect(
+        workersService.updateJobProgress('job-fencing-1', 'w-active-1', {
+          status: BookingStatus.EXECUTING,
+          leaseGeneration: 2,
+          fencingToken: 'fnc_job-fencing-1_gen3_w-active',
+        }),
+      ).rejects.toThrow('Stale lease generation (STALE_LEASE_GENERATION)');
+    });
+
+    it('REJECTS updateJobProgress with HTTP 409 ConflictException when fencingToken does not match', async () => {
+      await expect(
+        workersService.updateJobProgress('job-fencing-1', 'w-active-1', {
+          status: BookingStatus.EXECUTING,
+          leaseGeneration: 3,
+          fencingToken: 'fnc_wrong_token', // MISMATCH!
+        }),
+      ).rejects.toThrow(ConflictException);
+
+      await expect(
+        workersService.updateJobProgress('job-fencing-1', 'w-active-1', {
+          status: BookingStatus.EXECUTING,
+          leaseGeneration: 3,
+          fencingToken: 'fnc_wrong_token',
+        }),
+      ).rejects.toThrow('Fencing token mismatch (FENCING_TOKEN_MISMATCH)');
+    });
+
+    it('PRESERVES active leaseGeneration and fencingToken when worker re-claims its own active unexpired job', async () => {
+      const futureExpiry = new Date(Date.now() + 60000);
+      const activeExecutingJob = {
+        id: 'job-active-claim-1',
+        workerId: 'w-active-1',
+        status: BookingStatus.EXECUTING,
+        leaseGeneration: 2,
+        fencingToken: 'fnc_token_active_2',
+        leaseExpiresAt: futureExpiry,
+        jobType: JobType.BOOKING_EXECUTION,
+        bookingRequestId: 'br-fencing-1',
+        bookingRequest: {
+          id: 'br-fencing-1',
+          bookingCode: 'BK-FENCE-001',
+          status: BookingStatus.EXECUTING,
+          requestedDateStr: '2026-12-14',
+          route: 'Pamba',
+          pilgrimCount: 1,
+        },
+      };
+
+      prisma.bookingJob.findFirst = jest.fn().mockResolvedValue(activeExecutingJob);
+      prisma.bookingJob.updateMany = jest.fn().mockResolvedValue({ count: 1 });
+      prisma.bookingJob.findUnique = jest.fn().mockResolvedValue(activeExecutingJob);
+
+      const claimRes = await workersService.claimJob('w-active-1', [], {
+        date: '2026-12-14',
+      });
+
+      expect(claimRes.hasJob).toBe(true);
+      // Generation must NOT be incremented to 3; token must NOT be changed!
+      expect(claimRes.job?.leaseGeneration).toBe(2);
+      expect(claimRes.job?.fencingToken).toBe('fnc_token_active_2');
+      expect(prisma.bookingJob.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: 'job-active-claim-1', workerId: 'w-active-1' }),
+          data: expect.not.objectContaining({
+            leaseGeneration: { increment: 1 },
+          }),
+        }),
+      );
     });
   });
 });

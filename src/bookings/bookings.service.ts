@@ -565,6 +565,9 @@ export class BookingsService {
       this.smartAllocator.runAllocationSweep().catch((err) => {
         this.logger.warn(`Proactive allocation error: ${err.message}`);
       });
+      this.smartAllocator.runMonitoringAllocationSweep().catch((err) => {
+        this.logger.warn(`Proactive monitoring allocation error: ${err.message}`);
+      });
     }
 
     // Dispatch real-time Telegram alert for new booking arrival
@@ -1126,8 +1129,9 @@ export class BookingsService {
       throw new BadRequestException(`Cannot restart an already confirmed booking (#${booking.bookingCode})`);
     }
 
-    // Only CANCELLED and FAILED bookings can be restarted
+    // Only PENDING, CANCELLED, and FAILED bookings can be restarted
     const allowedRestartStatuses: BookingStatus[] = [
+      BookingStatus.PENDING,
       BookingStatus.CANCELLED,
       BookingStatus.FAILED,
       BookingStatus.LOGIN_FAILED,
@@ -1250,20 +1254,6 @@ export class BookingsService {
         }
       }
 
-      // Transition booking back to PENDING (monitoring state)
-      const transitionRes = await this.stateMachine.transition(
-        {
-          bookingId: id,
-          targetStatus: BookingStatus.PENDING,
-          targetExecutionStatus: 'IDLE',
-          targetFinancialStatus: 'RESERVED' as any,
-          expectedVersion: booking.version,
-          note: `Restarted by ${user.role} (${user.email || user.username || user.id}) - entered availability monitoring`,
-          force: true,
-        },
-        tx,
-      );
-
       // Clear previous worker execution states, error states, and reset monitoring cycle on bookingRequest
       await tx.bookingRequest.update({
         where: { id },
@@ -1273,6 +1263,7 @@ export class BookingsService {
           monitoringAssignedAt: null,
           monitoringLeaseExpiresAt: null,
           isWatching: false,
+          isManuallyAssigned: false,
           leaseExpiresAt: null,
           leaseStartedAt: null,
           failureReason: null,
@@ -1307,11 +1298,48 @@ export class BookingsService {
         },
       });
 
-      return transitionRes.booking;
+      // Transition booking back to PENDING (initial clean restart state)
+      const transitionRes = await this.stateMachine.transition(
+        {
+          bookingId: id,
+          targetStatus: BookingStatus.PENDING,
+          targetExecutionStatus: 'IDLE',
+          targetFinancialStatus: 'RESERVED' as any,
+          expectedVersion: booking.version,
+          note: `Restarted by ${user.role} (${user.email || user.username || user.id}) - entered availability monitoring`,
+          force: true,
+        },
+        tx,
+      );
+
+      // INSTANT WORKER ASSIGNMENT: immediately allocate to an online worker with monitoring capacity
+      let instantWorker: any = null;
+      if (this.smartAllocator && typeof this.smartAllocator.assignMonitoringWorkerInstantly === 'function') {
+        try {
+          const allocRes = await this.smartAllocator.assignMonitoringWorkerInstantly(id, tx);
+          if (allocRes?.assigned && allocRes.worker) {
+            instantWorker = allocRes.worker;
+            await this.stateMachine.transition(
+              {
+                bookingId: id,
+                targetStatus: BookingStatus.WATCHING,
+                targetExecutionStatus: 'IDLE',
+                expectedVersion: (transitionRes.booking?.version ?? booking.version) + 1,
+                note: `Instantly assigned to worker ${allocRes.worker.machineCode} for availability monitoring`,
+              },
+              tx,
+            ).catch(() => {});
+          }
+        } catch (allocErr: any) {
+          this.logger.warn(`[BOOKING RESTART] Instant allocation notice for #${booking.bookingCode}: ${allocErr?.message || allocErr}`);
+        }
+      }
+
+      return { booking: transitionRes.booking, instantWorker };
     });
 
-    // Assign the request to an eligible worker according to its monitoring capacity
-    if (this.smartAllocator) {
+    // If not instantly assigned, fall back to monitoring allocation sweep
+    if (!updated?.instantWorker && this.smartAllocator) {
       try {
         await this.smartAllocator.runMonitoringAllocationSweep();
       } catch (allocErr: any) {
@@ -1336,11 +1364,18 @@ export class BookingsService {
       monitoringWorker: freshBooking?.monitoringWorker || null,
     });
 
-    this.logger.log(`[BOOKING RESTART] Booking #${booking.bookingCode} restarted and entered availability monitoring by ${user.role}`);
+    const isWatching = freshBooking?.status === BookingStatus.WATCHING;
+    const workerCode = freshBooking?.monitoringWorker?.machineCode;
+
+    this.logger.log(
+      `[BOOKING RESTART] Booking #${booking.bookingCode} restarted by ${user.role} (Status: ${freshBooking?.status || 'PENDING'}, Assigned PC: ${workerCode || 'Pending Assignment'})`,
+    );
 
     return {
-      message: `Booking #${booking.bookingCode} restarted successfully and entered availability monitoring`,
-      booking: freshBooking || updated,
+      message: isWatching && workerCode
+        ? `Booking #${booking.bookingCode} restarted and instantly assigned to worker ${workerCode} (Status: WATCHING)`
+        : `Booking #${booking.bookingCode} restarted successfully and entered availability monitoring`,
+      booking: freshBooking || updated?.booking || booking,
     };
   }
 
@@ -1578,6 +1613,207 @@ export class BookingsService {
     } else {
       return this.cancelBooking(id, user);
     }
+  }
+
+  /**
+   * Permanently delete a booking request and clean up associated records,
+   * worker assignments, and release any active wallet holds.
+   */
+  async deleteBooking(id: string, user: any) {
+    const booking = await this.prisma.bookingRequest.findUnique({
+      where: { id },
+      include: {
+        user: {
+          include: {
+            centre: true,
+          },
+        },
+      },
+    });
+
+    if (!booking) {
+      throw new NotFoundException('Booking not found');
+    }
+
+    if (user.role === Role.CENTRE && booking.userId !== user.id) {
+      throw new ForbiddenException('Access denied: You can only delete your own bookings.');
+    }
+
+    // 1. Release any active wallet hold for this booking
+    try {
+      const reserveTxs = await this.prisma.walletTransaction.findMany({
+        where: {
+          bookingId: booking.id,
+          type: { in: ['RESERVE', 'RELEASE', 'CAPTURE', 'REFUND'] },
+          status: 'COMPLETED',
+        },
+      });
+      let currentHeld = 0;
+      for (const tx of reserveTxs) {
+        const amt = Number(tx.amount);
+        if (tx.type === 'RESERVE') currentHeld += amt;
+        if (tx.type === 'RELEASE' || tx.type === 'REFUND' || tx.type === 'CAPTURE') currentHeld -= amt;
+      }
+      if (currentHeld > 0) {
+        await this.walletService.release({
+          userId: booking.userId,
+          bookingId: booking.id,
+          amount: currentHeld,
+          reason: 'Booking deleted by operator',
+          idempotencyKey: `delete_${booking.id}_${Date.now()}`,
+        }).catch((err: any) => this.logger.warn(`Failed to release wallet hold on delete: ${err.message}`));
+      }
+    } catch (err: any) {
+      this.logger.warn(`Error calculating held funds for deleted booking ${id}: ${err.message}`);
+    }
+
+    // 2. Release devotee account lock if held
+    if (booking.accountId) {
+      await this.accountLockService.releaseLock(booking.accountId, booking.id).catch(() => {});
+    }
+
+    // 3. If assigned to a worker that is actively running it, reset worker state
+    const assignedExecutionWorkerId = booking.assignedMachineId;
+    if (assignedExecutionWorkerId) {
+      await this.prisma.workerMachine.updateMany({
+        where: {
+          id: assignedExecutionWorkerId,
+          currentBookingId: booking.id,
+        },
+        data: {
+          currentBookingId: null,
+          currentJobId: null,
+          currentActivity: 'IDLE',
+          activityDetails: 'Idle, ready for work',
+        },
+      }).catch(() => {});
+    }
+
+    // 4. If assigned for monitoring, adjust cached count
+    const assignedMonitoringId = booking.assignedMonitoringWorkerId;
+
+    // 5. Unlink wallet transactions and ledger entries so they don't block deletion
+    await this.prisma.walletTransaction.updateMany({
+      where: { bookingId: booking.id },
+      data: { bookingId: null },
+    }).catch(() => {});
+    await this.prisma.walletLedgerEntry.updateMany({
+      where: { bookingId: booking.id },
+      data: { bookingId: null },
+    }).catch(() => {});
+
+    // 6. Unlink availability opportunities
+    await this.prisma.availabilityOpportunity.updateMany({
+      where: { matchedBookingId: booking.id },
+      data: { matchedBookingId: null },
+    }).catch(() => {});
+
+    // 7. Delete dependent logs & records
+    await this.prisma.accountLock.deleteMany({
+      where: { bookingId: booking.id },
+    }).catch(() => {});
+    await this.prisma.jobAllocationLog.deleteMany({
+      where: { bookingId: booking.id },
+    }).catch(() => {});
+    await this.prisma.bookingMilestone.deleteMany({
+      where: { bookingRequestId: booking.id },
+    }).catch(() => {});
+    await this.prisma.bookingAttempt.deleteMany({
+      where: { bookingId: booking.id },
+    }).catch(() => {});
+    await this.prisma.bookingReconciliation.deleteMany({
+      where: { bookingRequestId: booking.id },
+    }).catch(() => {});
+    await this.prisma.bookingJob.deleteMany({
+      where: { bookingRequestId: booking.id },
+    }).catch(() => {});
+    await this.prisma.bookingPilgrim.deleteMany({
+      where: { bookingRequestId: booking.id },
+    }).catch(() => {});
+
+    // 8. Delete the booking request
+    await this.prisma.bookingRequest.delete({
+      where: { id: booking.id },
+    });
+
+    if (assignedMonitoringId) {
+      const remainingCount = await this.prisma.bookingRequest.count({
+        where: {
+          assignedMonitoringWorkerId: assignedMonitoringId,
+          status: { in: [BookingStatus.PENDING, BookingStatus.WATCHING, BookingStatus.WAITING_FOR_DATE_AVAILABILITY, BookingStatus.FAST_BOOKING_QUEUED] },
+        },
+      }).catch(() => 0);
+      await this.prisma.workerMachine.update({
+        where: { id: assignedMonitoringId },
+        data: { currentAssignedMonitoring: remainingCount },
+      }).catch(() => {});
+    }
+
+    this.logger.log(`Booking #${booking.bookingCode} (ID: ${booking.id}) permanently deleted by ${user.role} (${user.email || user.id}).`);
+
+    // 9. Audit log
+    await this.audit.log({
+      actorId: user.id,
+      actorType: user.role === Role.SUPER_ADMIN ? 'ADMIN' : 'USER',
+      action: 'BOOKING_DELETED',
+      entity: 'BookingRequest',
+      entityId: booking.id,
+      metadata: {
+        bookingCode: booking.bookingCode,
+        requestedDate: booking.requestedDateStr || booking.requestedDate,
+        route: booking.route,
+        deletedByRole: user.role,
+      },
+    }).catch(() => {});
+
+    // 10. Notify UI via WebSocket
+    this.eventsGateway.emitToAdmins('admin:booking_deleted', { bookingId: booking.id, bookingCode: booking.bookingCode });
+    this.eventsGateway.emitToAdmins('admin:booking_updated', { bookingId: booking.id, status: 'DELETED' });
+    this.eventsGateway.notifyBookingUpdated(booking.id, booking.userId, {
+      bookingId: booking.id,
+      bookingCode: booking.bookingCode,
+      status: 'DELETED',
+      timestamp: new Date().toISOString(),
+    });
+
+    // 11. Proactively reconcile monitoring and allocation sweeps
+    if (this.smartAllocator) {
+      this.smartAllocator.runAllocationSweep().catch(() => {});
+      this.smartAllocator.runMonitoringAllocationSweep().catch(() => {});
+    }
+
+    return {
+      success: true,
+      message: `Booking #${booking.bookingCode} was deleted successfully.`,
+      bookingId: booking.id,
+      bookingCode: booking.bookingCode,
+    };
+  }
+
+  /**
+   * Bulk delete multiple booking requests
+   */
+  async deleteBookings(ids: string[], user: any) {
+    if (!ids || !Array.isArray(ids) || ids.length === 0) {
+      throw new BadRequestException('No booking IDs provided');
+    }
+    const results: any[] = [];
+    for (const id of ids) {
+      try {
+        const res = await this.deleteBooking(id, user);
+        results.push(res);
+      } catch (err: any) {
+        this.logger.warn(`Failed to delete booking ${id}: ${err.message}`);
+        results.push({ success: false, id, error: err.message });
+      }
+    }
+    const deletedCount = results.filter((r) => r.success).length;
+    return {
+      success: true,
+      message: `${deletedCount} of ${ids.length} booking(s) deleted successfully.`,
+      deletedCount,
+      results,
+    };
   }
 
   /**

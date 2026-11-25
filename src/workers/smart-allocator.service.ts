@@ -1774,6 +1774,100 @@ export class SmartAllocatorService {
   private isMonitoringSweepRunning = false;
 
   /**
+   * Instantly assign an open/restarted booking to an eligible online worker for availability monitoring.
+   * Directly sets status = WATCHING, isWatching = true, and assignedMonitoringWorkerId.
+   */
+  async assignMonitoringWorkerInstantly(
+    bookingId: string,
+    tx?: any,
+  ): Promise<{ assigned: boolean; worker?: any }> {
+    const client = tx || this.prisma;
+    const now = new Date();
+    const healthyCutoff = new Date(now.getTime() - 35000);
+
+    const booking = await client.bookingRequest.findUnique({
+      where: { id: bookingId },
+      select: { id: true, bookingCode: true, status: true, version: true, userId: true },
+    });
+    if (!booking) return { assigned: false };
+
+    // 1. Fetch eligible online workers: Cloud (DOCKER/CLOUD_VM) first, then Local (LOCAL_PC)
+    const workers = await client.workerMachine.findMany({
+      where: {
+        status: { in: [WorkerStatus.ONLINE, WorkerStatus.IDLE, WorkerStatus.BUSY] },
+        active: true,
+        adminStatus: { notIn: ['REVOKED', 'RETIRED', 'PAUSED', 'DISABLED'] },
+        desiredState: 'RUNNING',
+        lastHeartbeat: { gte: healthyCutoff },
+      },
+      orderBy: [
+        { deploymentType: 'asc' },
+        { createdAt: 'asc' },
+      ],
+    });
+
+    for (const worker of workers) {
+      if ((worker.cpuUsage && worker.cpuUsage > 85) || (worker.memoryUsage && worker.memoryUsage > 85)) {
+        continue;
+      }
+
+      const currentAssigned = await client.bookingRequest.count({
+        where: {
+          assignedMonitoringWorkerId: worker.id,
+          status: { in: [BookingStatus.PENDING, BookingStatus.WATCHING, BookingStatus.WAITING_FOR_DATE_AVAILABILITY, BookingStatus.FAST_BOOKING_QUEUED] },
+        },
+      });
+
+      const maxCap = worker.maxMonitoringRequests ?? 10;
+      if (currentAssigned < maxCap) {
+        const leaseExpiry = new Date(now.getTime() + 60000);
+
+        await client.bookingRequest.update({
+          where: { id: bookingId },
+          data: {
+            assignedMonitoringWorkerId: worker.id,
+            monitoringAssignedAt: now,
+            monitoringLeaseExpiresAt: leaseExpiry,
+            status: BookingStatus.WATCHING,
+            isWatching: true,
+            isManuallyAssigned: false,
+          },
+        });
+
+        await client.workerMachine.update({
+          where: { id: worker.id },
+          data: {
+            currentAssignedMonitoring: currentAssigned + 1,
+          },
+        }).catch(() => {});
+
+        this.logger.log(
+          `[INSTANT MONITORING ALLOCATION] Booking #${booking.bookingCode} instantly assigned to ${worker.machineCode} (Status: WATCHING, Load: ${currentAssigned + 1}/${maxCap})`
+        );
+
+        if (this.eventsGateway) {
+          this.eventsGateway.notifyBookingUpdated(booking.id, booking.userId, {
+            bookingId: booking.id,
+            bookingCode: booking.bookingCode,
+            status: BookingStatus.WATCHING,
+            assignedMonitoringWorkerId: worker.id,
+            monitoringWorker: {
+              id: worker.id,
+              machineCode: worker.machineCode,
+              machineName: worker.machineName,
+              status: worker.status,
+            },
+          });
+        }
+
+        return { assigned: true, worker };
+      }
+    }
+
+    return { assigned: false };
+  }
+
+  /**
    * Periodic & Event-Driven Authoritative Monitoring Allocation Engine
    * Allocates unassigned PENDING/WATCHING requests across healthy workers
    * according to their independently configured maxMonitoringRequests.
@@ -1792,7 +1886,7 @@ export class SmartAllocatorService {
       // 1. Fetch eligible online workers ordered by priority: Cloud (DOCKER/CLOUD_VM) first, then Local (LOCAL_PC)
       const workers = await this.prisma.workerMachine.findMany({
         where: {
-          status: WorkerStatus.ONLINE,
+          status: { in: [WorkerStatus.ONLINE, WorkerStatus.IDLE, WorkerStatus.BUSY] },
           active: true,
           adminStatus: { notIn: ['REVOKED', 'RETIRED', 'PAUSED', 'DISABLED'] },
           desiredState: 'RUNNING',
@@ -1856,7 +1950,7 @@ export class SmartAllocatorService {
           SELECT id FROM "BookingRequest"
           WHERE "status" IN ('PENDING', 'WATCHING', 'FAST_BOOKING_QUEUED')
             AND "assignedMonitoringWorkerId" IS NULL
-            AND "isManuallyAssigned" = false
+            AND COALESCE("isManuallyAssigned", false) = false
           ORDER BY "createdAt" ASC
           LIMIT ${freeSlots}
           FOR UPDATE SKIP LOCKED

@@ -27,7 +27,8 @@ describe('Dynamic Dual-Worker Monitoring Capacity & Zero Lost Dates Suite', () =
       }),
       findMany: jest.fn().mockImplementation(({ where, orderBy }: any) => {
         let list = [...workerMachines];
-        if (where?.status) list = list.filter((w) => w.status === where.status);
+        if (where?.status?.in) list = list.filter((w) => where.status.in.includes(w.status));
+        else if (where?.status) list = list.filter((w) => w.status === where.status);
         if (where?.active !== undefined) list = list.filter((w) => w.active === where.active);
         if (where?.desiredState) list = list.filter((w) => w.desiredState === where.desiredState);
         if (where?.lastHeartbeat?.gte) {
@@ -444,5 +445,43 @@ describe('Dynamic Dual-Worker Monitoring Capacity & Zero Lost Dates Suite', () =
     for (const w of workerMachines) {
       expect(w.maxConcurrentJobs).toBe(1);
     }
+  });
+
+  it('Test 18: Idle worker with WorkerStatus.IDLE is eligible and allocated monitoring capacity', async () => {
+    // Reset existing assignments so workers have available capacity
+    bookingRequests.forEach((b) => {
+      b.assignedMonitoringWorkerId = null;
+    });
+
+    // Reset worker state and status to IDLE (as reported by worker heartbeat)
+    workerMachines[0].status = WorkerStatus.IDLE;
+    workerMachines[0].currentAssignedMonitoring = 0;
+    workerMachines[0].cpuUsage = 20.0;
+    workerMachines[0].memoryUsage = 20.0;
+    workerMachines[0].lastHeartbeat = new Date();
+
+    workerMachines[1].status = WorkerStatus.IDLE;
+    workerMachines[1].currentAssignedMonitoring = 0;
+    workerMachines[1].cpuUsage = 20.0;
+    workerMachines[1].memoryUsage = 20.0;
+    workerMachines[1].lastHeartbeat = new Date();
+
+    // Add unassigned booking at the front
+    bookingRequests.unshift({
+      id: 'idle-test-booking',
+      bookingCode: 'TA-IDLE-TEST',
+      status: BookingStatus.PENDING,
+      requestedDateStr: '2026-12-14',
+      route: 'Pamba',
+      assignedMonitoringWorkerId: null,
+      isManuallyAssigned: false,
+    });
+
+    const result = await allocator.runMonitoringAllocationSweep();
+    expect(result.allocatedCount).toBeGreaterThanOrEqual(1);
+
+    const assignedBooking = bookingRequests.find((b) => b.id === 'idle-test-booking');
+    expect(assignedBooking.assignedMonitoringWorkerId).toBeTruthy();
+    expect(assignedBooking.status).toBe(BookingStatus.WATCHING);
   });
 });
