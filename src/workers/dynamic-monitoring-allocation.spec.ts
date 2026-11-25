@@ -484,4 +484,35 @@ describe('Dynamic Dual-Worker Monitoring Capacity & Zero Lost Dates Suite', () =
     expect(assignedBooking.assignedMonitoringWorkerId).toBeTruthy();
     expect(assignedBooking.status).toBe(BookingStatus.WATCHING);
   });
+
+  it('Test 19: Worker with RAM at 91.6% (idle workstation) is allocated monitoring when capacity is free and CPU is healthy', async () => {
+    // Reset workers: only 1 online worker available, reporting 91.6% RAM and 11.2% CPU (exact user scenario)
+    workerMachines[0].status = WorkerStatus.ONLINE;
+    workerMachines[0].currentAssignedMonitoring = 0;
+    workerMachines[0].maxMonitoringRequests = 10;
+    workerMachines[0].cpuUsage = 11.2;
+    workerMachines[0].memoryUsage = 91.6;
+    workerMachines[0].lastHeartbeat = new Date();
+
+    // Disable second worker
+    workerMachines[1].status = WorkerStatus.OFFLINE;
+
+    // Add unassigned pending booking
+    bookingRequests.unshift({
+      id: 'ram-test-booking',
+      bookingCode: 'TA-RAM-916',
+      status: BookingStatus.PENDING,
+      requestedDateStr: '2026-11-28',
+      route: 'Pamba',
+      assignedMonitoringWorkerId: null,
+      isManuallyAssigned: false,
+    });
+
+    const result = await allocator.runMonitoringAllocationSweep();
+    expect(result.allocatedCount).toBeGreaterThanOrEqual(1);
+
+    const assignedBooking = bookingRequests.find((b) => b.id === 'ram-test-booking');
+    expect(assignedBooking.assignedMonitoringWorkerId).toBe(workerMachines[0].id);
+    expect(assignedBooking.status).toBe(BookingStatus.WATCHING);
+  });
 });

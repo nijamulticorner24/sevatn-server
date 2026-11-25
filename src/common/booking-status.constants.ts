@@ -170,6 +170,33 @@ export function evaluateJobActiveCapacity(
 }
 
 /**
+ * Normalizes date string or Date object into canonical YYYY-MM-DD format.
+ */
+export function normalizeDate(input: string | Date | null | undefined): string {
+  if (!input) return '';
+  if (typeof input === 'string') {
+    const clean = input.split('T')[0].trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(clean)) {
+      return clean;
+    }
+    const ddmmyyyy = clean.match(/^(\d{2})[-/](\d{2})[-/](\d{4})$/);
+    if (ddmmyyyy) {
+      return `${ddmmyyyy[3]}-${ddmmyyyy[2]}-${ddmmyyyy[1]}`;
+    }
+  }
+  try {
+    const d = input instanceof Date ? input : new Date(input);
+    if (Number.isNaN(d.getTime())) return '';
+    const year = d.getUTCFullYear();
+    const month = (d.getUTCMonth() + 1).toString().padStart(2, '0');
+    const day = d.getUTCDate().toString().padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  } catch {
+    return '';
+  }
+}
+
+/**
  * Returns current date string in IST (Asia/Kolkata) as YYYY-MM-DD.
  */
 export function getTodayISTDateString(): string {

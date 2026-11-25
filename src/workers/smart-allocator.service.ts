@@ -1807,7 +1807,11 @@ export class SmartAllocatorService {
     });
 
     for (const worker of workers) {
-      if ((worker.cpuUsage && worker.cpuUsage > 85) || (worker.memoryUsage && worker.memoryUsage > 85)) {
+      const isCpuSaturated = Boolean(worker.cpuUsage && worker.cpuUsage > Number(process.env.RESOURCE_THROTTLE_CPU ?? 85));
+      const isMemSaturated = Boolean(worker.memoryUsage && worker.memoryUsage > Number(process.env.RESOURCE_THROTTLE_MEM ?? 95));
+      const isSoleWorkerWithCapacity = workers.length === 1 && (worker.memoryUsage ?? 0) <= 98 && (worker.cpuUsage ?? 0) <= 95;
+
+      if ((isCpuSaturated || isMemSaturated) && !isSoleWorkerWithCapacity) {
         continue;
       }
 
@@ -1901,8 +1905,12 @@ export class SmartAllocatorService {
       let totalAllocated = 0;
 
       for (const worker of workers) {
-        // Resource-aware throttling: skip if CPU or Memory is saturated (> 85%)
-        if ((worker.cpuUsage && worker.cpuUsage > 85) || (worker.memoryUsage && worker.memoryUsage > 85)) {
+        const isCpuSaturated = Boolean(worker.cpuUsage && worker.cpuUsage > Number(process.env.RESOURCE_THROTTLE_CPU ?? 85));
+        const isMemSaturated = Boolean(worker.memoryUsage && worker.memoryUsage > Number(process.env.RESOURCE_THROTTLE_MEM ?? 95));
+        const isSoleWorkerWithCapacity = workers.length === 1 && (worker.memoryUsage ?? 0) <= 98 && (worker.cpuUsage ?? 0) <= 95;
+
+        // Resource-aware throttling: skip if CPU or Memory is saturated (> threshold)
+        if ((isCpuSaturated || isMemSaturated) && !isSoleWorkerWithCapacity) {
           await this.prisma.workerMachine.update({
             where: { id: worker.id },
             data: { resourceWarning: true },

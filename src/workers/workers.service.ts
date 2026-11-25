@@ -46,6 +46,7 @@ import {
   isDateInPast,
   isRouteMatching,
   normalizeRouteCanonical,
+  normalizeDate,
 } from '../common/booking-status.constants';
 import { normalizeDemandKey } from '../common/utils/demand-key';
 
@@ -1941,6 +1942,7 @@ export class WorkersService {
     const excludedBookingStatuses = TERMINAL_OR_EXCLUDED_BOOKING_STATUSES;
 
     // 1. First priority: Check if a job was already reserved specifically for this worker (pre-allocated or OWN_STALE_LEASE takeover)
+    const requestedClaimDate = claimOptions?.date ? normalizeDate(claimOptions.date) : undefined;
     const preAllocatedCandidate = await this.prisma.bookingJob.findFirst({
       where: {
         workerId: machineId,
@@ -1949,6 +1951,19 @@ export class WorkersService {
           { status: BookingStatus.EXECUTING },
         ],
         AND: [
+          ...(requestedClaimDate ? [{
+            OR: [
+              { jobType: JobType.ACCOUNT_VERIFICATION },
+              {
+                bookingRequest: {
+                  OR: [
+                    { requestedDateStr: requestedClaimDate },
+                    { requestedDate: new Date(requestedClaimDate) },
+                  ],
+                },
+              },
+            ],
+          }] : []),
           {
             OR: [
               { jobType: JobType.ACCOUNT_VERIFICATION },
@@ -2008,15 +2023,18 @@ export class WorkersService {
     // Date matching guard: if a specific date was requested, preAllocatedCandidate must match that date
     const candidateBr = preAllocatedCandidate?.bookingRequest as any;
     const candidateDateStr = candidateBr
-      ? candidateBr.requestedDateStr ||
-      (candidateBr.requestedDate instanceof Date
-        ? candidateBr.requestedDate.toISOString().split('T')[0]
-        : String(candidateBr.requestedDate || '').split('T')[0])
+      ? normalizeDate(candidateBr.requestedDateStr || candidateBr.requestedDate)
       : undefined;
     const isDateMismatch = Boolean(
-      claimOptions?.date &&
-      candidateDateStr &&
-      candidateDateStr !== claimOptions.date,
+      requestedClaimDate &&
+      preAllocatedCandidate?.jobType === JobType.BOOKING_EXECUTION &&
+      (!candidateDateStr || candidateDateStr !== requestedClaimDate),
+    );
+    const isRouteMismatch = Boolean(
+      claimOptions?.route &&
+      preAllocatedCandidate?.jobType === JobType.BOOKING_EXECUTION &&
+      candidateBr &&
+      (!candidateBr.route || !isRouteMatching(candidateBr.route, claimOptions.route)),
     );
 
     const cannotAcceptBooking =
@@ -2038,6 +2056,7 @@ export class WorkersService {
       preAllocatedCandidate &&
         !isJobTypeMismatch &&
         !isDateMismatch &&
+        !isRouteMismatch &&
         !isQueuePollSpeculativeBooking &&
         !cannotAcceptBooking &&
         !cannotAcceptVerification &&
@@ -2274,7 +2293,10 @@ export class WorkersService {
           });
           return { hasJob: false };
         }
-        const dateOnlyStr = br.requestedDateStr || (br.requestedDate instanceof Date ? br.requestedDate.toISOString().split('T')[0] : String(br.requestedDate).split('T')[0]);
+        const dateOnlyStr = normalizeDate(br.requestedDateStr || br.requestedDate);
+        this.logger.log(
+          `[DATE-MATCH-AUDIT] Pre-allocated claim matched: requestedDate=${dateOnlyStr} targetDate=${requestedClaimDate || 'ANY'} route=${br.route} targetRoute=${claimOptions?.route || 'ANY'} requestId=${br.id} (${br.bookingCode}) jobId=${preAllocatedJob.id} matchResult=MATCH`,
+        );
 
         return {
           hasJob: true,
@@ -2413,22 +2435,40 @@ export class WorkersService {
         return { hasJob: false, reason: 'BOOKING_EXECUTION_UNAUTHORIZED_OR_RESTRICTED' };
       }
 
-      const cleanTargetDate = claimOptions?.date ? claimOptions.date.trim() : null;
-      const requestedDateFilter: any = cleanTargetDate
-        ? {
+      const cleanTargetDate = claimOptions?.date ? normalizeDate(claimOptions.date) : null;
+      let requestedDateFilter: any = {};
+
+      if (cleanTargetDate && claimOptions?.bookingIds && Array.isArray(claimOptions.bookingIds) && claimOptions.bookingIds.length > 0) {
+        requestedDateFilter = {
+          AND: [
+            {
+              OR: [
+                { requestedDateStr: cleanTargetDate },
+                { requestedDate: new Date(cleanTargetDate) },
+              ],
+            },
+            {
+              OR: [
+                { bookingCode: { in: claimOptions.bookingIds } },
+                { id: { in: claimOptions.bookingIds } },
+              ],
+            },
+          ],
+        };
+      } else if (cleanTargetDate) {
+        requestedDateFilter = {
           OR: [
             { requestedDateStr: cleanTargetDate },
             { requestedDate: new Date(cleanTargetDate) },
           ],
-        }
-        : {};
-
-      if (claimOptions?.bookingIds && Array.isArray(claimOptions.bookingIds) && claimOptions.bookingIds.length > 0) {
-        requestedDateFilter.OR = [
-          ...(requestedDateFilter.OR || []),
-          { bookingCode: { in: claimOptions.bookingIds } },
-          { id: { in: claimOptions.bookingIds } },
-        ];
+        };
+      } else if (claimOptions?.bookingIds && Array.isArray(claimOptions.bookingIds) && claimOptions.bookingIds.length > 0) {
+        requestedDateFilter = {
+          OR: [
+            { bookingCode: { in: claimOptions.bookingIds } },
+            { id: { in: claimOptions.bookingIds } },
+          ],
+        };
       }
 
       const rawCandidateJobs = typeof tx.bookingJob.findMany === 'function'
@@ -2545,23 +2585,23 @@ export class WorkersService {
           continue;
         }
 
-        const dateOnlyStr =
-          br.requestedDateStr ||
-          (br.requestedDate instanceof Date
-            ? br.requestedDate.toISOString().split('T')[0]
-            : String(br.requestedDate || '').split('T')[0]);
+        const dateOnlyStr = normalizeDate(
+          br.requestedDateStr || br.requestedDate
+        );
 
         // CRITICAL GUARD: If claimOptions.date is specified, never claim a job for a different date!
-        if (cleanTargetDate && dateOnlyStr && dateOnlyStr !== cleanTargetDate) {
-          this.logger.log(`[CLAIM] Skipping Job #${cj.id}: Date mismatch (requested: ${cleanTargetDate}, job: ${dateOnlyStr}).`);
-          lastRejectionReason = `DATE_MISMATCH(${dateOnlyStr}!=${cleanTargetDate})`;
+        if (cleanTargetDate && (!dateOnlyStr || dateOnlyStr !== cleanTargetDate)) {
+          this.logger.warn(`[DATE-MATCH-AUDIT] Worker claim rejected: requestedDate=${dateOnlyStr || 'UNKNOWN'} targetDate=${cleanTargetDate} route=${br.route || 'UNKNOWN'} targetRoute=${claimOptions?.route || 'ANY'} requestId=${br.id} (${br.bookingCode}) jobId=${cj.id} matchResult=MISMATCH(DATE)`);
+          this.logger.log(`[CLAIM] Skipping Job #${cj.id}: Date mismatch (requested: ${cleanTargetDate}, job: ${dateOnlyStr || 'UNKNOWN'}).`);
+          lastRejectionReason = `DATE_MISMATCH(${dateOnlyStr || 'UNKNOWN'}!=${cleanTargetDate})`;
           continue;
         }
 
         // CRITICAL GUARD: If claimOptions.route is specified, verify route match!
-        if (claimOptions?.route && br.route && !isRouteMatching(br.route, claimOptions.route)) {
-          this.logger.log(`[CLAIM] Skipping Job #${cj.id}: Route mismatch (requested: ${claimOptions.route}, job: ${br.route}).`);
-          lastRejectionReason = `ROUTE_MISMATCH(${br.route}!=${claimOptions.route})`;
+        if (claimOptions?.route && (!br.route || !isRouteMatching(br.route, claimOptions.route))) {
+          this.logger.warn(`[DATE-MATCH-AUDIT] Worker claim rejected: requestedDate=${dateOnlyStr || 'UNKNOWN'} targetDate=${cleanTargetDate || 'ANY'} route=${br.route || 'UNKNOWN'} targetRoute=${claimOptions?.route} requestId=${br.id} (${br.bookingCode}) jobId=${cj.id} matchResult=MISMATCH(ROUTE)`);
+          this.logger.log(`[CLAIM] Skipping Job #${cj.id}: Route mismatch (requested: ${claimOptions.route}, job: ${br.route || 'UNKNOWN'}).`);
+          lastRejectionReason = `ROUTE_MISMATCH(${br.route || 'UNKNOWN'}!=${claimOptions.route})`;
           continue;
         }
 
@@ -2723,7 +2763,8 @@ export class WorkersService {
         }
 
 
-        const dateOnlyStr = br.requestedDateStr || (br.requestedDate instanceof Date ? br.requestedDate.toISOString().split('T')[0] : String(br.requestedDate).split('T')[0]);
+        const dateOnlyStr = normalizeDate(br.requestedDateStr || br.requestedDate);
+        this.logger.log(`[DATE-MATCH-AUDIT] Worker claim matched: requestedDate=${dateOnlyStr} targetDate=${cleanTargetDate || 'ANY'} route=${br.route} targetRoute=${claimOptions?.route || 'ANY'} requestId=${br.id} (${br.bookingCode}) jobId=${bookingJob.id} matchResult=MATCH`);
         this.logger.log(`[CLAIM] Successfully claimed Job #${bookingJob.id} for Booking #${br.bookingCode} (Date: ${dateOnlyStr}, Route: ${br.route}). Transitioning to EXECUTING.`);
 
         // Successfully and exclusively claimed! Update booking request and attempt log.
@@ -3451,8 +3492,18 @@ export class WorkersService {
           continue;
         }
 
+        const normalizedCandidateDate = normalizeDate(br.requestedDateStr || br.requestedDate);
+        const normalizedTargetDate = normalizeDate(targetDateStr);
+        if (normalizedTargetDate && (!normalizedCandidateDate || normalizedCandidateDate !== normalizedTargetDate)) {
+          this.logger.warn(`[DATE-MATCH-AUDIT] Sniper claim rejected: requestedDate=${normalizedCandidateDate || 'UNKNOWN'} targetDate=${normalizedTargetDate} route=${br.route || 'UNKNOWN'} targetRoute=${routeInput || 'ANY'} requestId=${br.id} (${br.bookingCode}) matchResult=MISMATCH(DATE)`);
+          this.logger.log(`[SNIPER] Candidate #${br.bookingCode} date (${normalizedCandidateDate || 'UNKNOWN'}) does not match target date (${normalizedTargetDate}). Skipping.`);
+          rejectionReason = `DATE_MISMATCH(${normalizedCandidateDate || 'UNKNOWN'}!=${normalizedTargetDate})`;
+          continue;
+        }
+
         // Route matching
-        if (routeInput && !isRouteMatching(br.route, routeInput)) {
+        if (routeInput && (!br.route || !isRouteMatching(br.route, routeInput))) {
+          this.logger.warn(`[DATE-MATCH-AUDIT] Sniper claim rejected: requestedDate=${normalizedCandidateDate || 'UNKNOWN'} targetDate=${normalizedTargetDate} route=${br.route || 'UNKNOWN'} targetRoute=${routeInput} requestId=${br.id} (${br.bookingCode}) matchResult=MISMATCH(ROUTE)`);
           this.logger.log(`[SNIPER] Candidate #${br.bookingCode} route (${br.route}) does not match target route (${routeInput}). Skipping.`);
           rejectionReason = 'ROUTE_MISMATCH';
           continue;
@@ -3753,9 +3804,8 @@ export class WorkersService {
           });
         }
 
-        const dateOnlyStr =
-          br.requestedDateStr ||
-          (br.requestedDate instanceof Date ? br.requestedDate.toISOString().split('T')[0] : String(br.requestedDate).split('T')[0]);
+        const dateOnlyStr = normalizeDate(br.requestedDateStr || br.requestedDate);
+        this.logger.log(`[DATE-MATCH-AUDIT] Sniper claim matched: requestedDate=${dateOnlyStr} targetDate=${targetDateStr} route=${br.route} targetRoute=${routeInput || 'ANY'} requestId=${br.id} (${br.bookingCode}) jobId=${job.id} matchResult=MATCH`);
 
         // Update worker machine accurately (do not double-increment on same-owner takeover)
         await tx.workerMachine.update({
