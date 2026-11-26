@@ -1154,18 +1154,29 @@ export class SmartAllocatorService {
       try {
         const assignedWorkerId = job.workerId;
 
-        // Safety: If job reached site submission or verification, external booking could exist
+        // Safety: If job reached site submission or verification (e.g. CONFIRM_CLICKED), external booking could exist
+        const lastMilestoneStr = String(job.lastMilestone || job.bookingRequest?.lastMilestone || '');
+        const isConfirmClickedMilestone =
+          lastMilestoneStr === 'CONFIRM_CLICKED' ||
+          lastMilestoneStr === 'PAYMENT_PROCEED_CLICKED' ||
+          lastMilestoneStr === 'ZERO_COST_CONFIRMATION_PENDING' ||
+          lastMilestoneStr === 'CONFIRMATION_PENDING';
+
         const isAmbiguous =
           job.status === BookingStatus.EXECUTING &&
           job.bookingRequest?.officialReference === null &&
-          (job.attempt || 0) > 1;
+          (isConfirmClickedMilestone || (job.attempt || 0) > 1);
 
         if (isAmbiguous) {
-          // Escalate to human review to prevent duplicate portal booking
+          const targetQuarantineStatus = isConfirmClickedMilestone
+            ? BookingStatus.PENDING_VERIFICATION
+            : BookingStatus.REQUIRES_HUMAN;
+
+          // Escalate to PENDING_VERIFICATION / REQUIRES_HUMAN to prevent duplicate portal booking
           await this.prisma.bookingJob.update({
             where: { id: job.id },
             data: {
-              status: BookingStatus.REQUIRES_HUMAN,
+              status: targetQuarantineStatus,
               errorMessage: 'Worker lease expired during active execution. Ambiguous portal state requires verification.',
             },
           });
@@ -1174,17 +1185,17 @@ export class SmartAllocatorService {
             if (this.stateMachine) {
               await this.stateMachine.transition({
                 bookingId: job.bookingRequestId,
-                targetStatus: BookingStatus.REQUIRES_HUMAN,
+                targetStatus: targetQuarantineStatus,
                 note: 'Worker lease expired during execution. Check Sabarimala portal before retrying.',
                 reason: 'Worker lease expired during active execution. Ambiguous portal state requires verification.',
-                milestone: 'STALE_LEASE_REAPED_TO_HUMAN',
+                milestone: isConfirmClickedMilestone ? 'EXPIRED_AFTER_CONFIRM_CLICK' : 'STALE_LEASE_REAPED_TO_HUMAN',
                 operator: 'SmartAllocatorService:reapStaleLeases',
               });
             } else {
               await this.prisma.bookingRequest.update({
                 where: { id: job.bookingRequestId },
                 data: {
-                  status: BookingStatus.REQUIRES_HUMAN,
+                  status: targetQuarantineStatus,
                   requiresHumanNote: 'Worker lease expired during execution. Check Sabarimala portal before retrying.',
                 },
               });

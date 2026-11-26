@@ -151,6 +151,7 @@ enum BookingStatus {
   UNKNOWN_OUTCOME
   BOOKING_FAILED
   PAYMENT_UNKNOWN
+  PENDING_VERIFICATION
   RECONCILIATION_REQUIRED
   RETRYABLE_FAILURE
   CANCELLED
@@ -324,6 +325,8 @@ model BookingAccount {
 
   bookingRequests   BookingRequest[]
   verificationJobs  BookingJob[]
+  savedPilgrims     AccountSavedPilgrim[]
+  confirmationHistory BookingConfirmationHistory[]
 
   @@unique([userId, username])
   @@index([userId, status])
@@ -420,10 +423,16 @@ model BookingRequest {
   completedAt                 DateTime?
 
   // Nominee Details (Mandatory for pilgrim insurance)
-  nomineeName         String?
-  nomineeAge          Int?
-  nomineeRelationship String?
-  nomineePhone        String?
+  nomineeName             String?
+  nomineeAge              Int?
+  nomineeRelationship     String?
+  nomineePhone            String?
+  nomineeValidationStatus String?         @default("RECEIVED")
+
+  // Selected Saved Pilgrim Identity (1-Saved-Pilgrim per Booking Model)
+  selectedSavedPilgrimId     String?
+  selectedPilgrimFingerprint String?
+  selectedPilgrimName        String?
 
   // Three-Level Ticket Pricing Snapshot
   baseTicketPrice      Decimal?        @default(10.00)
@@ -456,6 +465,7 @@ model BookingRequest {
   reconciliationRecord BookingReconciliation?
   milestones        BookingMilestone[]
   monitoringPollEvents MonitoringPollEvent[]
+  confirmationHistory  BookingConfirmationHistory?
 
   @@index([userId, status])
   @@index([status, nextCheckAt])
@@ -1138,6 +1148,59 @@ model PricingAuditLog {
   @@index([targetEntity, targetId])
   @@index([createdAt])
 }
+
+model AccountSavedPilgrim {
+  id                  String         @id @default(uuid())
+  accountId           String
+  account             BookingAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  portalPilgrimId     String?
+  identityFingerprint String
+  fullName            String
+  age                 Int?
+  gender              String?
+  idType              String?
+  maskedIdNumber      String?
+  lastSelectedAt      DateTime?
+  lastSeenAt          DateTime       @default(now())
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+
+  confirmationHistory BookingConfirmationHistory[]
+
+  @@unique([accountId, identityFingerprint])
+  @@index([accountId])
+  @@index([identityFingerprint])
+}
+
+model BookingConfirmationHistory {
+  id                         String               @id @default(uuid())
+  bookingRequestId           String               @unique
+  bookingRequest             BookingRequest       @relation(fields: [bookingRequestId], references: [id], onDelete: Cascade)
+  accountId                  String
+  account                    BookingAccount       @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  savedPilgrimId             String?
+  savedPilgrim               AccountSavedPilgrim? @relation(fields: [savedPilgrimId], references: [id], onDelete: SetNull)
+  selectedPilgrimFingerprint String?
+  selectedPilgrimName        String?
+  requestedDateStr           String
+  route                      String
+  selectedSlot               String?
+  nomineeName                String?
+  nomineeAge                 Int?
+  nomineeRelationship        String?
+  nomineePhone               String?
+  officialBookingReference   String               @unique
+  cartId                     String?
+  portalTransactionReference String?
+  officialReceiptReference   String?
+  confirmedAt                DateTime             @default(now())
+  createdAt                  DateTime             @default(now())
+
+  @@index([accountId, requestedDateStr])
+  @@index([selectedPilgrimFingerprint, requestedDateStr])
+  @@index([requestedDateStr, route])
+}
+
 
 
 

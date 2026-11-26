@@ -238,7 +238,7 @@ describe('BookingsService - Booking Readiness & Queue Protection', () => {
       expect(mockPrisma.bookingRequest.create).not.toHaveBeenCalled();
     });
 
-    it('TEST 5: Accepts booking when nominee details are missing (optional in backend)', async () => {
+    it('TEST 5: Rejects booking when mandatory nominee details are missing', async () => {
       const dto: any = {
         ...validDto,
         nominee: undefined,
@@ -246,29 +246,48 @@ describe('BookingsService - Booking Readiness & Queue Protection', () => {
         nominees: undefined,
       };
 
-      const result = await bookingsService.createBooking('user-1', dto);
-      expect(result).toBeDefined();
-      expect(result.bookingCode).toBe('TA-10101');
-      expect(result.nomineeName).toBeNull();
-      expect(mockPrisma.bookingRequest.create).toHaveBeenCalled();
+      await expect(bookingsService.createBooking('user-1', dto)).rejects.toThrow(
+        BadRequestException,
+      );
+      expect(mockPrisma.bookingRequest.create).not.toHaveBeenCalled();
     });
 
-    it('TEST 5B: Calculates pricing based on serviceFee * pilgrimCount and enforces max 5 pilgrims', async () => {
-      // 2 pilgrims = ₹ 40 fee
-      const dto2: any = {
-        ...validDto,
-        pilgrimCount: 2,
-      };
-      const result2 = await bookingsService.createBooking('user-1', dto2);
-      expect(result2.pilgrimCount).toBe(2);
+    it('TEST 5B: Enforces 1 to 5 pilgrims (pilgrimCount 1..5) with dynamic pricing and wallet reservation, and rejects quantity 0 or 6', async () => {
+      // Quantity 1..5 accepted with dynamic fee (20 * N)
+      for (const qty of [1, 2, 3, 4, 5]) {
+        mockPrisma.wallet.update.mockClear();
+        const dtoN: any = {
+          ...validDto,
+          pilgrimCount: qty,
+        };
+        const resultN = await bookingsService.createBooking('user-1', dtoN);
+        expect(resultN.pilgrimCount).toBe(qty);
+        expect(mockPrisma.wallet.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: {
+              availableBalance: { decrement: 20 * qty },
+              reservedBalance: { increment: 20 * qty },
+            },
+          }),
+        );
+      }
 
-      // 6 pilgrims = rejects with max 5 error
-      const dto6: any = {
-        ...validDto,
-        pilgrimCount: 6,
-      };
-      await expect(bookingsService.createBooking('user-1', dto6)).rejects.toThrow(
-        new BadRequestException('Sabarimala portal allows a maximum of 5 pilgrims per booking.'),
+      // Quantity 6 rejected
+      await expect(
+        bookingsService.createBooking('user-1', { ...validDto, pilgrimCount: 6 } as any),
+      ).rejects.toThrow(
+        new BadRequestException(
+          'Sabarimala portal allows 1 to 5 pilgrims per booking (pilgrimCount must be an integer between 1 and 5).',
+        ),
+      );
+
+      // Quantity 0 rejected
+      await expect(
+        bookingsService.createBooking('user-1', { ...validDto, pilgrimCount: 0 } as any),
+      ).rejects.toThrow(
+        new BadRequestException(
+          'Sabarimala portal allows 1 to 5 pilgrims per booking (pilgrimCount must be an integer between 1 and 5).',
+        ),
       );
     });
 
@@ -284,14 +303,15 @@ describe('BookingsService - Booking Readiness & Queue Protection', () => {
       };
 
       await expect(bookingsService.createBooking('user-1', dto)).rejects.toThrow(
-        new BadRequestException('Nominee must be an adult with a valid age (minimum 18 years).'),
+        new BadRequestException('Nominee must be an adult with a valid age between 18 and 120 years.'),
       );
       expect(mockPrisma.bookingRequest.create).not.toHaveBeenCalled();
     });
 
-    it('TEST 6b: Successfully accepts booking with multiple nominees in nominees array', async () => {
-      const dto: any = {
+    it('TEST 6b: Accepts 1 to 5 nominees in nominees array and rejects > 5 nominees', async () => {
+      const multiDto: any = {
         ...validDto,
+        pilgrimCount: 2,
         nominees: [
           {
             nomineeName: 'Primary Nominee',
@@ -308,14 +328,45 @@ describe('BookingsService - Booking Readiness & Queue Protection', () => {
         ],
       };
 
-      const result = await bookingsService.createBooking('user-1', dto);
+      const multiResult = await bookingsService.createBooking('user-1', multiDto);
+      expect(multiResult).toBeDefined();
+      expect(multiResult.pilgrimCount).toBe(2);
+      expect((multiResult.preferences as any).nominees).toHaveLength(2);
+
+      // Reject > 5 nominees
+      const sixNomineesDto: any = {
+        ...validDto,
+        nominees: Array.from({ length: 6 }, (_, i) => ({
+          nomineeName: `Nominee ${i + 1}`,
+          nomineeAge: 30 + i,
+          nomineeRelationship: 'SPOUSE',
+        })),
+      };
+      await expect(bookingsService.createBooking('user-1', sixNomineesDto)).rejects.toThrow(
+        new BadRequestException('Sabarimala portal allows a maximum of 5 nominee entries per booking.'),
+      );
+
+      const singleDto: any = {
+        ...validDto,
+        nominee: undefined,
+        nominees: [
+          {
+            nomineeName: 'Primary Nominee',
+            nomineeAge: 30,
+            nomineeRelationship: 'SPOUSE',
+            nomineePhone: '9876543210',
+          },
+        ],
+      };
+
+      const result = await bookingsService.createBooking('user-1', singleDto);
       expect(result).toBeDefined();
       expect(mockPrisma.bookingRequest.create).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({
             nomineeName: 'Primary Nominee',
             nomineeAge: 30,
-            nomineeRelationship: 'SPOUSE',
+            nomineeRelationship: 'Spouse',
           }),
         }),
       );

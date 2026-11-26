@@ -27,7 +27,7 @@ import {
   WorkerStopDto,
 } from './dto/worker.dto';
 import { AuthorizePaymentDto } from './dto/authorize-payment.dto';
-import { WorkerStatus, BookingStatus, NotificationChannel, JobType, AccountStatus, Prisma } from '@prisma/client';
+import { WorkerStatus, BookingStatus, NotificationChannel, JobType, AccountStatus, FinancialStatus, Prisma } from '@prisma/client';
 import { validateNominee } from '../common/nominee-validator';
 import { randomBytes, randomUUID } from 'crypto';
 import { AccountLockService } from '../availability/account-lock.service';
@@ -1719,6 +1719,16 @@ export class WorkersService {
       br.status === BookingStatus.COMPLETED ||
       (br.status as any) === 'BOOKING_CONFIRMED';
 
+    // Multi-devotee sequential booking guard: if pending devotees remain, request is PARTIALLY_COMPLETED and must be claimable
+    const totalRequested = Math.max(1, br.pilgrimCount || 1);
+    const pilgrims = Array.isArray(br.pilgrims) ? br.pilgrims : [];
+    const confirmedCount = pilgrims.filter((p: any) => (p.metadata as any)?.taskStatus === 'CONFIRMED').length;
+    const hasPendingDevotees = totalRequested > 1 && confirmedCount < totalRequested && (br.status === BookingStatus.WATCHING || (br as any).reconciliationStatus === 'PARTIALLY_COMPLETED');
+
+    if (hasPendingDevotees) {
+      return { alreadyCompleted: false };
+    }
+
     if (!storedRef && !isJobCompleted && !isBrCompleted) {
       return { alreadyCompleted: false };
     }
@@ -2298,6 +2308,21 @@ export class WorkersService {
           `[DATE-MATCH-AUDIT] Pre-allocated claim matched: requestedDate=${dateOnlyStr} targetDate=${requestedClaimDate || 'ANY'} route=${br.route} targetRoute=${claimOptions?.route || 'ANY'} requestId=${br.id} (${br.bookingCode}) jobId=${preAllocatedJob.id} matchResult=MATCH`,
         );
 
+        let excludedPilgrimFingerprints: string[] = [];
+        if (account?.id && typeof (this.prisma as any).bookingConfirmationHistory?.findMany === 'function') {
+          const hist = await (this.prisma as any).bookingConfirmationHistory.findMany({
+            where: { accountId: account.id, requestedDateStr: dateOnlyStr, selectedPilgrimFingerprint: { not: null } },
+            select: { selectedPilgrimFingerprint: true },
+          }).catch(() => []);
+          excludedPilgrimFingerprints = hist.map((h: any) => h.selectedPilgrimFingerprint).filter(Boolean);
+        }
+
+        const rawJobNominees = (br.preferences as any)?.nominees;
+        const resolvedJobNominees = Array.isArray(rawJobNominees) && rawJobNominees.length > 0
+          ? rawJobNominees
+          : (nomineeCheck.resolvedNominee ? [nomineeCheck.resolvedNominee] : []);
+        const resolvedPilgrimCount = Math.max(1, Math.min(5, Number(br.pilgrimCount || 1)));
+
         return {
           hasJob: true,
           jobType: JobType.BOOKING_EXECUTION,
@@ -2307,13 +2332,15 @@ export class WorkersService {
             bookingCode: br.bookingCode,
             requestedDate: dateOnlyStr,
             route: br.route,
-            pilgrimCount: br.pilgrimCount,
+            pilgrimCount: resolvedPilgrimCount,
             timeSlot: br.timeSlot,
             selectedTime: br.selectedTime || undefined,
             preferences: br.preferences,
             pilgrims: br.pilgrims,
             nominee: nomineeCheck.resolvedNominee,
-            nominees: (br.preferences as any)?.nominees || (nomineeCheck.resolvedNominee ? [nomineeCheck.resolvedNominee] : []),
+            nominees: resolvedJobNominees,
+            excludedPilgrimFingerprints,
+            lastMilestone: br.lastMilestone || preAllocatedJob.lastMilestone || null,
             account: account ? {
               id: account.id,
               username: account.username,
@@ -2436,9 +2463,12 @@ export class WorkersService {
       }
 
       const cleanTargetDate = claimOptions?.date ? normalizeDate(claimOptions.date) : null;
+      const validClaimBookingIds = Array.isArray(claimOptions?.bookingIds)
+        ? claimOptions.bookingIds.filter((id: string) => typeof id === 'string' && id.trim().length > 0 && !id.includes(':'))
+        : [];
       let requestedDateFilter: any = {};
 
-      if (cleanTargetDate && claimOptions?.bookingIds && Array.isArray(claimOptions.bookingIds) && claimOptions.bookingIds.length > 0) {
+      if (cleanTargetDate && validClaimBookingIds.length > 0) {
         requestedDateFilter = {
           AND: [
             {
@@ -2449,8 +2479,8 @@ export class WorkersService {
             },
             {
               OR: [
-                { bookingCode: { in: claimOptions.bookingIds } },
-                { id: { in: claimOptions.bookingIds } },
+                { bookingCode: { in: validClaimBookingIds } },
+                { id: { in: validClaimBookingIds } },
               ],
             },
           ],
@@ -2462,11 +2492,11 @@ export class WorkersService {
             { requestedDate: new Date(cleanTargetDate) },
           ],
         };
-      } else if (claimOptions?.bookingIds && Array.isArray(claimOptions.bookingIds) && claimOptions.bookingIds.length > 0) {
+      } else if (validClaimBookingIds.length > 0) {
         requestedDateFilter = {
           OR: [
-            { bookingCode: { in: claimOptions.bookingIds } },
-            { id: { in: claimOptions.bookingIds } },
+            { bookingCode: { in: validClaimBookingIds } },
+            { id: { in: validClaimBookingIds } },
           ],
         };
       }
@@ -2837,6 +2867,34 @@ export class WorkersService {
           message: `${isOwnTakeover ? '[OWN_STALE_LEASE] Re-claimed' : 'Claimed'} booking execution job #${br.bookingCode} for ${dateOnlyStr}`,
         });
 
+        let excludedPilgrimFingerprints: string[] = [];
+        if (account?.id && typeof (tx as any).bookingConfirmationHistory?.findMany === 'function') {
+          const hist = await (tx as any).bookingConfirmationHistory.findMany({
+            where: { accountId: account.id, requestedDateStr: dateOnlyStr, selectedPilgrimFingerprint: { not: null } },
+            select: { selectedPilgrimFingerprint: true },
+          }).catch(() => []);
+          excludedPilgrimFingerprints = Array.from(
+            new Set(
+              hist
+                .flatMap((h: any) => String(h.selectedPilgrimFingerprint || '').split(','))
+                .map((s: string) => s.trim())
+                .filter(Boolean),
+            ),
+          );
+        }
+
+        const resolvedPilgrimCount = Math.max(1, Math.min(5, Number(br.pilgrimCount || 1)));
+        const baseNominees =
+          nomineeCheck.resolvedNominees && nomineeCheck.resolvedNominees.length > 0
+            ? nomineeCheck.resolvedNominees
+            : nomineeCheck.resolvedNominee
+              ? [nomineeCheck.resolvedNominee]
+              : [];
+        const resolvedJobNominees =
+          baseNominees.length > 0
+            ? Array.from({ length: resolvedPilgrimCount }, (_, idx) => baseNominees[idx] || baseNominees[0])
+            : [];
+
         return {
           hasJob: true,
           jobType: JobType.BOOKING_EXECUTION,
@@ -2847,13 +2905,15 @@ export class WorkersService {
             bookingCode: br.bookingCode,
             requestedDate: dateOnlyStr,
             route: br.route,
-            pilgrimCount: br.pilgrimCount,
+            pilgrimCount: resolvedPilgrimCount,
             timeSlot: br.timeSlot,
             selectedTime: br.selectedTime || undefined,
             preferences: br.preferences,
             pilgrims: br.pilgrims,
             nominee: nomineeCheck.resolvedNominee,
-            nominees: (br.preferences as any)?.nominees || (nomineeCheck.resolvedNominee ? [nomineeCheck.resolvedNominee] : []),
+            nominees: resolvedJobNominees,
+            excludedPilgrimFingerprints,
+            lastMilestone: br.lastMilestone || bookingJob.lastMilestone || null,
             account: account
               ? {
                 id: account.id,
@@ -3195,6 +3255,34 @@ export class WorkersService {
           },
         });
 
+        let excludedPilgrimFingerprints: string[] = [];
+        if (account?.id && typeof (tx as any).bookingConfirmationHistory?.findMany === 'function') {
+          const hist = await (tx as any).bookingConfirmationHistory.findMany({
+            where: { accountId: account.id, requestedDateStr: dateOnlyStr, selectedPilgrimFingerprint: { not: null } },
+            select: { selectedPilgrimFingerprint: true },
+          }).catch(() => []);
+          excludedPilgrimFingerprints = Array.from(
+            new Set(
+              hist
+                .flatMap((h: any) => String(h.selectedPilgrimFingerprint || '').split(','))
+                .map((s: string) => s.trim())
+                .filter(Boolean),
+            ),
+          );
+        }
+
+        const resolvedPilgrimCount = Math.max(1, Math.min(5, Number(br.pilgrimCount || 1)));
+        const baseNominees =
+          nomineeCheck.resolvedNominees && nomineeCheck.resolvedNominees.length > 0
+            ? nomineeCheck.resolvedNominees
+            : nomineeCheck.resolvedNominee
+              ? [nomineeCheck.resolvedNominee]
+              : [];
+        const resolvedJobNominees =
+          baseNominees.length > 0
+            ? Array.from({ length: resolvedPilgrimCount }, (_, idx) => baseNominees[idx] || baseNominees[0])
+            : [];
+
         return {
           hasJob: true,
           jobType: JobType.BOOKING_EXECUTION,
@@ -3204,13 +3292,15 @@ export class WorkersService {
             bookingCode: br.bookingCode,
             requestedDate: dateOnlyStr,
             route: br.route,
-            pilgrimCount: br.pilgrimCount,
+            pilgrimCount: resolvedPilgrimCount,
             timeSlot: br.timeSlot,
             selectedTime: br.selectedTime || undefined,
             preferences: br.preferences,
             pilgrims: br.pilgrims,
             nominee: nomineeCheck.resolvedNominee,
-            nominees: (br.preferences as any)?.nominees || (nomineeCheck.resolvedNominee ? [nomineeCheck.resolvedNominee] : []),
+            nominees: resolvedJobNominees,
+            excludedPilgrimFingerprints,
+            lastMilestone: br.lastMilestone || targetJob.lastMilestone || null,
             account: account
               ? {
                 id: account.id,
@@ -3473,7 +3563,7 @@ export class WorkersService {
         const br = await tx.bookingRequest.findUnique({
           where: { id: bookingId },
           include: {
-            pilgrims: true,
+            pilgrims: { orderBy: { createdAt: 'asc' } },
             account: true,
           },
         });
@@ -3570,7 +3660,7 @@ export class WorkersService {
               data: {
                 nomineeName: 'Temple Seva',
                 nomineeAge: 35,
-                nomineeRelationship: 'Relative',
+                nomineeRelationship: 'Brother',
                 nomineePhone: '9876543210',
               },
             });
@@ -3580,7 +3670,7 @@ export class WorkersService {
               resolvedNominee: {
                 nomineeName: 'Temple Seva',
                 nomineeAge: 35,
-                nomineeRelationship: 'Relative',
+                nomineeRelationship: 'Brother',
                 nomineePhone: '9876543210',
               },
             };
@@ -3835,6 +3925,34 @@ export class WorkersService {
 
         this.logger.log(`[SNIPER] 🎯 Worker ${machine.machineCode} claimed booking #${br.bookingCode} for date ${dateOnlyStr}`);
 
+        let excludedPilgrimFingerprints: string[] = [];
+        if (account?.id && typeof (tx as any).bookingConfirmationHistory?.findMany === 'function') {
+          const hist = await (tx as any).bookingConfirmationHistory.findMany({
+            where: { accountId: account.id, requestedDateStr: dateOnlyStr, selectedPilgrimFingerprint: { not: null } },
+            select: { selectedPilgrimFingerprint: true },
+          }).catch(() => []);
+          excludedPilgrimFingerprints = Array.from(
+            new Set(
+              hist
+                .flatMap((h: any) => String(h.selectedPilgrimFingerprint || '').split(','))
+                .map((s: string) => s.trim())
+                .filter(Boolean),
+            ),
+          );
+        }
+
+        const resolvedPilgrimCount = Math.max(1, Math.min(5, Number(br.pilgrimCount || 1)));
+        const baseNominees =
+          nomineeCheck.resolvedNominees && nomineeCheck.resolvedNominees.length > 0
+            ? nomineeCheck.resolvedNominees
+            : nomineeCheck.resolvedNominee
+              ? [nomineeCheck.resolvedNominee]
+              : [];
+        const resolvedJobNominees =
+          baseNominees.length > 0
+            ? Array.from({ length: resolvedPilgrimCount }, (_, idx) => baseNominees[idx] || baseNominees[0])
+            : [];
+
         return {
           hasJob: true,
           jobType: JobType.BOOKING_EXECUTION,
@@ -3845,13 +3963,15 @@ export class WorkersService {
             bookingCode: br.bookingCode,
             requestedDate: dateOnlyStr,
             route: br.route,
-            pilgrimCount: br.pilgrimCount,
+            pilgrimCount: resolvedPilgrimCount,
             timeSlot: br.timeSlot,
             selectedTime: br.selectedTime || undefined,
             preferences: br.preferences,
             pilgrims: br.pilgrims,
             nominee: nomineeCheck.resolvedNominee,
-            nominees: (br.preferences as any)?.nominees || (nomineeCheck.resolvedNominee ? [nomineeCheck.resolvedNominee] : []),
+            nominees: resolvedJobNominees,
+            excludedPilgrimFingerprints,
+            lastMilestone: br.lastMilestone || job.lastMilestone || null,
             account: account
               ? {
                 id: account.id,
@@ -3950,183 +4070,13 @@ export class WorkersService {
         };
       }
 
-      // If truly NO bookings exist for this date: check Auto-Grab / Reserved Mode to hold slot
-      const activeExecuting = typeof tx.bookingRequest?.findFirst === 'function'
-        ? await tx.bookingRequest.findFirst({
-          where: {
-            OR: [{ requestedDateStr: targetDateStr }, { requestedDate: new Date(targetDateStr) }],
-            status: BookingStatus.EXECUTING,
-            ...(routeInput && routeInput.trim().length > 0 ? { route: routeInput.trim() } : {}),
-          },
-        })
-        : null;
-
-      if (activeExecuting) {
-        const isLiveOther =
-          activeExecuting.assignedMachineId &&
-          activeExecuting.assignedMachineId !== machineId &&
-          (!activeExecuting.leaseExpiresAt || new Date(activeExecuting.leaseExpiresAt).getTime() > now.getTime());
-        if (isLiveOther) {
-          this.logger.log(`[SNIPER] Date ${targetDateStr} is already being executed by worker ${activeExecuting.assignedMachineId}. Standing down.`);
-          return {
-            hasJob: false,
-            job: null,
-            reason: `CLAIMED_BY_OTHER(${activeExecuting.assignedMachineId})`,
-            ownerWorkerId: activeExecuting.assignedMachineId,
-            message: `Date is already being executed by worker ${activeExecuting.assignedMachineId}`,
-          };
-        }
-      }
-
-      this.logger.log(`[AUTO-GRAB] No pending booking or watchlist found for ${targetDateStr}. Engaging Auto-Grab / Reserved Mode to hold slot!`);
-
-      const verifiedAccounts = typeof tx.bookingAccount?.findMany === 'function'
-        ? await tx.bookingAccount.findMany({
-          where: { status: AccountStatus.VERIFIED },
-          orderBy: { lastVerifiedAt: 'desc' },
-        })
-        : [];
-
-      let chosenAccount: any = null;
-      for (const acc of verifiedAccounts) {
-        const isBusy = this.accountLockService ? await this.accountLockService.isLocked(acc.id) : false;
-        if (!isBusy) {
-          chosenAccount = acc;
-          break;
-        }
-      }
-
-      if (!chosenAccount && verifiedAccounts.length > 0) {
-        chosenAccount = verifiedAccounts[0]; // fallback
-      }
-
-      if (!chosenAccount) {
-        this.logger.warn(`[AUTO-GRAB] Date ${targetDateStr} is available, but no verified BookingAccount is available to reserve the slot.`);
-        return {
-          hasJob: false,
-          job: null,
-          reason: 'NONE_FOR_DATE',
-          message: `Date ${targetDateStr} is open, but no verified account is available to auto-grab slot`,
-        };
-      }
-
-      // Acquire account lock
-      if (this.accountLockService) {
-        await this.accountLockService.acquireLock(chosenAccount.id, `grab-${Date.now()}`, machineId);
-      }
-
-      const grabBookingCode = `TA-GRAB-${Date.now().toString().slice(-4)}${Math.floor(100 + Math.random() * 900)}`;
-      const autoGrabBooking = await tx.bookingRequest.create({
-        data: {
-          bookingCode: grabBookingCode,
-          userId: chosenAccount.userId,
-          accountId: chosenAccount.id,
-          requestedDate: new Date(targetDateStr),
-          requestedDateStr: targetDateStr,
-          route: routeInput && routeInput.trim().length > 0 ? routeInput.trim() : 'Pamba (Regular Footpath Route)',
-          pilgrimCount: 1,
-          status: BookingStatus.EXECUTING,
-          isWatching: true,
-          isAutoGrab: true,
-          assignedMachineId: machineId,
-          leaseStartedAt: now,
-          leaseExpiresAt: leaseExpiry,
-          nomineeName: 'Temple Seva',
-          nomineeAge: 35,
-          nomineeRelationship: 'Relative',
-          nomineePhone: '9876543210',
-        },
-        include: {
-          account: true,
-          pilgrims: true,
-        },
-      });
-
-      const autoGrabFencingToken = randomUUID();
-      const autoGrabJob = await tx.bookingJob.create({
-        data: {
-          jobType: JobType.BOOKING_EXECUTION,
-          bookingRequestId: autoGrabBooking.id,
-          accountId: chosenAccount.id,
-          workerId: machineId,
-          startedAt: now,
-          heartbeatAt: now,
-          leaseExpiresAt: leaseExpiry,
-          status: BookingStatus.EXECUTING,
-          attempt: 1,
-          leaseGeneration: 1,
-          fencingToken: autoGrabFencingToken,
-        },
-      });
-      this.logger.log(`[ARBITER] Sniper claim won (auto-grab): job=${autoGrabJob.id} worker=${machineId} gen=1 token=${autoGrabFencingToken}`);
-
-      await tx.workerMachine.update({
-        where: { id: machineId },
-        data: {
-          status: WorkerStatus.BUSY,
-          currentJobId: autoGrabJob.id,
-          currentBookingId: autoGrabBooking.id,
-          currentActiveJobs: { increment: 1 },
-          lastJobAt: now,
-          currentActivity: 'PROCESSING_JOB',
-          activityDetails: `Auto-grabbing reserved booking #${grabBookingCode} for ${targetDateStr}`,
-          activityStartedAt: now,
-          lastActivityAt: now,
-        },
-      });
-
-      await this.createActivityLog({
-        workerId: machineId,
-        jobId: autoGrabJob.id,
-        bookingId: autoGrabBooking.id,
-        eventType: 'JOB_CLAIMED',
-        severity: 'INFO',
-        activity: 'PROCESSING_JOB',
-        message: `🎯 [AUTO-GRAB] Sniped and auto-grabbed slot for ${targetDateStr}! Created reserved booking #${grabBookingCode} using account ${chosenAccount.username}`,
-      });
-
+      // SAFETY RULE: Never auto-grab or create synthetic TA-GRAB bookings on customer accounts!
+      // Only execute genuine customer BookingRequests.
       return {
-        hasJob: true,
-        jobType: JobType.BOOKING_EXECUTION,
-        job: {
-          id: autoGrabJob.id,
-          bookingRequestId: autoGrabBooking.id,
-          bookingCode: grabBookingCode,
-          requestedDate: targetDateStr,
-          route: autoGrabBooking.route,
-          pilgrimCount: 1,
-          timeSlot: autoGrabBooking.timeSlot,
-          selectedTime: autoGrabBooking.selectedTime || undefined,
-          preferences: autoGrabBooking.preferences,
-          pilgrims: [],
-          nominee: {
-            nomineeName: 'Temple Seva',
-            nomineeAge: 35,
-            nomineeRelationship: 'Relative',
-            nomineePhone: '9876543210',
-          },
-          nominees: [
-            {
-              nomineeName: 'Temple Seva',
-              nomineeAge: 35,
-              nomineeRelationship: 'Relative',
-              nomineePhone: '9876543210',
-            },
-          ],
-          account: {
-            id: chosenAccount.id,
-            username: chosenAccount.username,
-            encryptedPassword: chosenAccount.encryptedPassword,
-            encryptionIv: chosenAccount.encryptionIv,
-            encryptionTag: chosenAccount.encryptionTag,
-          },
-          leaseExpiresAt: leaseExpiry,
-          leaseGeneration: autoGrabJob.leaseGeneration,
-          fencingToken: autoGrabJob.fencingToken,
-          verifiedAvailable: true,
-          skipPreflight: true,
-          dispatchSource: 'SNIPER_AUTO_GRAB',
-        },
+        hasJob: false,
+        job: null,
+        reason: 'NONE_FOR_DATE',
+        message: `No eligible customer booking request found for date ${targetDateStr}`,
       };
     });
   }
@@ -4173,7 +4123,7 @@ export class WorkersService {
         isWatching: true,
         nomineeName: 'Temple Seva',
         nomineeAge: 35,
-        nomineeRelationship: 'Relative',
+        nomineeRelationship: 'Brother',
         nomineePhone: '9876543210',
       },
     });
@@ -4265,6 +4215,16 @@ export class WorkersService {
       : BookingStatus.EXECUTING;
 
     // Update BookingJob only if not already completed
+    const milestoneTag = (dto as any).milestone || (
+      String(dto.status) === 'NOMINEE_POPULATED' ||
+        String(dto.status) === 'NOMINEE_ACCEPTED_BY_PORTAL' ||
+        String(dto.status) === 'NOMINEE_VERIFIED' ||
+        String(dto.status) === 'CONFIRM_CLICKED' ||
+        String(dto.status) === 'ZERO_COST_CONFIRMATION_PENDING'
+        ? String(dto.status)
+        : undefined
+    );
+
     if (job.status !== BookingStatus.SUCCESS) {
       await this.prisma.bookingJob.update({
         where: { id: jobId },
@@ -4272,8 +4232,45 @@ export class WorkersService {
           status: validStatus,
           heartbeatAt: new Date(),
           leaseExpiresAt,
+          ...(milestoneTag ? { lastMilestone: milestoneTag } : {}),
         },
       });
+    }
+
+    // Track nominee validation status and selected saved pilgrim identity on BookingRequest if reported
+    if (job.bookingRequestId) {
+      const selectedPilgrim = (dto as any).selectedPilgrim || (dto.logs as any)?.selectedPilgrim;
+      const selectedPilgrimsList: any[] =
+        (Array.isArray((dto as any).selectedPilgrims) && (dto as any).selectedPilgrims) ||
+        (Array.isArray((dto.logs as any)?.selectedPilgrims) && (dto.logs as any).selectedPilgrims) ||
+        (selectedPilgrim ? [selectedPilgrim] : []);
+      const combinedFingerprints = selectedPilgrimsList
+        .map((p: any) => p?.identityFingerprint)
+        .filter(Boolean)
+        .join(',');
+      const combinedNames = selectedPilgrimsList
+        .map((p: any) => p?.fullName || p?.name)
+        .filter(Boolean)
+        .join(', ');
+
+      const nomineeStatusUpdate =
+        String(dto.status) === 'NOMINEE_VERIFIED' || String(dto.status) === 'NOMINEE_ACCEPTED_BY_PORTAL' || milestoneTag === 'NOMINEE_ACCEPTED_BY_PORTAL'
+          ? 'ACCEPTED_BY_PORTAL'
+          : String(dto.status) === 'NOMINEE_POPULATED' || milestoneTag === 'NOMINEE_POPULATED'
+            ? 'POPULATED'
+            : undefined;
+
+      if (nomineeStatusUpdate || combinedFingerprints || combinedNames || milestoneTag) {
+        await this.prisma.bookingRequest.update({
+          where: { id: job.bookingRequestId },
+          data: {
+            ...(nomineeStatusUpdate ? { nomineeValidationStatus: nomineeStatusUpdate } : {}),
+            ...(milestoneTag ? { lastMilestone: milestoneTag } : {}),
+            ...(combinedFingerprints ? { selectedPilgrimFingerprint: combinedFingerprints } : {}),
+            ...(combinedNames ? { selectedPilgrimName: combinedNames } : {}),
+          } as any,
+        }).catch(() => { });
+      }
     }
 
     // If linked to BookingRequest, update it as well only if not already completed/confirmed
@@ -4389,6 +4386,14 @@ export class WorkersService {
       leaseGeneration?: number;
       fencingToken?: string;
       protocolVersion?: string;
+      pilgrimTaskId?: string;
+      taskIndex?: number;
+      selectedPilgrim?: any;
+      selectedPilgrims?: any[];
+      isFinalPilgrim?: boolean;
+      totalRequestedPilgrims?: number;
+      confirmedPilgrimsCount?: number;
+      remainingDevoteesCount?: number;
     },
   ) {
     try {
@@ -4502,6 +4507,17 @@ export class WorkersService {
           throw new BadRequestException('Authoritative official booking reference (e.g. IVQ...) is required. Cart ID or synthetic references are rejected as booking references.');
         }
 
+        // Reject false confirmation from cancelled transactions or zero pilgrims
+        if (
+          dto.confirmationData?.status === 'CANCELLED' ||
+          dto.confirmationData?.status === 'FAILED' ||
+          dto.confirmationData?.pilgrimsCount === 0 ||
+          (typeof dto.note === 'string' && dto.note.toLowerCase().includes('cancelled'))
+        ) {
+          this.logger.error(`[COMPLETE-GUARD] Refusing completeJob for Job #${jobId}: Confirmation data indicates CANCELLED or 0 pilgrims.`);
+          throw new BadRequestException('Cannot complete job with CANCELLED status or 0 pilgrims (FALSE_CONFIRMATION_REJECTED)');
+        }
+
         // Check if another booking was already confirmed with this identical pass reference (Conflict Guard)
         if (officialBookingRef && typeof this.prisma.bookingRequest?.findFirst === 'function') {
           const conflictingBooking = await this.prisma.bookingRequest.findFirst({
@@ -4560,61 +4576,65 @@ export class WorkersService {
           const br = job.bookingRequest;
           const selectedSlot = dto.confirmationData?.selectedTime || (dto as any).timeSlot || br.selectedTime || br.timeSlot || null;
 
-          if (this.stateMachine) {
-            await this.stateMachine.transition({
-              bookingId: br.id,
-              targetStatus: BookingStatus.SUCCESS,
-              targetExecutionStatus: 'COMPLETED',
-              targetFinancialStatus: 'CAPTURED',
-              expectedVersion: br.version,
-              workerId: machineId,
-              leaseGeneration: job.leaseGeneration,
-              milestone: 'CONFIRMED',
-              officialReference: officialBookingRef,
-              officialBookingReference: officialBookingRef,
-              cartId: cartId || null,
-              officialReceiptReference: officialReceiptRef || null,
-              portalTransactionReference: portalTxnRef || null,
-              confirmationEvidence: dto.confirmationEvidence || dto.confirmationData || null,
-              confirmedAt: dto.confirmedAt ? new Date(dto.confirmedAt) : now,
-              confirmationData: { ...(dto.confirmationData || {}), ...(needsReview ? { needsReview: true, reconciliationStatus: 'NEEDS_REVIEW' } : {}) },
-              selectedTime: selectedSlot,
-              note: needsReview ? 'CONFIRMED_AFTER_LEASE_EXPIRY - NEEDS_REVIEW' : undefined,
-            }, tx);
+          const pilgrimTaskId = (dto as any).pilgrimTaskId;
+          const taskIndex = (dto as any).taskIndex;
+          const selectedPilgrim = (dto as any).selectedPilgrim || dto.confirmationData?.selectedPilgrim || null;
 
-            if (needsReview) {
-              await tx.bookingRequest.update({
-                where: { id: br.id },
-                data: {
-                  reconciliationStatus: 'NEEDS_REVIEW',
-                  requiresHumanNote: 'CONFIRMED_AFTER_LEASE_EXPIRY - NEEDS_REVIEW',
-                },
-              }).catch(() => { });
+          // 1. Update individual child BookingPilgrim record if task was specified
+          if (pilgrimTaskId || taskIndex) {
+            let targetBp: any = null;
+            if (pilgrimTaskId && typeof (tx as any).bookingPilgrim?.findUnique === 'function') {
+              targetBp = await Promise.resolve((tx as any).bookingPilgrim.findUnique({ where: { id: pilgrimTaskId } })).catch(() => null);
             }
-          } else {
-            await tx.bookingRequest.update({
-              where: { id: br.id },
-              data: {
-                status: BookingStatus.SUCCESS,
-                officialReference: officialBookingRef,
-                officialBookingReference: officialBookingRef,
-                cartId: cartId || null,
-                officialReceiptReference: officialReceiptRef || null,
-                portalTransactionReference: portalTxnRef || null,
-                confirmationEvidence: dto.confirmationEvidence || dto.confirmationData || null,
-                confirmedAt: dto.confirmedAt ? new Date(dto.confirmedAt) : now,
-                confirmationData: { ...(dto.confirmationData || {}), ...(needsReview ? { needsReview: true } : {}) },
-                reconciliationStatus: needsReview ? 'NEEDS_REVIEW' : null,
-                requiresHumanNote: needsReview ? 'CONFIRMED_AFTER_LEASE_EXPIRY - NEEDS_REVIEW' : null,
-                selectedTime: selectedSlot,
-                assignedMachineId: null,
-                leaseExpiresAt: null,
-                completedAt: now,
-              } as any,
-            });
+            if (!targetBp && br.id && typeof (tx as any).bookingPilgrim?.findFirst === 'function') {
+              targetBp = await Promise.resolve((tx as any).bookingPilgrim.findFirst({
+                where: {
+                  bookingRequestId: br.id,
+                  ...(taskIndex ? { metadata: { path: ['taskIndex'], equals: taskIndex } } : {}),
+                },
+              })).catch(() => null);
+            }
+            if (!targetBp && br.id && taskIndex && typeof (tx as any).bookingPilgrim?.findMany === 'function') {
+              const allBps = await Promise.resolve((tx as any).bookingPilgrim.findMany({
+                where: { bookingRequestId: br.id },
+                orderBy: { createdAt: 'asc' },
+              })).catch(() => []);
+              targetBp = allBps.find((p: any) => {
+                const meta = typeof p.metadata === 'string' ? JSON.parse(p.metadata) : (p.metadata || {});
+                return Number(meta.taskIndex) === Number(taskIndex);
+              }) || allBps[taskIndex - 1];
+            }
+            if (targetBp && typeof (tx as any).bookingPilgrim?.update === 'function') {
+              const prevMeta = typeof targetBp.metadata === 'string' ? JSON.parse(targetBp.metadata) : (targetBp.metadata || {});
+              await Promise.resolve((tx as any).bookingPilgrim.update({
+                where: { id: targetBp.id },
+                data: {
+                  fullName: selectedPilgrim?.fullName || targetBp.fullName,
+                  age: selectedPilgrim?.age ? Number(selectedPilgrim.age) : targetBp.age,
+                  gender: selectedPilgrim?.gender || targetBp.gender,
+                  idType: selectedPilgrim?.idType || targetBp.idType,
+                  idNumber: selectedPilgrim?.maskedIdNumber || targetBp.idNumber,
+                  metadata: {
+                    ...prevMeta,
+                    taskIndex: taskIndex || prevMeta.taskIndex,
+                    taskStatus: 'CONFIRMED',
+                    status: 'CONFIRMED',
+                    officialBookingReference: officialBookingRef,
+                    portalTransactionReference: portalTxnRef || officialBookingRef,
+                    transactionId: portalTxnRef || officialBookingRef,
+                    selectedPilgrimFingerprint: selectedPilgrim?.identityFingerprint,
+                    identityFingerprint: selectedPilgrim?.identityFingerprint,
+                    confirmedAt: now.toISOString(),
+                  },
+                },
+              })).catch(() => { });
+            }
           }
 
-          // Capture reserved service fee from centre wallet in the SAME atomic transaction
+          // 2. Determine per-pilgrim capture amount (₹10 per confirmed devotee)
+          const isMultiPilgrim = (br.pilgrimCount || 1) > 1;
+          const isSinglePilgrimTaskConfirmation = Boolean((dto as any).pilgrimTaskId || (dto as any).taskIndex);
+          const perPilgrimFee = 10;
           const reserveTx = await tx.walletTransaction.findFirst({
             where: {
               bookingId: br.id,
@@ -4622,38 +4642,283 @@ export class WorkersService {
               status: 'COMPLETED',
             },
           });
-          const feeAmount = reserveTx ? Number(reserveTx.amount) : 10;
+          const captureFee = (isMultiPilgrim && isSinglePilgrimTaskConfirmation) ? perPilgrimFee : (reserveTx ? Number(reserveTx.amount) : 10);
+          const capIdempotencyKey = isSinglePilgrimTaskConfirmation
+            ? `cap_${br.id}_${(dto as any).pilgrimTaskId || (dto as any).taskIndex}`
+            : `cap_${br.id}`;
 
           await this.walletService.capture({
             userId: br.userId,
             bookingId: br.id,
-            amount: feeAmount,
+            amount: captureFee,
             workerMachineId: machineId,
-            idempotencyKey: `cap_${br.id}`,
+            idempotencyKey: capIdempotencyKey,
           }, tx);
 
-          // Increment worker metrics in the SAME atomic transaction
-          await tx.workerMachine.update({
-            where: { id: machineId },
-            data: {
-              jobsCompleted: { increment: 1 },
-              successCount: { increment: 1 },
-              currentJobId: null,
-              currentBookingId: null,
-              currentActivity: 'IDLE',
-              activityDetails: `Last job confirmed with ref: ${officialBookingRef}`,
-              lastActivityAt: now,
-              status: WorkerStatus.ONLINE,
-            },
-          });
+          // 3. Count confirmed pilgrims to determine if parent request is fully completed
+          let isAllConfirmed = true;
+          let confirmedPilgrimsCount = 1;
+          const totalRequested = Math.max(1, br.pilgrimCount || 1);
 
-          return { bookingCompleted: true, feeAmount };
+          if (isMultiPilgrim && typeof (tx as any).bookingPilgrim?.findMany === 'function') {
+            const allPilgrimTasks = await Promise.resolve((tx as any).bookingPilgrim.findMany({
+              where: { bookingRequestId: br.id },
+            })).catch(() => []);
+            confirmedPilgrimsCount = allPilgrimTasks.filter((p: any) => {
+              const meta = typeof p.metadata === 'string' ? JSON.parse(p.metadata) : (p.metadata || {});
+              return meta.taskStatus === 'CONFIRMED' || meta.status === 'CONFIRMED' || meta.officialBookingReference || p.id === (dto as any).pilgrimTaskId;
+            }).length;
+            isAllConfirmed = (dto as any).isFinalPilgrim || confirmedPilgrimsCount >= totalRequested || allPilgrimTasks.length === 0;
+          }
+
+          if (isAllConfirmed) {
+            if (this.stateMachine) {
+              await this.stateMachine.transition({
+                bookingId: br.id,
+                targetStatus: BookingStatus.SUCCESS,
+                targetExecutionStatus: 'COMPLETED',
+                targetFinancialStatus: 'CAPTURED',
+                expectedVersion: br.version,
+                workerId: machineId,
+                leaseGeneration: job.leaseGeneration,
+                milestone: 'CONFIRMED',
+                officialReference: officialBookingRef,
+                officialBookingReference: officialBookingRef,
+                cartId: cartId || null,
+                officialReceiptReference: officialReceiptRef || null,
+                portalTransactionReference: portalTxnRef || null,
+                confirmationEvidence: dto.confirmationEvidence || dto.confirmationData || null,
+                confirmedAt: dto.confirmedAt ? new Date(dto.confirmedAt) : now,
+                confirmationData: { ...(dto.confirmationData || {}), ...(needsReview ? { needsReview: true, reconciliationStatus: 'NEEDS_REVIEW' } : {}) },
+                selectedTime: selectedSlot,
+                note: needsReview ? 'CONFIRMED_AFTER_LEASE_EXPIRY - NEEDS_REVIEW' : undefined,
+              }, tx);
+
+              if (needsReview) {
+                await tx.bookingRequest.update({
+                  where: { id: br.id },
+                  data: {
+                    reconciliationStatus: 'NEEDS_REVIEW',
+                    requiresHumanNote: 'CONFIRMED_AFTER_LEASE_EXPIRY - NEEDS_REVIEW',
+                  },
+                }).catch(() => { });
+              }
+            } else {
+              await tx.bookingRequest.update({
+                where: { id: br.id },
+                data: {
+                  status: BookingStatus.SUCCESS,
+                  financialStatus: FinancialStatus.CAPTURED,
+                  officialReference: officialBookingRef,
+                  officialBookingReference: officialBookingRef,
+                  cartId: cartId || null,
+                  officialReceiptReference: officialReceiptRef || null,
+                  portalTransactionReference: portalTxnRef || null,
+                  confirmationEvidence: dto.confirmationEvidence || dto.confirmationData || null,
+                  confirmedAt: dto.confirmedAt ? new Date(dto.confirmedAt) : now,
+                  confirmationData: { ...(dto.confirmationData || {}), ...(needsReview ? { needsReview: true } : {}) },
+                  reconciliationStatus: needsReview ? 'NEEDS_REVIEW' : null,
+                  requiresHumanNote: needsReview ? 'CONFIRMED_AFTER_LEASE_EXPIRY - NEEDS_REVIEW' : null,
+                  selectedTime: selectedSlot,
+                  assignedMachineId: null,
+                  leaseExpiresAt: null,
+                  completedAt: now,
+                } as any,
+              });
+            }
+          } else {
+            // Sequential Devotee Booking: Devotee confirmed, remaining devotees pending.
+            // Reset BookingJob to QUEUED so next devotee can be claimed when availability returns
+            await tx.bookingJob.update({
+              where: { id: jobId },
+              data: {
+                status: BookingStatus.QUEUED,
+                workerId: null,
+                leaseExpiresAt: null,
+                completedAt: null,
+                attempt: 0,
+              },
+            });
+
+            const remainingCount = totalRequested - confirmedPilgrimsCount;
+            await Promise.resolve(
+              tx.bookingRequest.update({
+                where: { id: br.id },
+                data: {
+                  status: BookingStatus.WATCHING,
+                  isWatching: true,
+                  reconciliationStatus: 'PARTIALLY_CONFIRMED',
+                  lastMilestone: `PARTIALLY_CONFIRMED (${confirmedPilgrimsCount}/${totalRequested} Confirmed, ${remainingCount} Pending)`,
+                  officialReference: officialBookingRef,
+                  officialBookingReference: officialBookingRef,
+                  portalTransactionReference: portalTxnRef || null,
+                  confirmedAt: dto.confirmedAt ? new Date(dto.confirmedAt) : now,
+                  selectedTime: selectedSlot,
+                  assignedMachineId: null,
+                  leaseExpiresAt: null,
+                } as any,
+              }),
+            ).catch(() => { });
+
+            // Update worker machine: returned to WATCHING availability
+            await tx.workerMachine.update({
+              where: { id: machineId },
+              data: {
+                currentJobId: null,
+                currentBookingId: null,
+                currentActivity: 'WATCHING',
+                activityDetails: `Devotee ${taskIndex || confirmedPilgrimsCount} of ${totalRequested} confirmed. Returning to availability watch for remaining ${remainingCount} devotee(s).`,
+                lastActivityAt: now,
+                status: WorkerStatus.ONLINE,
+              },
+            });
+          }
+
+          // Record Saved Pilgrim Identity & BookingConfirmationHistory for duplicate prevention
+          const selectedPilgrimsList: any[] =
+            (Array.isArray((dto as any).selectedPilgrims) && (dto as any).selectedPilgrims.length > 0
+              ? (dto as any).selectedPilgrims
+              : Array.isArray(dto.confirmationData?.selectedPilgrims) && dto.confirmationData.selectedPilgrims.length > 0
+                ? dto.confirmationData.selectedPilgrims
+                : selectedPilgrim
+                  ? [selectedPilgrim]
+                  : []);
+
+          const pilgrimFingerprint =
+            selectedPilgrimsList.map((p: any) => p?.identityFingerprint).filter(Boolean).join(',') ||
+            selectedPilgrim?.identityFingerprint ||
+            (br as any).selectedPilgrimFingerprint ||
+            null;
+          const pilgrimName =
+            selectedPilgrimsList.map((p: any) => p?.fullName || p?.name).filter(Boolean).join(', ') ||
+            selectedPilgrim?.fullName ||
+            (br as any).selectedPilgrimName ||
+            null;
+          const targetAcctId = job.accountId || br.accountId;
+          let savedPilgrimRecordId: string | null = (br as any).selectedSavedPilgrimId || null;
+
+          if (targetAcctId && typeof (tx as any).accountSavedPilgrim?.upsert === 'function') {
+            const pilgrimsToUpsert = selectedPilgrimsList.length > 0
+              ? selectedPilgrimsList
+              : pilgrimFingerprint
+                ? [{
+                  identityFingerprint: String(pilgrimFingerprint).split(',')[0].trim(),
+                  fullName: pilgrimName ? String(pilgrimName).split(',')[0].trim() : 'Registered Devotee',
+                }]
+                : [];
+
+            for (const spItem of pilgrimsToUpsert) {
+              const fp = spItem?.identityFingerprint?.trim();
+              if (!fp) continue;
+              const pName = (spItem?.fullName || spItem?.name || '').trim() || 'Registered Devotee';
+              try {
+                const savedPilgrim = await (tx as any).accountSavedPilgrim.upsert({
+                  where: {
+                    accountId_identityFingerprint: {
+                      accountId: targetAcctId,
+                      identityFingerprint: fp,
+                    },
+                  },
+                  create: {
+                    accountId: targetAcctId,
+                    portalPilgrimId: spItem?.portalPilgrimId || null,
+                    identityFingerprint: fp,
+                    fullName: pName,
+                    age: spItem?.age ? Number(spItem.age) : null,
+                    gender: spItem?.gender || null,
+                    idType: spItem?.idType || null,
+                    maskedIdNumber: spItem?.maskedIdNumber || null,
+                    lastSelectedAt: now,
+                    lastSeenAt: now,
+                  },
+                  update: {
+                    lastSelectedAt: now,
+                    lastSeenAt: now,
+                    ...(pName ? { fullName: pName } : {}),
+                  },
+                });
+                if (!savedPilgrimRecordId && savedPilgrim?.id) {
+                  savedPilgrimRecordId = savedPilgrim.id;
+                }
+              } catch (spErr: any) {
+                this.logger.warn(`[COMPLETE] Non-fatal AccountSavedPilgrim upsert notice: ${spErr.message}`);
+              }
+            }
+          }
+
+          if (pilgrimFingerprint || pilgrimName || savedPilgrimRecordId) {
+            await tx.bookingRequest.update({
+              where: { id: br.id },
+              data: {
+                nomineeValidationStatus: 'ACCEPTED_BY_PORTAL',
+                ...(savedPilgrimRecordId ? { selectedSavedPilgrimId: savedPilgrimRecordId } : {}),
+                ...(pilgrimFingerprint ? { selectedPilgrimFingerprint: pilgrimFingerprint } : {}),
+                ...(pilgrimName ? { selectedPilgrimName: pilgrimName } : {}),
+              } as any,
+            }).catch(() => { });
+          }
+
+          if (targetAcctId && officialBookingRef && typeof (tx as any).bookingConfirmationHistory?.upsert === 'function') {
+            const reqDateStr = br.requestedDateStr || (br.requestedDate instanceof Date ? br.requestedDate.toISOString().split('T')[0] : String(br.requestedDate).split('T')[0]);
+            await (tx as any).bookingConfirmationHistory.upsert({
+              where: { bookingRequestId: br.id },
+              create: {
+                bookingRequestId: br.id,
+                accountId: targetAcctId,
+                savedPilgrimId: savedPilgrimRecordId,
+                selectedPilgrimFingerprint: pilgrimFingerprint,
+                selectedPilgrimName: pilgrimName,
+                requestedDateStr: reqDateStr,
+                route: br.route,
+                selectedSlot: selectedSlot,
+                nomineeName: br.nomineeName || null,
+                nomineeAge: br.nomineeAge || null,
+                nomineeRelationship: br.nomineeRelationship || null,
+                nomineePhone: br.nomineePhone || null,
+                officialBookingReference: officialBookingRef,
+                cartId: cartId || null,
+                portalTransactionReference: portalTxnRef || null,
+                officialReceiptReference: officialReceiptRef || null,
+                confirmedAt: dto.confirmedAt ? new Date(dto.confirmedAt) : now,
+              },
+              update: {
+                officialBookingReference: officialBookingRef,
+                selectedPilgrimFingerprint: pilgrimFingerprint || undefined,
+                selectedPilgrimName: pilgrimName || undefined,
+                savedPilgrimId: savedPilgrimRecordId || undefined,
+                cartId: cartId || undefined,
+                portalTransactionReference: portalTxnRef || undefined,
+                officialReceiptReference: officialReceiptRef || undefined,
+              },
+            }).catch((bhErr: any) => {
+              this.logger.warn(`[COMPLETE] Non-fatal BookingConfirmationHistory upsert notice: ${bhErr.message}`);
+            });
+          }
+
+          // Increment worker metrics if all requested pilgrims are confirmed
+          if (isAllConfirmed) {
+            await tx.workerMachine.update({
+              where: { id: machineId },
+              data: {
+                jobsCompleted: { increment: 1 },
+                successCount: { increment: 1 },
+                currentJobId: null,
+                currentBookingId: null,
+                currentActivity: 'IDLE',
+                activityDetails: `Last job confirmed with ref: ${officialBookingRef}`,
+                lastActivityAt: now,
+                status: WorkerStatus.ONLINE,
+              },
+            });
+          }
+
+          return { bookingCompleted: isAllConfirmed, isAllConfirmed, confirmedCount: confirmedPilgrimsCount, totalRequested, feeAmount: captureFee };
         }
 
-        return { success: true };
+        return { success: true, ...((completionResult && typeof completionResult === 'object') ? completionResult : {}) };
       });
 
-      // Release Account Lock with exact lease generation protection
+      // Release Account Lock with exact lease generation protection between devotee bookings so account is not held locked while waiting for availability
       if (job.accountId || job.bookingRequest?.accountId) {
         await this.accountLockService.releaseLock(
           job.accountId || job.bookingRequest?.accountId,
@@ -4676,15 +4941,21 @@ export class WorkersService {
       if (job.bookingRequest) {
         const br = job.bookingRequest;
         const feeAmount = (completionResult as any)?.feeAmount || 10;
+        const isAllConfirmed = (completionResult as any)?.isAllConfirmed !== false;
+        const confirmedCount = (completionResult as any)?.confirmedCount || 1;
+        const totalRequested = (completionResult as any)?.totalRequested || Math.max(1, br.pilgrimCount || 1);
+        const remainingCount = totalRequested - confirmedCount;
 
         await this.createActivityLog({
           workerId: machineId,
           jobId,
           bookingId: br.id,
-          eventType: 'JOB_COMPLETED',
+          eventType: isAllConfirmed ? 'JOB_COMPLETED' : 'DEVOTEE_COMPLETED',
           severity: 'INFO',
-          activity: 'IDLE',
-          message: `Booking execution confirmed successfully with reference ${officialBookingRef} (Cart ID: ${cartId || 'N/A'}, Txn Ref: ${portalTxnRef || 'N/A'})`,
+          activity: isAllConfirmed ? 'IDLE' : 'WATCHING',
+          message: isAllConfirmed
+            ? `All ${totalRequested} devotees confirmed successfully with reference ${officialBookingRef} (Cart ID: ${cartId || 'N/A'}, Txn Ref: ${portalTxnRef || 'N/A'})`
+            : `Devotee ${dto.taskIndex || confirmedCount} of ${totalRequested} confirmed (#${officialBookingRef}). Returning to availability monitoring for remaining ${remainingCount} devotee(s).`,
         });
 
         // Credit partner commission if the booking was performed by a centre under a partner franchise
@@ -4718,36 +4989,105 @@ export class WorkersService {
           }
         }
 
-        // Notify Centre and Customer with complete official booking confirmation details
+        // Notify Centre and Customer with official booking confirmation details
         const dateDisplay = br.requestedDateStr || (br.requestedDate instanceof Date ? br.requestedDate.toISOString().split('T')[0] : String(br.requestedDate).split('T')[0]);
         const slotDisplay = br.selectedTime || br.timeSlot || 'Standard';
         const grandTotalDisplay = dto.confirmationData?.grandTotal || '₹ 0.00';
         const receiptUrlDisplay = dto.confirmationData?.receiptUrl || 'https://sabarimalaonline.org/#/booking-history';
 
-        await this.notifications.send({
-          userId: br.userId,
-          recipient: (br as any).user?.email || 'centre@ticketassist.com',
-          channel: NotificationChannel.IN_APP,
-          title: `Official Sabarimala Pass Confirmed: #${br.bookingCode}`,
-          body: `Pass Reference: ${officialBookingRef} | Date: ${dateDisplay} | Route: ${br.route} | Slot: ${slotDisplay} | Pilgrims: ${br.pilgrimCount} | Paid: ${grandTotalDisplay} | Status: CONFIRMED | Receipt: ${receiptUrlDisplay}`,
-          payload: {
-            bookingId: br.id,
-            bookingCode: br.bookingCode,
-            bookingReference: officialBookingRef,
-            officialBookingReference: officialBookingRef,
-            cartId: cartId || null,
-            portalTransactionReference: portalTxnRef || null,
-            officialReceiptReference: officialReceiptRef || null,
-            darshanDate: dateDisplay,
-            route: br.route,
-            timeSlot: slotDisplay,
-            pilgrimCount: br.pilgrimCount,
-            amountPaid: grandTotalDisplay,
-            confirmationStatus: 'CONFIRMED',
-            receiptUrl: receiptUrlDisplay,
-            confirmationData: dto.confirmationData,
-          },
-        }).catch((err) => this.logger.warn(`Notification send failure: ${err.message}`));
+        if (!isAllConfirmed) {
+          const devoteeNotice = (dto as any).notificationMessage ||
+            `Devotee ${dto.taskIndex || confirmedCount} of ${totalRequested} completed successfully. Booking reference: ${officialBookingRef}. Remaining devotees: ${remainingCount}. Returning to availability monitoring.`;
+
+          await this.notifications.send({
+            userId: br.userId,
+            recipient: (br as any).user?.email || 'centre@ticketassist.com',
+            channel: NotificationChannel.IN_APP,
+            title: `Devotee Confirmed: #${br.bookingCode}`,
+            body: devoteeNotice,
+            payload: {
+              bookingId: br.id,
+              bookingCode: br.bookingCode,
+              pilgrimTaskId: (dto as any).pilgrimTaskId,
+              taskIndex: dto.taskIndex,
+              officialReference: officialBookingRef,
+              confirmedCount,
+              totalRequested,
+              remainingDevotees: remainingCount,
+              status: 'PARTIALLY_COMPLETED',
+            },
+          }).catch((err) => this.logger.warn(`Notification send failure: ${err.message}`));
+        } else {
+          await this.notifications.send({
+            userId: br.userId,
+            recipient: (br as any).user?.email || 'centre@ticketassist.com',
+            channel: NotificationChannel.IN_APP,
+            title: `Official Sabarimala Pass Confirmed: #${br.bookingCode}`,
+            body: `Pass Reference: ${officialBookingRef} | Date: ${dateDisplay} | Route: ${br.route} | Slot: ${slotDisplay} | Pilgrims: ${br.pilgrimCount} | Paid: ${grandTotalDisplay} | Status: CONFIRMED | Receipt: ${receiptUrlDisplay}`,
+            payload: {
+              bookingId: br.id,
+              bookingCode: br.bookingCode,
+              bookingReference: officialBookingRef,
+              officialBookingReference: officialBookingRef,
+              cartId: cartId || null,
+              portalTransactionReference: portalTxnRef || null,
+              officialReceiptReference: officialReceiptRef || null,
+              darshanDate: dateDisplay,
+              route: br.route,
+              timeSlot: slotDisplay,
+              pilgrimCount: br.pilgrimCount,
+              amountPaid: grandTotalDisplay,
+              confirmationStatus: 'CONFIRMED',
+              receiptUrl: receiptUrlDisplay,
+              confirmationData: dto.confirmationData,
+            },
+          }).catch((err) => this.logger.warn(`Notification send failure: ${err.message}`));
+        }
+
+        // Dispatch official Telegram confirmation alert for confirmed devotee
+        try {
+          const devoteeName = (dto as any)?.selectedPilgrim?.fullName || (br as any).selectedPilgrimName || (dto.taskIndex ? `Devotee #${dto.taskIndex}` : `Devotee #${confirmedCount}`);
+          const officialTxnId = portalTxnRef || officialBookingRef;
+          const formattedDate = br.requestedDate
+            ? new Date(br.requestedDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }).replace(/ /g, '-')
+            : dateDisplay;
+
+          const tgMessage = [
+            `✅ <b>SABARIMALA BOOKING CONFIRMED</b>`,
+            ``,
+            `<b>Booking:</b> <code>${br.bookingCode}</code>`,
+            `<b>Devotee:</b> ${devoteeName}`,
+            `<b>Transaction ID:</b> <code>${officialTxnId}</code>`,
+            `<b>Date:</b> ${formattedDate}`,
+            `<b>Slot:</b> ${slotDisplay}`,
+            `<b>Pilgrims:</b> 1`,
+            ``,
+            `<b>Progress:</b> ${confirmedCount} / ${totalRequested} confirmed`,
+            `<b>Remaining:</b> ${remainingCount} devotee${remainingCount === 1 ? '' : 's'}`,
+            ``,
+            `Official booking success verified.`,
+          ].join('\n');
+
+          const dedupSuccessKey = `tg_success:${br.id}:${officialTxnId}:${dto.taskIndex || confirmedCount}`;
+          if (typeof this.notifications?.sendTelegramBookingNotification === 'function') {
+            await this.notifications.sendTelegramBookingNotification({
+              bookingId: br.id,
+              bookingCode: br.bookingCode,
+              status: BookingStatus.BOOKING_CONFIRMED,
+              officialReference: officialBookingRef,
+              selectedTime: slotDisplay,
+              requestedDate: br.requestedDate,
+              pilgrimCount: 1,
+              customMessage: tgMessage,
+              idempotencyKey: dedupSuccessKey,
+            } as any).catch((tgErr: any) => {
+              this.logger.warn(`[TELEGRAM] Notice: ${tgErr?.message}`);
+            });
+            this.logger.log(`[TELEGRAM_SUCCESS_NOTIFICATION_SENT] Telegram confirmation alert dispatched for Booking #${br.bookingCode} Devotee #${dto.taskIndex || confirmedCount} (Txn: ${officialTxnId})`);
+          }
+        } catch (tgNotifyErr: any) {
+          this.logger.warn(`[TELEGRAM] Failed to send devotee confirmation alert: ${tgNotifyErr?.message}`);
+        }
 
         // Realtime WebSocket broadcast to Admin Dashboard and user
         if (this.eventsGateway) {
@@ -4771,14 +5111,19 @@ export class WorkersService {
           await this.smartAllocator.releaseJobCapacity(machineId, jobId, br.id);
         }
 
-        return { success: true, message: 'Booking completed and funds captured', ref: officialBookingRef };
+        return {
+          success: true,
+          message: 'Booking completed and funds captured',
+          ref: officialBookingRef,
+          ...((completionResult && typeof completionResult === 'object') ? completionResult : {}),
+        };
       }
 
       if (this.smartAllocator) {
         await this.smartAllocator.releaseJobCapacity(machineId, jobId);
       }
 
-      return { success: true };
+      return { success: true, ...((completionResult && typeof completionResult === 'object') ? completionResult : {}) };
     } catch (err: any) {
       this.logger.error(`[completeJob] Failed for Job #${jobId}: ${err?.message || err}`, {
         stack: err?.stack,
@@ -4815,6 +5160,14 @@ export class WorkersService {
       leaseGeneration?: number;
       fencingToken?: string;
       protocolVersion?: string;
+      pilgrimTaskId?: string;
+      taskIndex?: number;
+      selectedPilgrim?: any;
+      selectedPilgrims?: any[];
+      isFinalPilgrim?: boolean;
+      totalRequestedPilgrims?: number;
+      confirmedPilgrimsCount?: number;
+      remainingDevoteesCount?: number;
     },
   ) {
     // Protocol Version Guard
@@ -4860,6 +5213,51 @@ export class WorkersService {
       );
     }
 
+    // CENTRAL STATE-TRANSITION GUARD FOR CONFIRMED DEVOTEES / PARTIALLY CONFIRMED BOOKINGS
+    if (job.bookingRequest) {
+      const br = job.bookingRequest;
+
+      // 1. If specific devotee task is already CONFIRMED, refuse to downgrade
+      if (dto.pilgrimTaskId || dto.taskIndex) {
+        let targetBp: any = null;
+        if (dto.pilgrimTaskId && typeof (this.prisma as any).bookingPilgrim?.findUnique === 'function') {
+          targetBp = await (this.prisma as any).bookingPilgrim.findUnique({ where: { id: dto.pilgrimTaskId } }).catch(() => null);
+        }
+        if (!targetBp && br.id && typeof (this.prisma as any).bookingPilgrim?.findFirst === 'function') {
+          targetBp = await (this.prisma as any).bookingPilgrim.findFirst({
+            where: {
+              bookingRequestId: br.id,
+              ...(dto.taskIndex ? { metadata: { path: ['taskIndex'], equals: dto.taskIndex } } : {}),
+            },
+          }).catch(() => null);
+        }
+        if (targetBp && ((targetBp.metadata as any)?.taskStatus === 'CONFIRMED' || (targetBp.metadata as any)?.officialBookingReference)) {
+          this.logger.warn(`[CONFIRMATION-GUARD] Devotee #${dto.taskIndex || targetBp.fullName} is already CONFIRMED. Refusing to downgrade to ${dto.status}.`);
+          return { success: true, message: 'Devotee already confirmed; protected from failure downgrade' };
+        }
+      }
+
+      // 2. If parent booking has confirmed devotees, preserve PARTIALLY_CONFIRMED and WATCHING state
+      const allPilgrims = await (this.prisma as any).bookingPilgrim?.findMany({ where: { bookingRequestId: br.id } }).catch(() => []);
+      const confirmedPilgrims = (allPilgrims || []).filter((p: any) => (p.metadata as any)?.taskStatus === 'CONFIRMED' || (p.metadata as any)?.officialBookingReference);
+      if (confirmedPilgrims.length > 0) {
+        this.logger.warn(`[CONFIRMATION-GUARD] Booking #${br.bookingCode} has ${confirmedPilgrims.length} confirmed devotee(s). Preserving PARTIALLY_CONFIRMED / WATCHING status despite failure: ${dto.errorMessage || dto.status}`);
+        await this.prisma.bookingRequest.update({
+          where: { id: br.id },
+          data: {
+            status: BookingStatus.WATCHING,
+            isWatching: true,
+            executionStatus: 'IDLE',
+            reconciliationStatus: 'PARTIALLY_CONFIRMED',
+            lastMilestone: `PARTIALLY_CONFIRMED (${confirmedPilgrims.length}/${br.pilgrimCount || allPilgrims.length} Confirmed)`,
+            assignedMachineId: null,
+            leaseExpiresAt: null,
+          } as any,
+        }).catch(() => { });
+        return { success: true, message: 'Preserved PARTIALLY_CONFIRMED status for booking with confirmed devotees' };
+      }
+    }
+
     // Date Full / Unavailable / Mismatch Handling -> transition to WATCHING in ONE atomic step so UI reflects monitoring reality
     const isMismatch =
       dto.errorCode === 'PORTAL_AVAILABILITY_MISMATCH' ||
@@ -4871,6 +5269,8 @@ export class WorkersService {
     const isDateFullOrUnavailable =
       isMismatch ||
       (dto.status as string) === 'DATE_FULL' ||
+      (dto.status as string) === 'PORTAL_SERVICE_UNAVAILABLE' ||
+      dto.errorCode === 'PORTAL_SERVICE_UNAVAILABLE' ||
       dto.status === BookingStatus.WATCHING ||
       (dto.status as string) === 'WATCHING' ||
       dto.errorCode === 'DATE_UNAVAILABLE' ||
@@ -5136,44 +5536,117 @@ export class WorkersService {
     if (job.bookingRequest) {
       const br = job.bookingRequest;
 
-      if (dto.status === BookingStatus.REQUIRES_HUMAN || (dto.status as string) === 'UNKNOWN_RESULT') {
-        // Quarantine ambiguous outcome without releasing wallet hold (FIND-002)
-        const interventionNote = (dto.status as string) === 'UNKNOWN_RESULT'
-          ? `[MANUAL RECONCILIATION] ${dto.errorMessage || 'Official booking unconfirmed after submission. Wallet hold retained for operator verification.'}`
-          : (dto.errorMessage || 'Official portal requires verification (CAPTCHA / OTP)');
+      const isQuarantinedOrPendingVerification =
+        dto.status === BookingStatus.REQUIRES_HUMAN ||
+        dto.status === BookingStatus.RECONCILIATION_REQUIRED ||
+        dto.status === ('PENDING_VERIFICATION' as any) ||
+        dto.status === BookingStatus.OTP_REQUIRED ||
+        dto.status === BookingStatus.CAPTCHA_REQUIRED ||
+        (dto.status as string) === 'UNKNOWN_RESULT' ||
+        (dto.status as string) === 'UNKNOWN_OUTCOME' ||
+        dto.status === BookingStatus.UNKNOWN;
+
+      const isRetryableInQueue =
+        validFailStatus === BookingStatus.RETRYABLE_FAILURE &&
+        (job.attempt || 1) < (job.maxAttempts || 3);
+
+      if (isQuarantinedOrPendingVerification) {
+        // Quarantine ambiguous or human-verification outcome WITHOUT releasing wallet hold
+        const targetQuarantineStatus =
+          dto.status === BookingStatus.RECONCILIATION_REQUIRED || dto.status === ('PENDING_VERIFICATION' as any)
+            ? dto.status
+            : BookingStatus.REQUIRES_HUMAN;
+
+        const interventionNote =
+          (dto.status as string) === 'UNKNOWN_RESULT' ||
+            dto.status === BookingStatus.RECONCILIATION_REQUIRED ||
+            dto.status === ('PENDING_VERIFICATION' as any)
+            ? `[PENDING VERIFICATION] ${dto.errorMessage || 'Official booking outcome requires history verification after submission. Wallet reservation safely retained.'}`
+            : (dto.errorMessage || 'Official portal requires verification (CAPTCHA / OTP)');
 
         try {
           await this.stateMachine.transition({
             bookingId: br.id,
-            targetStatus: BookingStatus.REQUIRES_HUMAN,
+            targetStatus: targetQuarantineStatus,
             targetExecutionStatus: 'QUARANTINED',
             workerId: machineId,
             leaseGeneration: job.leaseGeneration,
-            milestone: 'REQUIRES_HUMAN',
+            milestone: String(targetQuarantineStatus),
             screenshot: dto.screenshot,
             confirmationEvidence: dto.screenshot ? { screenshot: dto.screenshot } : undefined,
             note: interventionNote,
           });
         } catch (smErr: any) {
-          this.logger.warn(`[STATE_MACHINE] Fail transition to REQUIRES_HUMAN fallback: ${smErr.message}`);
+          this.logger.warn(`[STATE_MACHINE] Fail transition to ${targetQuarantineStatus} fallback: ${smErr.message}`);
           await this.prisma.bookingRequest.update({
             where: { id: br.id },
             data: {
-              status: BookingStatus.REQUIRES_HUMAN,
+              status: targetQuarantineStatus,
               requiresHumanNote: interventionNote,
               confirmationEvidence: dto.screenshot ? { screenshot: dto.screenshot } : undefined,
             },
           });
-          // Dispatch Telegram notification with screenshot directly on state machine fallback
           if (typeof this.notifications?.sendTelegramBookingNotification === 'function') {
             await this.notifications.sendTelegramBookingNotification({
               bookingId: br.id,
-              status: BookingStatus.REQUIRES_HUMAN,
+              status: targetQuarantineStatus,
               requiresHumanNote: interventionNote,
               screenshotUrl: dto.screenshot,
               workerId: machineId,
             }).catch(() => { });
           }
+        }
+
+        // Keep child devotee task in PENDING_VERIFICATION (never CONFIRMED)
+        if (dto.pilgrimTaskId || dto.taskIndex) {
+          let targetBp: any = null;
+          if (dto.pilgrimTaskId && typeof (this.prisma as any).bookingPilgrim?.findUnique === 'function') {
+            targetBp = await (this.prisma as any).bookingPilgrim.findUnique({ where: { id: dto.pilgrimTaskId } }).catch(() => null);
+          }
+          if (!targetBp && br.id && typeof (this.prisma as any).bookingPilgrim?.findFirst === 'function') {
+            targetBp = await (this.prisma as any).bookingPilgrim.findFirst({
+              where: {
+                bookingRequestId: br.id,
+                ...(dto.taskIndex ? { metadata: { path: ['taskIndex'], equals: dto.taskIndex } } : {}),
+              },
+            }).catch(() => null);
+          }
+          if (targetBp && (targetBp.metadata as any)?.taskStatus !== 'CONFIRMED' && typeof (this.prisma as any).bookingPilgrim?.update === 'function') {
+            await (this.prisma as any).bookingPilgrim.update({
+              where: { id: targetBp.id },
+              data: {
+                metadata: {
+                  ...((targetBp.metadata as any) || {}),
+                  taskStatus: 'PENDING_VERIFICATION',
+                  lastFailureReason: dto.errorMessage || dto.errorCode,
+                },
+              },
+            }).catch(() => { });
+          }
+        }
+      } else if (isRetryableInQueue) {
+        // Retain wallet hold while booking is scheduled for automatic retry
+        const retryReason = dto.errorMessage || dto.errorCode || 'Transient portal error; scheduled for automatic retry.';
+        try {
+          await this.stateMachine.transition({
+            bookingId: br.id,
+            targetStatus: BookingStatus.RETRYABLE_FAILURE,
+            targetExecutionStatus: 'IDLE',
+            workerId: machineId,
+            leaseGeneration: job.leaseGeneration,
+            milestone: 'RETRYABLE_FAILURE',
+            failureReason: retryReason,
+          });
+        } catch {
+          await this.prisma.bookingRequest.update({
+            where: { id: br.id },
+            data: {
+              status: BookingStatus.RETRYABLE_FAILURE,
+              failureReason: retryReason,
+              assignedMachineId: null,
+              leaseExpiresAt: null,
+            },
+          });
         }
       } else {
         const failReason = dto.errorMessage || dto.errorCode || 'Booking execution failed';
@@ -5213,7 +5686,16 @@ export class WorkersService {
           }
         }
 
-        // Release exact reserved hold only on confirmed failures
+        // Release uncaptured reserved hold only on confirmed failures
+        const captureTxs: any[] = await this.prisma.walletTransaction.findMany({
+          where: {
+            bookingId: br.id,
+            type: 'CAPTURE',
+            status: 'COMPLETED',
+          },
+        }).catch(() => []);
+        const totalCaptured = captureTxs.reduce((sum: number, t: any) => sum + Number(t.amount || 0), 0);
+
         const reserveTx = await this.prisma.walletTransaction.findFirst({
           where: {
             bookingId: br.id,
@@ -5221,15 +5703,31 @@ export class WorkersService {
             status: 'COMPLETED',
           },
         });
-        const feeAmount = reserveTx ? Number(reserveTx.amount) : 100;
+        const totalReserved = reserveTx ? Number(reserveTx.amount) : 10;
+        const remainingToRelease = Math.max(0, totalReserved - totalCaptured);
 
-        await this.walletService.release({
-          userId: br.userId,
-          bookingId: br.id,
-          amount: feeAmount,
-          reason: dto.errorMessage || 'Booking execution failed',
-          idempotencyKey: `rel_${br.id}`,
-        });
+        if (remainingToRelease > 0) {
+          await this.walletService.release({
+            userId: br.userId,
+            bookingId: br.id,
+            amount: remainingToRelease,
+            reason: totalCaptured > 0 ? 'Partial completion: remaining unfulfilled devotees released' : (dto.errorMessage || 'Booking execution failed'),
+            idempotencyKey: `rel_${br.id}`,
+          });
+        }
+
+        if (totalCaptured > 0) {
+          const totalRequested = Math.max(1, br.pilgrimCount || 1);
+          const confirmedCount = Math.round(totalCaptured / 10);
+          await this.prisma.bookingRequest.update({
+            where: { id: br.id },
+            data: {
+              reconciliationStatus: 'PARTIALLY_COMPLETED',
+              lastMilestone: `PARTIALLY_COMPLETED (${confirmedCount}/${totalRequested} Confirmed)`,
+              financialStatus: FinancialStatus.CAPTURED,
+            },
+          }).catch(() => { });
+        }
       }
 
       // Notify customer of non-confirmed / failed execution
@@ -5430,12 +5928,15 @@ export class WorkersService {
       const pollSeq = event.pollSeq;
 
       // Determine associated booking requests
-      let targetBookingIds = event.bookingRequestIds || [];
+      let targetBookingIds = (event.bookingRequestIds || []).filter((id) => typeof id === 'string' && !id.includes(':'));
       if (targetBookingIds.length === 0) {
-        const matchingReqs = await this.prisma.bookingRequest.findMany({
+        const candidateReqs = await this.prisma.bookingRequest.findMany({
           where: {
             assignedMonitoringWorkerId: machineId,
-            requestedDateStr: event.date,
+            OR: [
+              { requestedDateStr: event.date },
+              ...(event.date ? [{ requestedDate: new Date(event.date) }] : []),
+            ],
             status: {
               in: [
                 BookingStatus.PENDING,
@@ -5445,8 +5946,11 @@ export class WorkersService {
               ],
             },
           },
-          select: { id: true },
+          select: { id: true, route: true },
         });
+        const matchingReqs = event.route
+          ? candidateReqs.filter((r) => !r.route || isRouteMatching(r.route, event.route))
+          : candidateReqs;
         targetBookingIds = matchingReqs.map((r) => r.id);
       }
 

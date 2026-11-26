@@ -14,6 +14,7 @@ export interface DateDemandGroup {
   date: string; // YYYY-MM-DD
   route: string;
   pendingCount: number;
+  bookingIds: string[];
   isDue: boolean;
   status: string;
   lastCheckedAt: string | null;
@@ -70,7 +71,7 @@ export class AvailabilityService {
     });
 
     const now = new Date();
-    const map = new Map<string, { date: string; route: string; pendingCount: number }>();
+    const map = new Map<string, { date: string; route: string; pendingCount: number; bookingIds: string[] }>();
     const excludedRequests: Array<{ code: string; reason: string }> = [];
 
     for (const b of openBookings) {
@@ -122,11 +123,15 @@ export class AvailabilityService {
         const existing = map.get(key);
         if (existing) {
           existing.pendingCount++;
+          if (!existing.bookingIds.includes(b.id)) {
+            existing.bookingIds.push(b.id);
+          }
         } else {
           map.set(key, {
             date: curDate,
             route: b.route,
             pendingCount: 1,
+            bookingIds: [b.id],
           });
         }
       }
@@ -145,6 +150,7 @@ export class AvailabilityService {
         date: group.date,
         route: group.route,
         pendingCount: group.pendingCount,
+        bookingIds: group.bookingIds,
         isDue,
         status: schedule.status,
         lastCheckedAt: schedule.lastCheckedAt ? schedule.lastCheckedAt.toISOString() : null,

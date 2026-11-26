@@ -16,6 +16,7 @@ import { CreateBookingDto, ResolveHumanActionDto } from './dto/booking.dto';
 import { BookingStatus, JobType, AccountStatus, Role, Prisma } from '@prisma/client';
 import { calculateHaversineDistanceKm } from '../common/utils/geo';
 import { getTodayISTDateString, isDateInPast, SabarimalaRoute, normalizeSabarimalaRoute, getOfficialSabarimalaRouteLabel, isRouteMatching } from '../common/booking-status.constants';
+import { validateNominee, OFFICIAL_SABARIMALA_RELATIONSHIPS } from '../common/nominee-validator';
 
 import { EventsGateway } from '../events/events.gateway';
 import { SmartAllocatorService } from '../workers/smart-allocator.service';
@@ -64,74 +65,66 @@ export class BookingsService {
     }
     const validatedOfficialRoute = getOfficialSabarimalaRouteLabel(canonicalRouteEnum);
 
-    // 1. Optional Pilgrim Details Validation (if explicitly supplied)
-    if (dto.pilgrims && Array.isArray(dto.pilgrims) && dto.pilgrims.length > 0) {
+    // 1. Business Logic: One BookingRequest = 1 Account + 1 Date + 1 Route + 1 to 5 Selected Saved Pilgrims + Nominee details
+    let requestedPilgrimCount = 1;
+    if (dto.pilgrimCount !== undefined && dto.pilgrimCount !== null) {
+      const parsedCount = Number(dto.pilgrimCount);
+      if (!Number.isInteger(parsedCount) || parsedCount < 1 || parsedCount > 5) {
+        throw new BadRequestException(
+          'Sabarimala portal allows 1 to 5 pilgrims per booking (pilgrimCount must be an integer between 1 and 5).',
+        );
+      }
+      requestedPilgrimCount = parsedCount;
+    } else if (dto.pilgrims && Array.isArray(dto.pilgrims) && dto.pilgrims.length > 0) {
       if (dto.pilgrims.length > 5) {
-        throw new BadRequestException('A maximum of 5 pilgrims is permitted per booking.');
+        throw new BadRequestException(
+          'Sabarimala portal allows a maximum of 5 pilgrims per booking.',
+        );
       }
+      requestedPilgrimCount = dto.pilgrims.length;
+    } else if (dto.nominees && Array.isArray(dto.nominees) && dto.nominees.length > 1) {
+      if (dto.nominees.length > 5) {
+        throw new BadRequestException(
+          'Sabarimala portal allows a maximum of 5 nominee entries per booking.',
+        );
+      }
+      requestedPilgrimCount = dto.nominees.length;
+    }
 
-      for (let i = 0; i < dto.pilgrims.length; i++) {
-        const p = dto.pilgrims[i];
-        if (!p.fullName || p.fullName.trim().length < 2) {
-          throw new BadRequestException(`Pilgrim #${i + 1}: Full name is required.`);
-        }
-        if (!p.age || typeof p.age !== 'number' || p.age < 1 || p.age > 120) {
-          throw new BadRequestException(`Pilgrim #${i + 1}: Valid age between 1 and 120 is required.`);
-        }
-        if (!p.gender || !['MALE', 'FEMALE', 'TRANSGENDER'].includes(p.gender.toUpperCase())) {
-          throw new BadRequestException(`Pilgrim #${i + 1}: Valid gender (MALE, FEMALE, TRANSGENDER) is required.`);
-        }
-        if (!p.idType || !['AADHAAR', 'VOTER_ID', 'PASSPORT'].includes(p.idType.toUpperCase())) {
-          throw new BadRequestException(`Pilgrim #${i + 1}: Valid ID type (AADHAAR, VOTER_ID, PASSPORT) is required.`);
-        }
-        if (!p.idNumber || p.idNumber.trim().length < 4) {
-          throw new BadRequestException(`Pilgrim #${i + 1}: Valid ID number is required.`);
+    if (dto.pilgrims && Array.isArray(dto.pilgrims) && dto.pilgrims.length > 5) {
+      throw new BadRequestException(
+        'Sabarimala portal allows a maximum of 5 pilgrims per booking.',
+      );
+    }
+    if (dto.nominees && Array.isArray(dto.nominees) && dto.nominees.length > 5) {
+      throw new BadRequestException(
+        'Sabarimala portal allows a maximum of 5 nominee entries per booking.',
+      );
+    }
+    if (dto.pilgrims && Array.isArray(dto.pilgrims) && dto.pilgrims.length > 0) {
+      for (const p of dto.pilgrims) {
+        if (!p.fullName || !p.fullName.trim() || !p.age || Number(p.age) < 1 || Number(p.age) > 120 || !p.gender || !p.idType || !p.idNumber || !p.idNumber.trim()) {
+          throw new BadRequestException('Each explicitly provided pilgrim record must contain a valid fullName, age (1-120), gender, idType, and idNumber.');
         }
       }
     }
 
-    // 2. Nominee Details (Optional in backend; validate if provided)
-    const resolvedNominee = (dto.nominees && dto.nominees[0]) || dto.nominee || (dto.nomineeName ? {
-      nomineeName: dto.nomineeName,
-      nomineeAge: dto.nomineeAge,
-      nomineeRelationship: dto.nomineeRelationship,
-      nomineePhone: dto.nomineePhone,
-    } : null) || (dto.pilgrims && dto.pilgrims[0]?.nominee ? dto.pilgrims[0].nominee : null) || (dto.pilgrims && dto.pilgrims[0]?.nomineeName ? {
-      nomineeName: dto.pilgrims[0].nomineeName,
-      nomineeAge: dto.pilgrims[0].nomineeAge,
-      nomineeRelationship: dto.pilgrims[0].nomineeRelationship,
-      nomineePhone: dto.pilgrims[0].nomineePhone,
-    } : null);
-
-    // If nominee was provided with a non-empty name, validate required format
-    if (resolvedNominee && resolvedNominee.nomineeName && resolvedNominee.nomineeName.trim().length > 0) {
-      if (resolvedNominee.nomineeName.trim().length < 2) {
-        throw new BadRequestException('Nominee name must be at least 2 characters long.');
-      }
-      if (!resolvedNominee.nomineeAge || typeof resolvedNominee.nomineeAge !== 'number' || resolvedNominee.nomineeAge < 18 || resolvedNominee.nomineeAge > 120) {
-        throw new BadRequestException('Nominee must be an adult with a valid age (minimum 18 years).');
-      }
-      if (!resolvedNominee.nomineeRelationship || resolvedNominee.nomineeRelationship.trim().length < 2) {
-        throw new BadRequestException('Nominee relationship is required.');
-      }
+    // 2. Mandatory Nominee Details & Official Relationship Validation
+    const nomineeCheck = validateNominee(dto, {
+      allowOptional: false,
+      strictOfficialRelationship: true,
+    });
+    if (!nomineeCheck.valid || !nomineeCheck.resolvedNominee) {
+      throw new BadRequestException(
+        nomineeCheck.errors[0] ||
+          `Valid nominee details (full name, adult age 18-120, and relationship from: ${OFFICIAL_SABARIMALA_RELATIONSHIPS.join(', ')}) are required.`,
+      );
     }
-
-    if (dto.nominees && Array.isArray(dto.nominees)) {
-      for (let i = 0; i < dto.nominees.length; i++) {
-        const n = dto.nominees[i];
-        if (n && n.nomineeName && n.nomineeName.trim().length > 0) {
-          if (n.nomineeName.trim().length < 2) {
-            throw new BadRequestException(`Nominee #${i + 1}: Name must be at least 2 characters.`);
-          }
-          if (!n.nomineeAge || typeof n.nomineeAge !== 'number' || n.nomineeAge < 18 || n.nomineeAge > 120) {
-            throw new BadRequestException(`Nominee #${i + 1}: Must be an adult (minimum 18 years).`);
-          }
-          if (!n.nomineeRelationship || n.nomineeRelationship.trim().length < 2) {
-            throw new BadRequestException(`Nominee #${i + 1}: Relationship is required.`);
-          }
-        }
-      }
-    }
+    const resolvedNominee = nomineeCheck.resolvedNominee;
+    const baseNominees = nomineeCheck.resolvedNominees && nomineeCheck.resolvedNominees.length > 0
+      ? nomineeCheck.resolvedNominees
+      : [resolvedNominee];
+    const resolvedNominees = Array.from({ length: requestedPilgrimCount }, (_, idx) => baseNominees[idx] || resolvedNominee);
 
     // Verify user role & registered centre location: Strictly CENTRE, DISTRIBUTOR, or SUPER_ADMIN
     const callingUser = await this.prisma.user.findUnique({
@@ -314,10 +307,6 @@ export class BookingsService {
       }
     }
 
-    // Generate readable booking code e.g. TA-10492
-    const count = await this.prisma.bookingRequest.count();
-    const bookingCode = `TA-${10000 + count + 1}`;
-
     const rawDateStr = dto.requestedDate.split('T')[0];
     const [year, month, day] = rawDateStr.split('-').map(Number);
     const canonicalDate = new Date(Date.UTC(year, month - 1, day, 0, 0, 0));
@@ -327,11 +316,7 @@ export class BookingsService {
     });
     const baseServiceFee = Number(config?.serviceFee ?? 20);
 
-    const rawPilgrimCount = Number(dto.pilgrimCount) || (dto.pilgrims && dto.pilgrims.length > 0 ? dto.pilgrims.length : 1);
-    if (rawPilgrimCount > 5) {
-      throw new BadRequestException('Sabarimala portal allows a maximum of 5 pilgrims per booking.');
-    }
-    const pilgrimCount = Math.max(1, rawPilgrimCount);
+    const pilgrimCount = requestedPilgrimCount;
 
     // Calculate immutable 3-level ticket price breakdown snapshot (Base Price + Franchise/Partner Markup + Distributor Markup)
     const priceCalculation = await this.pricingService.calculateBookingPrice({
@@ -342,6 +327,9 @@ export class BookingsService {
     const feeAmount = Number(priceCalculation?.totalTicketAmount) || (unitPrice * pilgrimCount);
 
     const result = await this.prisma.$transaction(async (tx) => {
+      // 0. Generate guaranteed collision-free booking code inside transaction
+      const bookingCode = await this.generateUniqueBookingCode(tx);
+
       // 1. Verify and reserve funds from wallet
       let wallet = await tx.wallet.findUnique({ where: { userId } });
       const userRecord = await tx.user.findUnique({ where: { id: userId }, select: { role: true } });
@@ -459,13 +447,16 @@ export class BookingsService {
           nomineeAge: resolvedNominee?.nomineeAge ? Number(resolvedNominee.nomineeAge) : null,
           nomineeRelationship: resolvedNominee?.nomineeRelationship ? resolvedNominee.nomineeRelationship.trim() : null,
           nomineePhone: resolvedNominee?.nomineePhone ? resolvedNominee.nomineePhone.trim() : null,
+          nomineeValidationStatus: 'VALIDATED',
+          lastMilestone: 'NOMINEE_VALIDATED',
           preferences: {
             ...(dto.preferences || {}),
-            nominees: dto.nominees || (resolvedNominee ? [resolvedNominee] : []),
+            nominees: resolvedNominees,
             termsAccepted: true,
             termsAcceptedAt: new Date().toISOString(),
           },
           status: initialStatus,
+          financialStatus: 'RESERVED',
           // Three-Level Ticket Pricing Immutable Snapshot
           baseTicketPrice: new Prisma.Decimal(priceCalculation.baseTicketPrice),
           partnerMarkup: new Prisma.Decimal(priceCalculation.partnerMarkup),
@@ -475,20 +466,28 @@ export class BookingsService {
           totalTicketAmount: new Prisma.Decimal(priceCalculation.totalTicketAmount),
           pricingConfigVersion: priceCalculation.pricingConfigVersion,
           pricingSnapshot: priceCalculation.pricingSnapshot,
-          pilgrims: (dto.pilgrims && dto.pilgrims.length > 0) ? {
-            create: dto.pilgrims.map((p) => ({
-              fullName: p.fullName.trim(),
-              age: p.age,
-              gender: p.gender.toUpperCase(),
-              idType: p.idType.toUpperCase(),
-              idNumber: p.idNumber.trim(),
-              photoUrl: p.photoUrl || null,
-              nomineeName: (p.nomineeName || resolvedNominee?.nomineeName || null)?.trim() || null,
-              nomineeAge: p.nomineeAge || resolvedNominee?.nomineeAge || null,
-              nomineeRelationship: (p.nomineeRelationship || resolvedNominee?.nomineeRelationship || null)?.trim() || null,
-              nomineePhone: p.nomineePhone?.trim() || resolvedNominee?.nomineePhone?.trim() || null,
-            })),
-          } : undefined,
+          pilgrims: {
+            create: Array.from({ length: pilgrimCount }).map((_, idx) => {
+              const explicitPilgrim = dto.pilgrims && dto.pilgrims[idx];
+              const nom = (resolvedNominees && resolvedNominees[idx]) || resolvedNominee;
+              return {
+                fullName: explicitPilgrim?.fullName?.trim() || `Devotee #${idx + 1}`,
+                age: explicitPilgrim?.age || 0,
+                gender: explicitPilgrim?.gender?.toUpperCase() || 'MALE',
+                idType: explicitPilgrim?.idType?.toUpperCase() || 'AADHAAR',
+                idNumber: explicitPilgrim?.idNumber?.trim() || 'PENDING_PORTAL_SELECTION',
+                photoUrl: explicitPilgrim?.photoUrl || null,
+                nomineeName: (explicitPilgrim?.nomineeName || nom?.nomineeName || null)?.trim() || null,
+                nomineeAge: explicitPilgrim?.nomineeAge || nom?.nomineeAge || null,
+                nomineeRelationship: (explicitPilgrim?.nomineeRelationship || nom?.nomineeRelationship || null)?.trim() || null,
+                nomineePhone: explicitPilgrim?.nomineePhone?.trim() || nom?.nomineePhone?.trim() || null,
+                metadata: {
+                  taskIndex: idx + 1,
+                  taskStatus: 'PENDING',
+                },
+              };
+            }),
+          },
         } as any,
         include: {
           pilgrims: true,
@@ -562,12 +561,16 @@ export class BookingsService {
     });
 
     if (this.smartAllocator) {
-      this.smartAllocator.runAllocationSweep().catch((err) => {
-        this.logger.warn(`Proactive allocation error: ${err.message}`);
-      });
-      this.smartAllocator.runMonitoringAllocationSweep().catch((err) => {
-        this.logger.warn(`Proactive monitoring allocation error: ${err.message}`);
-      });
+      if (typeof this.smartAllocator.runAllocationSweep === 'function') {
+        this.smartAllocator.runAllocationSweep().catch((err) => {
+          this.logger.warn(`Proactive allocation error: ${err.message}`);
+        });
+      }
+      if (typeof this.smartAllocator.runMonitoringAllocationSweep === 'function') {
+        this.smartAllocator.runMonitoringAllocationSweep().catch((err) => {
+          this.logger.warn(`Proactive monitoring allocation error: ${err.message}`);
+        });
+      }
     }
 
     // Dispatch real-time Telegram alert for new booking arrival
@@ -854,6 +857,7 @@ export class BookingsService {
         include: {
           pilgrims: true,
           account: { select: { id: true, label: true, username: true, status: true } as any },
+          confirmationHistory: true,
           assignedMachine: { select: { id: true, machineCode: true, machineName: true, status: true, lastHeartbeat: true, stopReason: true, stoppedAt: true } },
           monitoringWorker: { select: { id: true, machineCode: true, machineName: true, status: true, lastHeartbeat: true, stopReason: true, stoppedAt: true } },
           user: {
@@ -885,6 +889,7 @@ export class BookingsService {
       include: {
         pilgrims: true,
         account: { select: { id: true, label: true, username: true, status: true } as any },
+        confirmationHistory: true,
         assignedMachine: true,
         monitoringWorker: true,
         attempts: { orderBy: { startedAt: 'desc' } },
@@ -1814,6 +1819,75 @@ export class BookingsService {
       deletedCount,
       results,
     };
+  }
+
+  /**
+   * Generate guaranteed collision-proof, sequentially ascending booking codes (e.g. TA-10003).
+   * Dynamically inspects the maximum existing numeric suffix and checks existence within the transaction
+   * to prevent collisions even when prior rows have been deleted or when IDs have gaps.
+   */
+  private async generateUniqueBookingCode(tx: any): Promise<string> {
+    const totalCount = typeof tx?.bookingRequest?.count === 'function'
+      ? await tx.bookingRequest.count()
+      : (typeof this.prisma?.bookingRequest?.count === 'function' ? await this.prisma.bookingRequest.count() : 0);
+
+    let recentBookings: Array<{ bookingCode?: string | null }> = [];
+    if (typeof tx?.bookingRequest?.findMany === 'function') {
+      recentBookings = await tx.bookingRequest.findMany({
+        where: { bookingCode: { startsWith: 'TA-' } },
+        select: { bookingCode: true },
+        orderBy: { createdAt: 'desc' },
+        take: 200,
+      });
+    } else if (typeof this.prisma?.bookingRequest?.findMany === 'function') {
+      recentBookings = await this.prisma.bookingRequest.findMany({
+        where: { bookingCode: { startsWith: 'TA-' } },
+        select: { bookingCode: true },
+        orderBy: { createdAt: 'desc' },
+        take: 200,
+      });
+    }
+
+    let maxNum = Math.max(10000, 10000 + (Number(totalCount) || 0));
+    if (Array.isArray(recentBookings)) {
+      for (const b of recentBookings) {
+        const match = String(b?.bookingCode || '').match(/^TA-(\d+)$/);
+        if (match) {
+          const num = parseInt(match[1], 10);
+          if (!isNaN(num) && num > maxNum) {
+            maxNum = num;
+          }
+        }
+      }
+    }
+
+    let candidateNum = maxNum + 1;
+    let candidateCode = `TA-${candidateNum}`;
+
+    const checkExists = async (code: string): Promise<boolean> => {
+      if (typeof tx?.bookingRequest?.findUnique === 'function') {
+        const found = await tx.bookingRequest.findUnique({
+          where: { bookingCode: code },
+          select: { id: true },
+        });
+        return !!found;
+      }
+      if (typeof tx?.bookingRequest?.findFirst === 'function') {
+        const found = await tx.bookingRequest.findFirst({
+          where: { bookingCode: code },
+          select: { id: true },
+        });
+        return !!found;
+      }
+      return false;
+    };
+
+    while (await checkExists(candidateCode)) {
+      candidateNum++;
+      candidateCode = `TA-${candidateNum}`;
+    }
+
+    return candidateCode;
   }
 
   /**

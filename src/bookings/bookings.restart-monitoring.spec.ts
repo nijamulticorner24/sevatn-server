@@ -170,6 +170,12 @@ describe('FIX: Restart Booking Must Re-enter Availability Monitoring Suite', () 
       termsAccepted: true,
       accountId: 'acc-1',
       pilgrims: [{ fullName: 'Swami Bhakthan', age: 30, gender: 'MALE', idType: 'AADHAAR', idNumber: '123456789012' }],
+      nominee: {
+        nomineeName: 'Lakshmi S',
+        nomineeAge: 34,
+        nomineeRelationship: 'Spouse',
+        nomineePhone: '9876543210',
+      },
     };
 
     const res = await bookingsService.createBooking('user-centre-1', dto);

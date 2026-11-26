@@ -733,7 +733,9 @@ export class AdminService {
         include: {
           pilgrims: true,
           account: { select: { id: true, label: true, username: true, status: true } as any },
-          assignedMachine: { select: { machineCode: true, machineName: true, status: true } },
+          confirmationHistory: true,
+          assignedMachine: { select: { id: true, machineCode: true, machineName: true, status: true, lastHeartbeat: true, stopReason: true, stoppedAt: true } },
+          monitoringWorker: { select: { id: true, machineCode: true, machineName: true, status: true, lastHeartbeat: true, stopReason: true, stoppedAt: true } },
           user: {
             select: {
               name: true,

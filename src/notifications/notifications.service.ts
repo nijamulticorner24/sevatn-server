@@ -17,7 +17,7 @@ export class NotificationsService {
   private readonly dedupAlertCache = new Map<string, number>();
   private readonly DEDUP_COOLDOWN_MS = 60 * 1000; // 60s cooldown for identical alerts
 
-  constructor(private prisma: PrismaService) {}
+  constructor(private prisma: PrismaService) { }
 
   async send(dto: SendNotificationDto) {
     this.logger.log(`[Notification ${dto.channel}] to ${dto.recipient}: ${dto.title} - ${dto.body}`);
@@ -399,7 +399,7 @@ export class NotificationsService {
       const normalizedStatus = String(payload.status).toUpperCase();
 
       // Deduplicate alerts to avoid spamming the admin on repeated polling failures
-      const dedupKey = `booking:${payload.bookingId}:${normalizedStatus}:${(bookingData.failureReason || bookingData.note || '').slice(0, 40)}`;
+      const dedupKey = (payload as any).idempotencyKey || `booking:${payload.bookingId}:${normalizedStatus}:${(bookingData.failureReason || bookingData.note || '').slice(0, 40)}`;
       const nowTs = Date.now();
       const lastSent = this.dedupAlertCache.get(dedupKey);
       if (lastSent && (nowTs - lastSent < this.DEDUP_COOLDOWN_MS)) {
@@ -485,7 +485,7 @@ export class NotificationsService {
         `🔍 <b>Inspect Pass:</b> <a href="${directBookingUrl}">View Full Booking Record</a>`,
       ].filter(Boolean);
 
-      const text = lines.join('\n');
+      const text = (payload as any).customMessage || lines.join('\n');
 
       let sentPhoto = false;
       const screenshot =
@@ -573,7 +573,7 @@ export class NotificationsService {
             parse_mode: 'HTML',
             disable_web_page_preview: false,
           }),
-        }).catch(() => {});
+        }).catch(() => { });
       }
 
       return { success: true };
@@ -679,7 +679,7 @@ export class NotificationsService {
         `👉 <b>Fleet Overview:</b> <a href="http://localhost:3001/admin/fleet">Open Admin Fleet Dashboard</a>`,
       ].filter(Boolean);
 
-      const text = lines.join('\n');
+      const text = (payload as any).customMessage || lines.join('\n');
       const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
