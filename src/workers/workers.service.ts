@@ -4442,13 +4442,12 @@ export class WorkersService {
       let officialBookingRef = dto.officialBookingReference?.trim();
       if (!officialBookingRef && dto.officialReference) {
         const candidate = dto.officialReference.trim();
-        // Never use Cart ID or numeric portal transaction ID as official booking pass reference
-        if (candidate !== cartId && candidate !== portalTxnRef && !/^\d{8,12}$/.test(candidate)) {
+        if (!candidate.startsWith('SAB-2026-')) {
           officialBookingRef = candidate;
         }
       }
 
-      const hasValidPass = !!(officialBookingRef && !officialBookingRef.startsWith('SAB-2026-') && officialBookingRef.length >= 5 && (!cartId || officialBookingRef !== cartId));
+      const hasValidPass = !!(officialBookingRef && !officialBookingRef.startsWith('SAB-2026-') && officialBookingRef.length >= 5);
 
       // Fencing Guard 1: Worker machine ownership & lease generation checks
       const isWorkerMismatch = !!(job.workerId && job.workerId !== machineId);
@@ -4482,8 +4481,8 @@ export class WorkersService {
       }
 
       if (job.bookingRequest) {
-        // Enforce authoritative external government pass reference (e.g. IVQ...). Reject synthetic and Cart ID fallbacks
-        if (!officialBookingRef || officialBookingRef.startsWith('SAB-2026-') || officialBookingRef === 'SAB-2026-VERIFIED' || officialBookingRef.length < 5 || (cartId && officialBookingRef === cartId)) {
+        // Enforce authoritative external government pass reference (e.g. IVQ... or confirmed Transaction ID). Reject synthetic fallbacks
+        if (!officialBookingRef || officialBookingRef.startsWith('SAB-2026-') || officialBookingRef === 'SAB-2026-VERIFIED' || officialBookingRef.length < 5) {
           this.logger.warn(`[RECONCILIATION] Job #${jobId} missing authoritative official booking reference. Cart ID: ${cartId || 'N/A'}. Moving to RECONCILIATION_REQUIRED.`);
           if (this.stateMachine) {
             try {
@@ -5278,6 +5277,8 @@ export class WorkersService {
       dto.status === BookingStatus.DATE_UNAVAILABLE ||
       dto.status === BookingStatus.TEMPORARY_SLOT_LOST ||
       (dto.status as string) === 'TEMPORARY_SLOT_LOST' ||
+      dto.errorMessage?.toLowerCase().includes('not selectable in calendar') ||
+      dto.errorMessage?.includes('DATE_NOT_SELECTABLE') ||
       (dto.status === BookingStatus.RETRYABLE_FAILURE && (
         dto.errorCode === 'DATE_UNAVAILABLE' ||
         dto.errorCode === 'DATE_NOT_SELECTABLE' ||
@@ -5293,7 +5294,13 @@ export class WorkersService {
         ? 'PORTAL_AVAILABILITY_MISMATCH: Date marked DISABLED/FULL in official calendar. Discovery engine watching.'
         : 'Date is FULL/DISABLED. Discovery engine watching.');
       const nowWatch = new Date();
-      const nextWatchCheck = (dto.errorCode === 'DATE_NOT_SELECTABLE' || dto.status === BookingStatus.TEMPORARY_SLOT_LOST || (dto.status as string) === 'TEMPORARY_SLOT_LOST')
+      const nextWatchCheck = (
+        dto.errorCode === 'DATE_NOT_SELECTABLE' ||
+        dto.status === BookingStatus.TEMPORARY_SLOT_LOST ||
+        (dto.status as string) === 'TEMPORARY_SLOT_LOST' ||
+        dto.errorMessage?.toLowerCase().includes('not selectable in calendar') ||
+        dto.errorMessage?.includes('DATE_NOT_SELECTABLE')
+      )
         ? nowWatch
         : new Date(nowWatch.getTime() + 5 * 60 * 1000);
       this.logger.log(
@@ -5467,8 +5474,10 @@ export class WorkersService {
 
     // Backoff logic: Ensure any failed booking gets backoff so the worker doesn't loop on it
     if (job.bookingRequestId) {
-      // PR-5: server-side retry schedule for RETRYABLE_FAILURE must match watcher cadence
-      const isRetryable = validFailStatus === BookingStatus.RETRYABLE_FAILURE;
+      // PR-5: server-side retry schedule for RETRYABLE_FAILURE and TEMPORARY_SLOT_LOST must match watcher cadence
+      const isRetryable =
+        validFailStatus === BookingStatus.RETRYABLE_FAILURE ||
+        validFailStatus === BookingStatus.TEMPORARY_SLOT_LOST;
       const retryBackoffMs = isRetryable
         ? Number(process.env.RETRYABLE_FAILURE_BACKOFF_MS ?? 5000)
         : 5 * 60 * 1000;
@@ -5547,10 +5556,80 @@ export class WorkersService {
         dto.status === BookingStatus.UNKNOWN;
 
       const isRetryableInQueue =
-        validFailStatus === BookingStatus.RETRYABLE_FAILURE &&
+        (validFailStatus === BookingStatus.RETRYABLE_FAILURE ||
+          validFailStatus === BookingStatus.TEMPORARY_SLOT_LOST) &&
         (job.attempt || 1) < (job.maxAttempts || 3);
 
       if (isQuarantinedOrPendingVerification) {
+        const totalRequested = Math.max(1, br.pilgrimCount || 1);
+        const isMultiPilgrim = totalRequested > 1;
+        const hasDevoteeContext = Boolean(dto.taskIndex || (dto as any).pilgrimTaskId);
+
+        // If this failure belongs to an individual devotee in a multi-devotee booking,
+        // isolate the quarantine to the individual devotee task and keep the parent booking WATCHING
+        // so remaining pending devotees can continue to be booked!
+        if (isMultiPilgrim && hasDevoteeContext) {
+          const taskIdx = dto.taskIndex || 1;
+          this.logger.warn(`[DEVOTEE-ISOLATION] Devotee #${taskIdx} encountered ${dto.status} (${dto.errorMessage || 'verification pending'}). Isolating to devotee task, keeping Booking #${br.bookingCode} active in WATCHING queue.`);
+
+          let targetBp: any = null;
+          const pilgrimTaskId = (dto as any).pilgrimTaskId;
+          if (pilgrimTaskId && typeof (this.prisma as any).bookingPilgrim?.findUnique === 'function') {
+            targetBp = await Promise.resolve((this.prisma as any).bookingPilgrim.findUnique({ where: { id: pilgrimTaskId } })).catch(() => null);
+          }
+          if (!targetBp && br.id && typeof (this.prisma as any).bookingPilgrim?.findMany === 'function') {
+            const allBps = await Promise.resolve((this.prisma as any).bookingPilgrim.findMany({
+              where: { bookingRequestId: br.id },
+              orderBy: { createdAt: 'asc' },
+            })).catch(() => []);
+            targetBp = allBps.find((p: any) => {
+              const meta = typeof p.metadata === 'string' ? JSON.parse(p.metadata) : (p.metadata || {});
+              return Number(meta.taskIndex) === Number(taskIdx);
+            }) || allBps[taskIdx - 1];
+          }
+
+          if (targetBp && typeof (this.prisma as any).bookingPilgrim?.update === 'function') {
+            const prevMeta = typeof targetBp.metadata === 'string' ? JSON.parse(targetBp.metadata) : (targetBp.metadata || {});
+            await Promise.resolve((this.prisma as any).bookingPilgrim.update({
+              where: { id: targetBp.id },
+              data: {
+                metadata: {
+                  ...prevMeta,
+                  taskIndex: taskIdx,
+                  taskStatus: 'RECONCILIATION_REQUIRED',
+                  reconciliationRequired: true,
+                  failureReason: dto.errorMessage || 'Outcome requires reconciliation',
+                },
+              },
+            })).catch(() => {});
+          }
+
+          // Keep parent booking active in WATCHING so other devotees continue
+          await this.prisma.bookingRequest.update({
+            where: { id: br.id },
+            data: {
+              status: BookingStatus.WATCHING,
+              isWatching: true,
+              reconciliationStatus: 'DEVOTEE_RECONCILIATION_REQUIRED',
+              requiresHumanNote: `Devotee #${taskIdx} moved to reconciliation. Remaining devotees active in monitoring.`,
+            },
+          }).catch(() => {});
+
+          // Reset the job to QUEUED so next devotee is processed
+          await this.prisma.bookingJob.update({
+            where: { id: jobId },
+            data: {
+              status: BookingStatus.QUEUED,
+              workerId: null,
+              leaseExpiresAt: null,
+              completedAt: null,
+              attempt: 0,
+            },
+          }).catch(() => {});
+
+          return { success: true, isolatedDevotee: true, taskIndex: taskIdx };
+        }
+
         // Quarantine ambiguous or human-verification outcome WITHOUT releasing wallet hold
         const targetQuarantineStatus =
           dto.status === BookingStatus.RECONCILIATION_REQUIRED || dto.status === ('PENDING_VERIFICATION' as any)
@@ -5627,21 +5706,25 @@ export class WorkersService {
       } else if (isRetryableInQueue) {
         // Retain wallet hold while booking is scheduled for automatic retry
         const retryReason = dto.errorMessage || dto.errorCode || 'Transient portal error; scheduled for automatic retry.';
+        const targetStatus =
+          validFailStatus === BookingStatus.TEMPORARY_SLOT_LOST
+            ? BookingStatus.TEMPORARY_SLOT_LOST
+            : BookingStatus.RETRYABLE_FAILURE;
         try {
           await this.stateMachine.transition({
             bookingId: br.id,
-            targetStatus: BookingStatus.RETRYABLE_FAILURE,
+            targetStatus,
             targetExecutionStatus: 'IDLE',
             workerId: machineId,
             leaseGeneration: job.leaseGeneration,
-            milestone: 'RETRYABLE_FAILURE',
+            milestone: String(validFailStatus),
             failureReason: retryReason,
           });
         } catch {
           await this.prisma.bookingRequest.update({
             where: { id: br.id },
             data: {
-              status: BookingStatus.RETRYABLE_FAILURE,
+              status: targetStatus,
               failureReason: retryReason,
               assignedMachineId: null,
               leaseExpiresAt: null,
