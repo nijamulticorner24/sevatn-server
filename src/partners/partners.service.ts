@@ -2249,4 +2249,119 @@ export class PartnersService {
       },
     );
   }
+
+  /**
+   * Super Admin views paginated wallet transaction history for a single partner
+   */
+  async getPartnerWalletTransactions(
+    partnerId: string,
+    page: number = 1,
+    limit: number = 20,
+    type?: string,
+  ) {
+    const partner = await this.prisma.partner.findFirst({
+      where: {
+        OR: [{ id: partnerId }, { partnerCode: partnerId }],
+      },
+      include: {
+        user: {
+          include: {
+            wallet: true,
+          },
+        },
+      },
+    });
+
+    if (!partner) {
+      throw new NotFoundException(`Partner '${partnerId}' not found`);
+    }
+
+    let userId = partner.userId;
+    if (!userId && partner.user?.id) {
+      userId = partner.user.id;
+    }
+
+    if (!userId) {
+      const u = await this.prisma.user.findFirst({
+        where: {
+          OR: [{ email: partner.email }, { mobile: partner.mobile }],
+        },
+        include: { wallet: true },
+      });
+      if (u) userId = u.id;
+    }
+
+    const wallet = partner.user?.wallet;
+    const availableBalance = wallet ? Number(wallet.availableBalance) : Number(partner.balance || 0);
+    const reservedBalance = wallet ? Number(wallet.reservedBalance) : 0;
+
+    if (!userId) {
+      return {
+        partner: {
+          id: partner.id,
+          partnerCode: partner.partnerCode,
+          name: partner.name,
+          district: partner.district,
+          taluk: partner.taluk,
+          availableBalance,
+          reservedBalance,
+        },
+        transactions: [],
+        pagination: { page, limit, total: 0, totalPages: 0 },
+      };
+    }
+
+    const where: any = { userId };
+    if (type && type !== 'ALL') {
+      where.type = type;
+    }
+
+    const [transactions, total] = await Promise.all([
+      this.prisma.walletTransaction.findMany({
+        where,
+        skip: (page - 1) * limit,
+        take: limit,
+        orderBy: { createdAt: 'desc' },
+        include: {
+          booking: {
+            select: {
+              id: true,
+              bookingCode: true,
+              requestedDateStr: true,
+              status: true,
+            },
+          },
+        },
+      }),
+      this.prisma.walletTransaction.count({ where }),
+    ]);
+
+    return {
+      partner: {
+        id: partner.id,
+        partnerCode: partner.partnerCode,
+        name: partner.name,
+        district: partner.district,
+        taluk: partner.taluk,
+        availableBalance,
+        reservedBalance,
+      },
+      transactions: transactions.map((t) => ({
+        id: t.id,
+        type: t.type,
+        amount: Number(t.amount),
+        status: t.status,
+        reference: t.reference,
+        metadata: t.metadata,
+        createdAt: t.createdAt,
+        booking: t.booking,
+      })),
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    };
+  }
 }

@@ -829,6 +829,116 @@ export class CentresService {
     });
   }
 
+  async getCentreWalletTransactions(
+    centreId: string,
+    page = 1,
+    limit = 50,
+    type?: string,
+  ) {
+    const centre = await this.prisma.centre.findFirst({
+      where: {
+        OR: [{ id: centreId }, { userId: centreId }, { centreCode: centreId }],
+      },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            mobile: true,
+            wallet: true,
+          },
+        },
+      },
+    });
+
+    if (!centre) {
+      throw new NotFoundException(`Centre with ID '${centreId}' not found`);
+    }
+
+    const wallet = centre.user?.wallet || (await this.prisma.wallet.findUnique({
+      where: { userId: centre.userId },
+    }));
+
+    if (!wallet) {
+      return {
+        centre: {
+          id: centre.id,
+          centreName: centre.centreName,
+          centreCode: centre.centreCode,
+          district: centre.district,
+          taluk: centre.taluk,
+          contactName: centre.user?.name,
+          mobile: centre.user?.mobile,
+          email: centre.user?.email,
+        },
+        wallet: null,
+        transactions: [],
+        total: 0,
+        page,
+        limit,
+        totalPages: 0,
+      };
+    }
+
+    const pageNum = Math.max(1, Number(page) || 1);
+    const take = Math.min(100, Math.max(1, Number(limit) || 50));
+    const skip = (pageNum - 1) * take;
+
+    const where: Prisma.WalletTransactionWhereInput = {
+      walletId: wallet.id,
+    };
+
+    if (type && type !== 'ALL') {
+      where.type = type as TransactionType;
+    }
+
+    const [transactions, total] = await Promise.all([
+      this.prisma.walletTransaction.findMany({
+        where,
+        skip,
+        take,
+        orderBy: { createdAt: 'desc' },
+        include: {
+          booking: {
+            select: {
+              id: true,
+              bookingCode: true,
+              status: true,
+              route: true,
+              pilgrimCount: true,
+              requestedDate: true,
+            },
+          },
+        },
+      }),
+      this.prisma.walletTransaction.count({ where }),
+    ]);
+
+    return {
+      centre: {
+        id: centre.id,
+        centreName: centre.centreName,
+        centreCode: centre.centreCode,
+        district: centre.district,
+        taluk: centre.taluk,
+        contactName: centre.user?.name,
+        mobile: centre.user?.mobile,
+        email: centre.user?.email,
+      },
+      wallet: {
+        id: wallet.id,
+        availableBalance: Number(wallet.availableBalance),
+        reservedBalance: Number(wallet.reservedBalance),
+      },
+      transactions,
+      total,
+      page: pageNum,
+      limit: take,
+      totalPages: Math.ceil(total / take),
+    };
+  }
+
   async deleteCentre(adminUser: any, id: string) {
     const centre = await this.prisma.centre.findFirst({
       where: {

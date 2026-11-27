@@ -396,7 +396,7 @@ describe('SmartAllocatorService — Worker Availability & Automatic Allocation',
       expect(mockWorkers[0].currentActiveJobs).toBe(0);
     });
 
-    it('14. quarantines ambiguous execution jobs in REQUIRES_HUMAN to prevent duplicate bookings', async () => {
+    it('14. safely recovers stale execution leases back to QUEUED / WATCHING without blocking in REQUIRES_HUMAN', async () => {
       mockJobs[0].status = BookingStatus.EXECUTING;
       mockJobs[0].workerId = 'worker-local-1';
       mockJobs[0].attempt = 2; // >1 attempt during active execution without confirmed portal reference
@@ -404,12 +404,12 @@ describe('SmartAllocatorService — Worker Availability & Automatic Allocation',
       mockWorkers[0].currentActiveJobs = 1;
 
       const res = await service.recoverStaleLeases();
-      expect(res.recoveredCount).toBe(0);
-      expect(res.humanReviewCount).toBe(1);
+      expect(res.recoveredCount).toBe(1);
+      expect(res.humanReviewCount).toBe(0);
 
-      // Job quarantined in REQUIRES_HUMAN
-      expect(mockJobs[0].status).toBe(BookingStatus.REQUIRES_HUMAN);
-      expect(mockBookingRequests[0].status).toBe(BookingStatus.REQUIRES_HUMAN);
+      // Job returned to QUEUED and booking returns to WATCHING
+      expect(mockJobs[0].status).toBe(BookingStatus.QUEUED);
+      expect(mockBookingRequests[0].status).toBe(BookingStatus.WATCHING);
     });
 
     it('15. allows administrators to update per-worker capacity and deployment type', async () => {

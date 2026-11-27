@@ -369,11 +369,11 @@ export class BookingStateMachineService {
       BookingStatus.CANCELLED,
     ],
     [BookingStatus.RETRYABLE_FAILURE]: [
+      BookingStatus.WATCHING,
       BookingStatus.QUEUED,
       BookingStatus.CLAIMED,
       BookingStatus.FAILED,
       BookingStatus.BOOKING_FAILED,
-      BookingStatus.REQUIRES_HUMAN,
     ],
     [BookingStatus.BOOKING_FAILED]: [
       BookingStatus.QUEUED,
@@ -453,6 +453,7 @@ export class BookingStateMachineService {
       BookingStatus.PENDING,
     ],
     [BookingStatus.TEMPORARY_SLOT_LOST]: [
+      BookingStatus.WATCHING,
       BookingStatus.PENDING,
       BookingStatus.EXECUTION_QUEUED,
       BookingStatus.QUEUED,
@@ -460,6 +461,7 @@ export class BookingStateMachineService {
       BookingStatus.CANCELLED,
     ],
     [BookingStatus.REQUIRES_HUMAN]: [
+      BookingStatus.WATCHING,
       BookingStatus.PENDING,
       BookingStatus.EXECUTION_QUEUED,
       BookingStatus.QUEUED,

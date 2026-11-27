@@ -27,7 +27,7 @@ import {
   WorkerStopDto,
 } from './dto/worker.dto';
 import { AuthorizePaymentDto } from './dto/authorize-payment.dto';
-import { WorkerStatus, BookingStatus, NotificationChannel, JobType, AccountStatus, FinancialStatus, Prisma } from '@prisma/client';
+import { WorkerStatus, BookingStatus, NotificationChannel, JobType, AccountStatus, FinancialStatus, TransactionType, TransactionStatus, Prisma } from '@prisma/client';
 import { validateNominee } from '../common/nominee-validator';
 import { randomBytes, randomUUID } from 'crypto';
 import { AccountLockService } from '../availability/account-lock.service';
@@ -2746,7 +2746,7 @@ export class WorkersService {
         }
 
         // Q1/Q2/ITEM 2: Atomic conditional update with fencingToken + leaseGeneration increment — supports same-owner & expired-lease takeover
-        const isWorkerReportingActive = activeJobIds.includes(bookingJob.id);
+        const isWorkerReportingActive = Array.isArray(activeJobIds) && activeJobIds.includes(bookingJob.id);
         const isSameOwnerActive = ownership.isSameOwner && !isLeaseExpired && !isUnassigned && isWorkerReportingActive;
         const candidateFencingToken = isSameOwnerActive && bookingJob.fencingToken
           ? bookingJob.fencingToken
@@ -4333,8 +4333,8 @@ export class WorkersService {
       activityState = 'NAVIGATING_PORTAL';
     } else if (statusStr.includes('AVAILABILITY') || statusStr.includes('CHECKING')) {
       activityState = 'DISCOVERING_AVAILABILITY';
-    } else if (statusStr.includes('CAPTCHA') || statusStr.includes('OTP') || dto.status === BookingStatus.REQUIRES_HUMAN) {
-      activityState = 'WAITING_HUMAN_INTERVENTION';
+    } else if (statusStr.includes('CAPTCHA') || statusStr.includes('OTP')) {
+      activityState = 'DISCOVERING_AVAILABILITY';
     } else if (statusStr.includes('VERIFYING') || statusStr.includes('CONFIRMATION')) {
       activityState = 'VERIFYING_RESULT';
     }
@@ -4352,8 +4352,8 @@ export class WorkersService {
       workerId: machineId,
       jobId,
       bookingId: job.bookingRequestId,
-      eventType: activityState === 'WAITING_HUMAN_INTERVENTION' ? 'HUMAN_ACTION_REQUIRED' : 'STEP_PROGRESS',
-      severity: activityState === 'WAITING_HUMAN_INTERVENTION' ? 'WARN' : 'INFO',
+      eventType: 'STEP_PROGRESS',
+      severity: 'INFO',
       activity: activityState,
       message: dto.note || `Execution step: ${dto.status}`,
     });
@@ -4641,10 +4641,9 @@ export class WorkersService {
             }
           }
 
-          // 2. Determine per-pilgrim capture amount (₹10 per confirmed devotee)
+          // 2. Determine per-pilgrim capture amount based on dynamic 3-tier ticket price
           const isMultiPilgrim = (br.pilgrimCount || 1) > 1;
           const isSinglePilgrimTaskConfirmation = Boolean((dto as any).pilgrimTaskId || (dto as any).taskIndex);
-          const perPilgrimFee = 10;
           const reserveTx = await tx.walletTransaction.findFirst({
             where: {
               bookingId: br.id,
@@ -4652,7 +4651,14 @@ export class WorkersService {
               status: 'COMPLETED',
             },
           });
-          const captureFee = (isMultiPilgrim && isSinglePilgrimTaskConfirmation) ? perPilgrimFee : (reserveTx ? Number(reserveTx.amount) : 10);
+          const perPilgrimFee = (br as any).finalTicketPrice !== null && (br as any).finalTicketPrice !== undefined
+            ? Number((br as any).finalTicketPrice)
+            : (reserveTx ? Number(reserveTx.amount) / (br.pilgrimCount || 1) : 10);
+          const captureFee = (isMultiPilgrim && isSinglePilgrimTaskConfirmation)
+            ? perPilgrimFee
+            : ((br as any).totalTicketAmount !== null && (br as any).totalTicketAmount !== undefined
+              ? Number((br as any).totalTicketAmount)
+              : (reserveTx ? Number(reserveTx.amount) : perPilgrimFee * (br.pilgrimCount || 1)));
           const capIdempotencyKey = isSinglePilgrimTaskConfirmation
             ? `cap_${br.id}_${(dto as any).pilgrimTaskId || (dto as any).taskIndex}`
             : `cap_${br.id}`;
@@ -4978,34 +4984,93 @@ export class WorkersService {
             : `Devotee ${dto.taskIndex || confirmedCount} of ${totalRequested} confirmed (#${officialBookingRef}). Returning to availability monitoring for remaining ${remainingCount} devotee(s).`,
         });
 
-        // Credit partner commission if the booking was performed by a centre under a partner franchise
+        // Credit Franchise Partner & Distributor markups for confirmed booking devotee
         if (br.userId) {
           try {
             const bookingUser = await this.prisma.user.findUnique({
               where: { id: br.userId },
-              select: { partnerId: true },
+              include: { centre: { include: { distributor: true } } },
             });
-            if (bookingUser?.partnerId) {
+            const resolvedPartnerId = bookingUser?.partnerId || bookingUser?.centre?.distributor?.partnerId;
+            const resolvedDistributorId = bookingUser?.distributorId || bookingUser?.centre?.distributorId;
+            const partnerMarkup = Number((br as any).partnerMarkup || 0);
+            const distributorMarkup = Number((br as any).distributorMarkup || 0);
+
+            // 1. Credit Partner Markup (applies to both direct centres and distributor centres)
+            if (resolvedPartnerId && partnerMarkup > 0) {
               const partner = await (this.prisma as any).partner.findUnique({
-                where: { id: bookingUser.partnerId },
-                select: { id: true, commissionRate: true, commissionPercentage: true },
+                where: { id: resolvedPartnerId },
+                select: { id: true, userId: true },
               });
-              if (partner) {
-                const commPct = partner.commissionPercentage !== null && partner.commissionPercentage !== undefined
-                  ? Number(partner.commissionPercentage)
-                  : (partner.commissionRate ? (Number(partner.commissionRate) / feeAmount) * 100 : 20);
-                const commRate = (feeAmount * commPct) / 100;
+              if (partner && partner.userId) {
+                const partnerWallet = await this.prisma.wallet.upsert({
+                  where: { userId: partner.userId },
+                  update: { availableBalance: { increment: new Prisma.Decimal(partnerMarkup) } },
+                  create: { userId: partner.userId, availableBalance: new Prisma.Decimal(partnerMarkup), reservedBalance: new Prisma.Decimal(0) },
+                });
+                await this.prisma.walletTransaction.create({
+                  data: {
+                    walletId: partnerWallet.id,
+                    userId: partner.userId,
+                    bookingId: br.id,
+                    type: TransactionType.SETTLEMENT,
+                    amount: new Prisma.Decimal(partnerMarkup),
+                    status: TransactionStatus.COMPLETED,
+                    reference: `MARKUP-${br.bookingCode || br.id.slice(0, 8)}`,
+                    idempotencyKey: `markup_pt_${br.id}_${dto.taskIndex || 0}`,
+                    metadata: {
+                      note: `Franchise Markup Earning for Booking #${br.bookingCode || br.id}`,
+                      bookingId: br.id,
+                      bookingCode: br.bookingCode,
+                      markupType: 'FRANCHISE_MARKUP',
+                      taskIndex: dto.taskIndex,
+                    },
+                  },
+                }).catch(() => null);
                 await (this.prisma as any).partner.update({
                   where: { id: partner.id },
-                  data: {
-                    balance: { increment: new Prisma.Decimal(commRate) },
-                  },
+                  data: { balance: { increment: new Prisma.Decimal(partnerMarkup) } },
                 });
-                this.logger.log(`Credited ₹ ${commRate} commission (${commPct}% of ₹ ${feeAmount} service fee) to partner ${partner.id} for completed booking ${br.id}`);
+                this.logger.log(`Credited ₹ ${partnerMarkup} ticket markup to partner ${partner.id} for booking #${br.id}`);
               }
             }
-          } catch (commErr: any) {
-            this.logger.warn(`Could not credit partner commission: ${commErr.message}`);
+
+            // 2. Credit Distributor Markup (only when booking centre belongs to a distributor)
+            if (resolvedDistributorId && distributorMarkup > 0) {
+              const distributor = await (this.prisma as any).distributor.findUnique({
+                where: { id: resolvedDistributorId },
+                select: { id: true, userId: true },
+              });
+              if (distributor && distributor.userId) {
+                const distWallet = await this.prisma.wallet.upsert({
+                  where: { userId: distributor.userId },
+                  update: { availableBalance: { increment: new Prisma.Decimal(distributorMarkup) } },
+                  create: { userId: distributor.userId, availableBalance: new Prisma.Decimal(distributorMarkup), reservedBalance: new Prisma.Decimal(0) },
+                });
+                await this.prisma.walletTransaction.create({
+                  data: {
+                    walletId: distWallet.id,
+                    userId: distributor.userId,
+                    bookingId: br.id,
+                    type: TransactionType.SETTLEMENT,
+                    amount: new Prisma.Decimal(distributorMarkup),
+                    status: TransactionStatus.COMPLETED,
+                    reference: `MARKUP-${br.bookingCode || br.id.slice(0, 8)}`,
+                    idempotencyKey: `markup_dt_${br.id}_${dto.taskIndex || 0}`,
+                    metadata: {
+                      note: `Distributor Markup Earning for Booking #${br.bookingCode || br.id}`,
+                      bookingId: br.id,
+                      bookingCode: br.bookingCode,
+                      markupType: 'DISTRIBUTOR_MARKUP',
+                      taskIndex: dto.taskIndex,
+                    },
+                  },
+                }).catch(() => null);
+                this.logger.log(`Credited ₹ ${distributorMarkup} ticket markup to distributor ${distributor.id} for booking #${br.id}`);
+              }
+            }
+          } catch (markupErr: any) {
+            this.logger.warn(`Could not credit ticket markup: ${markupErr.message}`);
           }
         }
 
@@ -5654,68 +5719,107 @@ export class WorkersService {
         (dto.status as string) === 'UNKNOWN_OUTCOME' ||
         dto.status === BookingStatus.UNKNOWN;
 
-      const isRetryableInQueue =
-        (validFailStatus === BookingStatus.RETRYABLE_FAILURE ||
-          validFailStatus === BookingStatus.TEMPORARY_SLOT_LOST) &&
-        (job.attempt || 1) < (job.maxAttempts || 3);
+      const isExplicitTerminalFailure =
+        validFailStatus === BookingStatus.FAILED ||
+        validFailStatus === BookingStatus.CANCELLED;
 
-      if (isQuarantinedOrPendingVerification) {
+      if (!isExplicitTerminalFailure || isQuarantinedOrPendingVerification) {
         const totalRequested = Math.max(1, br.pilgrimCount || 1);
-        const isMultiPilgrim = totalRequested > 1;
-        const hasDevoteeContext = Boolean(dto.taskIndex || (dto as any).pilgrimTaskId);
+        const taskIdx = dto.taskIndex || 1;
+        const failReason = dto.errorMessage || dto.errorCode || 'Booking attempt unsuccessful; returned to monitoring queue.';
 
-        // If this failure belongs to an individual devotee in a multi-devotee booking,
-        // isolate the quarantine to the individual devotee task and keep the parent booking WATCHING
-        // so remaining pending devotees can continue to be booked!
-        if (isMultiPilgrim && hasDevoteeContext) {
-          const taskIdx = dto.taskIndex || 1;
-          this.logger.warn(`[DEVOTEE-ISOLATION] Devotee #${taskIdx} encountered ${dto.status} (${dto.errorMessage || 'verification pending'}). Isolating to devotee task, keeping Booking #${br.bookingCode} active in WATCHING queue.`);
+        // Resolve target devotee to defer to the end of the queue
+        let targetBp: any = null;
+        const pilgrimTaskId = (dto as any).pilgrimTaskId;
+        if (pilgrimTaskId && typeof (this.prisma as any).bookingPilgrim?.findUnique === 'function') {
+          targetBp = await Promise.resolve((this.prisma as any).bookingPilgrim.findUnique({ where: { id: pilgrimTaskId } })).catch(() => null);
+        }
+        if (!targetBp && br.id && typeof (this.prisma as any).bookingPilgrim?.findMany === 'function') {
+          const allBps = await Promise.resolve((this.prisma as any).bookingPilgrim.findMany({
+            where: { bookingRequestId: br.id },
+            orderBy: { createdAt: 'asc' },
+          })).catch(() => []);
+          targetBp = allBps.find((p: any) => {
+            const meta = typeof p.metadata === 'string' ? JSON.parse(p.metadata) : (p.metadata || {});
+            return Number(meta.taskIndex) === Number(taskIdx);
+          }) || allBps.find((p: any) => {
+            const meta = typeof p.metadata === 'string' ? JSON.parse(p.metadata) : (p.metadata || {});
+            return meta.taskStatus !== 'CONFIRMED' && meta.status !== 'CONFIRMED' && !meta.officialBookingReference;
+          }) || allBps[0];
+        }
 
-          let targetBp: any = null;
-          const pilgrimTaskId = (dto as any).pilgrimTaskId;
-          if (pilgrimTaskId && typeof (this.prisma as any).bookingPilgrim?.findUnique === 'function') {
-            targetBp = await Promise.resolve((this.prisma as any).bookingPilgrim.findUnique({ where: { id: pilgrimTaskId } })).catch(() => null);
-          }
-          if (!targetBp && br.id && typeof (this.prisma as any).bookingPilgrim?.findMany === 'function') {
-            const allBps = await Promise.resolve((this.prisma as any).bookingPilgrim.findMany({
-              where: { bookingRequestId: br.id },
-              orderBy: { createdAt: 'asc' },
-            })).catch(() => []);
-            targetBp = allBps.find((p: any) => {
-              const meta = typeof p.metadata === 'string' ? JSON.parse(p.metadata) : (p.metadata || {});
-              return Number(meta.taskIndex) === Number(taskIdx);
-            }) || allBps[taskIdx - 1];
-          }
-
-          if (targetBp && typeof (this.prisma as any).bookingPilgrim?.update === 'function') {
-            const prevMeta = typeof targetBp.metadata === 'string' ? JSON.parse(targetBp.metadata) : (targetBp.metadata || {});
+        if (targetBp && typeof (this.prisma as any).bookingPilgrim?.update === 'function') {
+          const prevMeta = typeof targetBp.metadata === 'string' ? JSON.parse(targetBp.metadata) : (targetBp.metadata || {});
+          if (prevMeta.taskStatus !== 'CONFIRMED' && prevMeta.status !== 'CONFIRMED' && !prevMeta.officialBookingReference) {
+            const nowIso = new Date().toISOString();
             await Promise.resolve((this.prisma as any).bookingPilgrim.update({
               where: { id: targetBp.id },
               data: {
                 metadata: {
                   ...prevMeta,
                   taskIndex: taskIdx,
-                  taskStatus: 'RECONCILIATION_REQUIRED',
-                  reconciliationRequired: true,
-                  failureReason: dto.errorMessage || 'Outcome requires reconciliation',
+                  taskStatus: 'PENDING',
+                  deferredAt: nowIso,
+                  lastAttemptedAt: nowIso,
+                  deferralCount: Number(prevMeta.deferralCount || 0) + 1,
+                  attemptCount: Number(prevMeta.attemptCount || 0) + 1,
+                  lastFailureReason: failReason,
+                  lastErrorCode: dto.errorCode || String(dto.status),
                 },
               },
             })).catch(() => {});
           }
+        }
 
-          // Keep parent booking active in WATCHING so other devotees continue
-          await this.prisma.bookingRequest.update({
-            where: { id: br.id },
-            data: {
-              status: BookingStatus.WATCHING,
-              isWatching: true,
-              reconciliationStatus: 'DEVOTEE_RECONCILIATION_REQUIRED',
-              requiresHumanNote: `Devotee #${taskIdx} moved to reconciliation. Remaining devotees active in monitoring.`,
-            },
-          }).catch(() => {});
+        // Keep parent booking active in WATCHING without requiring manual intervention
+        try {
+          if (this.stateMachine) {
+            await this.stateMachine.transition({
+              bookingId: br.id,
+              targetStatus: BookingStatus.WATCHING,
+              targetExecutionStatus: 'IDLE',
+              workerId: machineId,
+              leaseGeneration: job.leaseGeneration,
+              milestone: 'WATCHING_RESUMED_AFTER_ATTEMPT',
+              failureReason: failReason,
+              screenshot: dto.screenshot,
+              confirmationEvidence: dto.screenshot ? { screenshot: dto.screenshot } : undefined,
+              note: `Devotee #${taskIdx} deferred (${failReason}). Resumed WATCHING without manual intervention.`,
+            });
+          } else {
+            await this.prisma.bookingRequest.update({
+              where: { id: br.id },
+              data: {
+                status: BookingStatus.WATCHING,
+                isWatching: true,
+                assignedMachineId: null,
+                leaseExpiresAt: null,
+                failureReason: failReason,
+                requiresHumanNote: null,
+                confirmationEvidence: dto.screenshot ? { screenshot: dto.screenshot } : undefined,
+              },
+            });
+          }
+        } catch {
+          await Promise.resolve(
+            this.prisma.bookingRequest.update({
+              where: { id: br.id },
+              data: {
+                status: BookingStatus.WATCHING,
+                isWatching: true,
+                assignedMachineId: null,
+                leaseExpiresAt: null,
+                failureReason: failReason,
+                requiresHumanNote: null,
+                confirmationEvidence: dto.screenshot ? { screenshot: dto.screenshot } : undefined,
+              },
+            })
+          ).catch(() => {});
+        }
 
-          // Reset the job to QUEUED so next devotee is processed
-          await this.prisma.bookingJob.update({
+        // Reset the job to QUEUED so next devotee/attempt is automatically processed
+        await Promise.resolve(
+          this.prisma.bookingJob.update({
             where: { id: jobId },
             data: {
               status: BookingStatus.QUEUED,
@@ -5723,169 +5827,77 @@ export class WorkersService {
               leaseExpiresAt: null,
               completedAt: null,
               attempt: 0,
+              errorMessage: failReason,
             },
-          }).catch(() => {});
+          })
+        ).catch(() => {});
 
-          return { success: true, isolatedDevotee: true, taskIndex: taskIdx };
-        }
-
-        // Quarantine ambiguous or human-verification outcome WITHOUT releasing wallet hold
-        const targetQuarantineStatus =
-          dto.status === BookingStatus.RECONCILIATION_REQUIRED || dto.status === ('PENDING_VERIFICATION' as any)
-            ? dto.status
-            : BookingStatus.REQUIRES_HUMAN;
-
-        const interventionNote =
-          (dto.status as string) === 'UNKNOWN_RESULT' ||
-            dto.status === BookingStatus.RECONCILIATION_REQUIRED ||
-            dto.status === ('PENDING_VERIFICATION' as any)
-            ? `[PENDING VERIFICATION] ${dto.errorMessage || 'Official booking outcome requires history verification after submission. Wallet reservation safely retained.'}`
-            : (dto.errorMessage || 'Official portal requires verification (CAPTCHA / OTP)');
-
-        try {
-          await this.stateMachine.transition({
-            bookingId: br.id,
-            targetStatus: targetQuarantineStatus,
-            targetExecutionStatus: 'QUARANTINED',
-            workerId: machineId,
-            leaseGeneration: job.leaseGeneration,
-            milestone: String(targetQuarantineStatus),
-            screenshot: dto.screenshot,
-            confirmationEvidence: dto.screenshot ? { screenshot: dto.screenshot } : undefined,
-            note: interventionNote,
-          });
-        } catch (smErr: any) {
-          this.logger.warn(`[STATE_MACHINE] Fail transition to ${targetQuarantineStatus} fallback: ${smErr.message}`);
-          await this.prisma.bookingRequest.update({
-            where: { id: br.id },
-            data: {
-              status: targetQuarantineStatus,
-              requiresHumanNote: interventionNote,
-              confirmationEvidence: dto.screenshot ? { screenshot: dto.screenshot } : undefined,
-            },
-          });
-          if (typeof this.notifications?.sendTelegramBookingNotification === 'function') {
-            await this.notifications.sendTelegramBookingNotification({
-              bookingId: br.id,
-              status: targetQuarantineStatus,
-              requiresHumanNote: interventionNote,
-              screenshotUrl: dto.screenshot,
-              workerId: machineId,
-            }).catch(() => { });
-          }
-        }
-
-        // Keep child devotee task in PENDING_VERIFICATION (never CONFIRMED)
-        if (dto.pilgrimTaskId || dto.taskIndex) {
-          let targetBp: any = null;
-          if (dto.pilgrimTaskId && typeof (this.prisma as any).bookingPilgrim?.findUnique === 'function') {
-            targetBp = await (this.prisma as any).bookingPilgrim.findUnique({ where: { id: dto.pilgrimTaskId } }).catch(() => null);
-          }
-          if (!targetBp && br.id && typeof (this.prisma as any).bookingPilgrim?.findFirst === 'function') {
-            targetBp = await (this.prisma as any).bookingPilgrim.findFirst({
-              where: {
-                bookingRequestId: br.id,
-                ...(dto.taskIndex ? { metadata: { path: ['taskIndex'], equals: dto.taskIndex } } : {}),
-              },
-            }).catch(() => null);
-          }
-          if (targetBp && (targetBp.metadata as any)?.taskStatus !== 'CONFIRMED' && typeof (this.prisma as any).bookingPilgrim?.update === 'function') {
-            await (this.prisma as any).bookingPilgrim.update({
-              where: { id: targetBp.id },
-              data: {
-                metadata: {
-                  ...((targetBp.metadata as any) || {}),
-                  taskStatus: 'PENDING_VERIFICATION',
-                  lastFailureReason: dto.errorMessage || dto.errorCode,
-                },
-              },
-            }).catch(() => { });
-          }
-        }
-      } else if (isRetryableInQueue) {
-        // Retain wallet hold while booking is scheduled for automatic retry
-        const retryReason = dto.errorMessage || dto.errorCode || 'Transient portal error; scheduled for automatic retry.';
-        const targetStatus =
-          validFailStatus === BookingStatus.TEMPORARY_SLOT_LOST
-            ? BookingStatus.TEMPORARY_SLOT_LOST
-            : BookingStatus.RETRYABLE_FAILURE;
-        try {
-          await this.stateMachine.transition({
-            bookingId: br.id,
-            targetStatus,
-            targetExecutionStatus: 'IDLE',
-            workerId: machineId,
-            leaseGeneration: job.leaseGeneration,
-            milestone: String(validFailStatus),
-            failureReason: retryReason,
-          });
-        } catch {
-          await this.prisma.bookingRequest.update({
-            where: { id: br.id },
-            data: {
-              status: targetStatus,
-              failureReason: retryReason,
-              assignedMachineId: null,
-              leaseExpiresAt: null,
-            },
-          });
-        }
+        this.logger.warn(`[WATCHING-RESUMED] Booking #${br.bookingCode} (Devotee #${taskIdx}): ${failReason}. Returned safely to WATCHING queue; pilgrim deferred for rotation.`);
       } else {
+        // Explicit terminal failure (FAILED / CANCELLED): transition to validFailStatus and release uncaptured wallet hold
         const failReason = dto.errorMessage || dto.errorCode || 'Booking execution failed';
         try {
-          await this.stateMachine.transition({
-            bookingId: br.id,
-            targetStatus: validFailStatus,
-            targetExecutionStatus: 'FAILED',
-            workerId: machineId,
-            leaseGeneration: job.leaseGeneration,
-            milestone: 'FAILED',
-            screenshot: dto.screenshot,
-            confirmationEvidence: dto.screenshot ? { screenshot: dto.screenshot } : undefined,
-            failureReason: failReason,
-          });
-        } catch (smErr: any) {
-          this.logger.warn(`[STATE_MACHINE] Fail transition to ${validFailStatus} fallback: ${smErr.message}`);
-          await this.prisma.bookingRequest.update({
-            where: { id: br.id },
-            data: {
-              status: validFailStatus,
-              failureReason: failReason,
-              confirmationEvidence: dto.screenshot ? { screenshot: dto.screenshot } : undefined,
-              assignedMachineId: null,
-              leaseExpiresAt: null,
-            },
-          });
-          // Dispatch Telegram notification with screenshot directly on state machine fallback
-          if (typeof this.notifications?.sendTelegramBookingNotification === 'function') {
-            await this.notifications.sendTelegramBookingNotification({
+          if (this.stateMachine) {
+            await this.stateMachine.transition({
               bookingId: br.id,
-              status: validFailStatus,
-              failureReason: failReason,
-              screenshotUrl: dto.screenshot,
+              targetStatus: validFailStatus,
+              targetExecutionStatus: 'FAILED',
               workerId: machineId,
-            }).catch(() => { });
+              leaseGeneration: job.leaseGeneration,
+              milestone: 'FAILED',
+              screenshot: dto.screenshot,
+              confirmationEvidence: dto.screenshot ? { screenshot: dto.screenshot } : undefined,
+              failureReason: failReason,
+            });
+          } else {
+            await this.prisma.bookingRequest.update({
+              where: { id: br.id },
+              data: {
+                status: validFailStatus,
+                failureReason: failReason,
+                confirmationEvidence: dto.screenshot ? { screenshot: dto.screenshot } : undefined,
+                assignedMachineId: null,
+                leaseExpiresAt: null,
+              },
+            });
           }
+        } catch {
+          await Promise.resolve(
+            this.prisma.bookingRequest.update({
+              where: { id: br.id },
+              data: {
+                status: validFailStatus,
+                failureReason: failReason,
+                confirmationEvidence: dto.screenshot ? { screenshot: dto.screenshot } : undefined,
+                assignedMachineId: null,
+                leaseExpiresAt: null,
+              },
+            })
+          ).catch(() => {});
         }
 
         // Release uncaptured reserved hold only on confirmed failures
-        const captureTxs: any[] = await this.prisma.walletTransaction.findMany({
-          where: {
-            bookingId: br.id,
-            type: 'CAPTURE',
-            status: 'COMPLETED',
-          },
-        }).catch(() => []);
+        const captureTxs: any[] = typeof (this.prisma as any).walletTransaction?.findMany === 'function'
+          ? await Promise.resolve((this.prisma as any).walletTransaction.findMany({
+              where: {
+                bookingId: br.id,
+                type: 'CAPTURE',
+                status: 'COMPLETED',
+              },
+            })).catch(() => [])
+          : [];
         const totalCaptured = captureTxs.reduce((sum: number, t: any) => sum + Number(t.amount || 0), 0);
 
-        const reserveTx = await this.prisma.walletTransaction.findFirst({
-          where: {
-            bookingId: br.id,
-            type: 'RESERVE',
-            status: 'COMPLETED',
-          },
-        });
-        const totalReserved = reserveTx ? Number(reserveTx.amount) : 10;
+        const reserveTx = typeof (this.prisma as any).walletTransaction?.findFirst === 'function'
+          ? await Promise.resolve((this.prisma as any).walletTransaction.findFirst({
+              where: {
+                bookingId: br.id,
+                type: 'RESERVE',
+                status: 'COMPLETED',
+              },
+            })).catch(() => null)
+          : null;
+        const totalReserved = reserveTx ? Number(reserveTx.amount) : 100;
         const remainingToRelease = Math.max(0, totalReserved - totalCaptured);
 
         if (remainingToRelease > 0) {
@@ -5897,47 +5909,16 @@ export class WorkersService {
             idempotencyKey: `rel_${br.id}`,
           });
         }
-
-        if (totalCaptured > 0) {
-          const totalRequested = Math.max(1, br.pilgrimCount || 1);
-          const confirmedCount = Math.round(totalCaptured / 10);
-          await this.prisma.bookingRequest.update({
-            where: { id: br.id },
-            data: {
-              reconciliationStatus: 'PARTIALLY_COMPLETED',
-              lastMilestone: `PARTIALLY_COMPLETED (${confirmedCount}/${totalRequested} Confirmed)`,
-              financialStatus: FinancialStatus.CAPTURED,
-            },
-          }).catch(() => { });
-        }
       }
-
-      // Notify customer of non-confirmed / failed execution
-      await this.notifications.send({
-        userId: br.userId,
-        recipient: (br as any).user?.email || 'centre@ticketassist.com',
-        channel: NotificationChannel.IN_APP,
-        title: `Booking Update: #${br.bookingCode}`,
-        body: `Booking could not be confirmed automatically. Status: ${validFailStatus}. Reason: ${dto.errorMessage || dto.errorCode || 'Booking execution failed'}.`,
-        payload: {
-          bookingId: br.id,
-          bookingCode: br.bookingCode,
-          status: validFailStatus,
-          errorCode: dto.errorCode,
-          errorMessage: dto.errorMessage,
-        },
-      }).catch(() => { });
     }
 
-    const isHuman = dto.status === BookingStatus.REQUIRES_HUMAN;
     await this.prisma.workerMachine.update({
       where: { id: machineId },
       data: {
-        failureCount: isHuman ? undefined : { increment: 1 },
         currentJobId: null,
         currentBookingId: null,
-        currentActivity: isHuman ? 'WAITING_HUMAN_INTERVENTION' : 'IDLE',
-        activityDetails: isHuman ? `Requires human intervention: ${dto.errorMessage || 'CAPTCHA / OTP'}` : `Job failed: ${dto.errorMessage || dto.errorCode || dto.status}`,
+        currentActivity: 'IDLE',
+        activityDetails: `Attempt completed: ${dto.errorMessage || dto.errorCode || dto.status}. Returned to queue.`,
         lastActivityAt: new Date(),
         status: WorkerStatus.ONLINE,
       },
@@ -5947,12 +5928,10 @@ export class WorkersService {
       workerId: machineId,
       jobId,
       bookingId: job.bookingRequestId,
-      eventType: isHuman ? 'HUMAN_ACTION_REQUIRED' : 'JOB_FAILED',
-      severity: isHuman ? 'WARN' : 'ERROR',
-      activity: isHuman ? 'WAITING_HUMAN_INTERVENTION' : 'IDLE',
-      message: isHuman
-        ? `Official portal requires manual intervention (CAPTCHA/OTP). Note: ${dto.errorMessage || ''}`
-        : `Job failed: ${dto.errorMessage || dto.errorCode || dto.status}`,
+      eventType: 'STEP_PROGRESS',
+      severity: 'INFO',
+      activity: 'IDLE',
+      message: `Attempt finished: ${dto.errorMessage || dto.errorCode || dto.status}. Returned safely to WATCHING queue.`,
     });
 
     if (this.smartAllocator) {

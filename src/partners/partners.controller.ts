@@ -87,6 +87,23 @@ export class PartnersController {
     return this.partnersService.adjustPartnerWallet(req.user, id, dto);
   }
 
+  @Get(':id/wallet-transactions')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN)
+  async getPartnerWalletTransactions(
+    @Param('id') id: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+    @Query('type') type?: string,
+  ) {
+    return this.partnersService.getPartnerWalletTransactions(
+      id,
+      page ? parseInt(page, 10) : 1,
+      limit ? parseInt(limit, 10) : 20,
+      type,
+    );
+  }
+
   @Post(':id/invitations')
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(Role.SUPER_ADMIN)

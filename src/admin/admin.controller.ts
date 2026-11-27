@@ -90,6 +90,12 @@ export class AdminController {
     @Query('search') search?: string,
     @Query('dateFrom') dateFrom?: string,
     @Query('dateTo') dateTo?: string,
+    @Query('centreId') centreId?: string,
+    @Query('onlyCentres') onlyCentres?: string,
+    @Query('partnerId') partnerId?: string,
+    @Query('onlyPartners') onlyPartners?: string,
+    @Query('distributorId') distributorId?: string,
+    @Query('onlyDistributors') onlyDistributors?: string,
   ) {
     return this.adminService.getLedgerTransactions({
       page: page ? parseInt(page, 10) : 1,
@@ -99,6 +105,12 @@ export class AdminController {
       search,
       dateFrom,
       dateTo,
+      centreId,
+      onlyCentres: onlyCentres === 'true' || onlyCentres === '1',
+      partnerId,
+      onlyPartners: onlyPartners === 'true' || onlyPartners === '1',
+      distributorId,
+      onlyDistributors: onlyDistributors === 'true' || onlyDistributors === '1',
     });
   }
 

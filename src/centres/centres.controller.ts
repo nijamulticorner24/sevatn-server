@@ -99,6 +99,22 @@ export class CentresController {
     return this.centresService.adjustCentreWallet(adminUser, id, dto);
   }
 
+  @Get(':id/wallet-transactions')
+  @Roles(Role.SUPER_ADMIN, Role.PARTNER, Role.DISTRIBUTOR)
+  async getCentreWalletTransactions(
+    @Param('id') id: string,
+    @Query('page') page = '1',
+    @Query('limit') limit = '50',
+    @Query('type') type?: string,
+  ) {
+    return this.centresService.getCentreWalletTransactions(
+      id,
+      parseInt(page) || 1,
+      parseInt(limit) || 50,
+      type,
+    );
+  }
+
   @Delete(':id')
   @Roles(Role.SUPER_ADMIN)
   async deleteCentre(@CurrentUser() adminUser: any, @Param('id') id: string) {
@@ -170,6 +186,21 @@ export class AdminCentresController {
     @Body() dto: { amount: number; action: 'CREDIT' | 'DEBIT'; reason?: string },
   ) {
     return this.centresService.adjustCentreWallet(adminUser, id, dto);
+  }
+
+  @Get(':id/wallet-transactions')
+  async getCentreWalletTransactions(
+    @Param('id') id: string,
+    @Query('page') page = '1',
+    @Query('limit') limit = '50',
+    @Query('type') type?: string,
+  ) {
+    return this.centresService.getCentreWalletTransactions(
+      id,
+      parseInt(page) || 1,
+      parseInt(limit) || 50,
+      type,
+    );
   }
 
   @Delete(':id')

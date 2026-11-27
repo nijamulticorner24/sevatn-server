@@ -1167,83 +1167,76 @@ export class SmartAllocatorService {
           job.bookingRequest?.officialReference === null &&
           (isConfirmClickedMilestone || (job.attempt || 0) > 1);
 
-        if (isAmbiguous) {
-          const targetQuarantineStatus = isConfirmClickedMilestone
-            ? BookingStatus.PENDING_VERIFICATION
-            : BookingStatus.REQUIRES_HUMAN;
+        // Safe to recover back to queue: NEVER escalate to REQUIRES_HUMAN
+        await this.prisma.bookingJob.update({
+          where: { id: job.id },
+          data: {
+            status: BookingStatus.QUEUED,
+            workerId: null,
+            heartbeatAt: null,
+            leaseExpiresAt: null,
+            attempt: 0,
+            errorMessage: 'Worker lease expired; safely returned to queue.',
+          },
+        });
 
-          // Escalate to PENDING_VERIFICATION / REQUIRES_HUMAN to prevent duplicate portal booking
-          await this.prisma.bookingJob.update({
-            where: { id: job.id },
-            data: {
-              status: targetQuarantineStatus,
-              errorMessage: 'Worker lease expired during active execution. Ambiguous portal state requires verification.',
-            },
-          });
-
-          if (job.bookingRequestId) {
-            if (this.stateMachine) {
-              await this.stateMachine.transition({
-                bookingId: job.bookingRequestId,
-                targetStatus: targetQuarantineStatus,
-                note: 'Worker lease expired during execution. Check Sabarimala portal before retrying.',
-                reason: 'Worker lease expired during active execution. Ambiguous portal state requires verification.',
-                milestone: isConfirmClickedMilestone ? 'EXPIRED_AFTER_CONFIRM_CLICK' : 'STALE_LEASE_REAPED_TO_HUMAN',
-                operator: 'SmartAllocatorService:reapStaleLeases',
-              });
-            } else {
-              await this.prisma.bookingRequest.update({
-                where: { id: job.bookingRequestId },
+        if (job.bookingRequestId) {
+          // Defer active unconfirmed devotee if one was in execution
+          if (typeof (this.prisma as any).bookingPilgrim?.findMany === 'function') {
+            const allPilgrims = await (this.prisma as any).bookingPilgrim.findMany({
+              where: { bookingRequestId: job.bookingRequestId },
+              orderBy: { createdAt: 'asc' },
+            }).catch(() => []);
+            const unconfirmed = allPilgrims.filter((p: any) => {
+              const meta = typeof p.metadata === 'string' ? JSON.parse(p.metadata) : (p.metadata || {});
+              return meta.taskStatus !== 'CONFIRMED' && meta.status !== 'CONFIRMED' && !meta.officialBookingReference;
+            });
+            if (unconfirmed.length > 0) {
+              const targetP = unconfirmed[0];
+              const prevMeta = typeof targetP.metadata === 'string' ? JSON.parse(targetP.metadata) : (targetP.metadata || {});
+              const nowIso = new Date().toISOString();
+              await (this.prisma as any).bookingPilgrim.update({
+                where: { id: targetP.id },
                 data: {
-                  status: targetQuarantineStatus,
-                  requiresHumanNote: 'Worker lease expired during execution. Check Sabarimala portal before retrying.',
+                  metadata: {
+                    ...prevMeta,
+                    taskStatus: 'PENDING',
+                    deferredAt: nowIso,
+                    lastAttemptedAt: nowIso,
+                    deferralCount: Number(prevMeta.deferralCount || 0) + 1,
+                    lastFailureReason: 'Worker lease expired; rotated to end of queue.',
+                  },
                 },
-              });
+              }).catch(() => {});
             }
           }
 
-          humanReviewCount++;
-          details.push(`Lease expired for Job #${job.id} during active execution; escalated to REQUIRES_HUMAN.`);
-        } else {
-          // Safe to recover back to queue
-          await this.prisma.bookingJob.update({
-            where: { id: job.id },
-            data: {
-              status: BookingStatus.QUEUED,
-              workerId: null,
-              heartbeatAt: null,
+          if (this.stateMachine) {
+            await this.stateMachine.transition({
+              bookingId: job.bookingRequestId,
+              targetStatus: BookingStatus.WATCHING,
+              assignedMachineId: null,
+              leaseStartedAt: null,
               leaseExpiresAt: null,
-            },
-          });
-
-          if (job.bookingRequestId) {
-            if (this.stateMachine) {
-              await this.stateMachine.transition({
-                bookingId: job.bookingRequestId,
-                targetStatus: BookingStatus.QUEUED,
+              reason: 'Worker lease expired; safely returned to WATCHING queue.',
+              milestone: 'STALE_LEASE_RECOVERED_TO_WATCHING',
+              operator: 'SmartAllocatorService:reapStaleLeases',
+            }).catch(() => {});
+          } else {
+            await this.prisma.bookingRequest.update({
+              where: { id: job.bookingRequestId },
+              data: {
+                status: BookingStatus.WATCHING,
+                isWatching: true,
                 assignedMachineId: null,
-                leaseStartedAt: null,
                 leaseExpiresAt: null,
-                reason: 'Worker lease expired before critical stage. Recovered to queue.',
-                milestone: 'STALE_LEASE_RECOVERED_TO_QUEUE',
-                operator: 'SmartAllocatorService:reapStaleLeases',
-              });
-            } else {
-              await this.prisma.bookingRequest.update({
-                where: { id: job.bookingRequestId },
-                data: {
-                  status: BookingStatus.QUEUED,
-                  assignedMachineId: null,
-                  leaseStartedAt: null,
-                  leaseExpiresAt: null,
-                },
-              });
-            }
+              },
+            }).catch(() => {});
           }
-
-          recoveredCount++;
-          details.push(`Recovered stale Job #${job.id} back to QUEUED.`);
         }
+
+        recoveredCount++;
+        details.push(`Lease expired for Job #${job.id}; safely returned to WATCHING.`);
 
         // Release capacity on the assigned worker without immediately reallocating to it
         if (assignedWorkerId) {

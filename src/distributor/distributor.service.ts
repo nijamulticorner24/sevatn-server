@@ -1653,5 +1653,125 @@ export class DistributorService {
       })),
     };
   }
+
+  /**
+   * Super Admin views paginated wallet transaction history for a single distributor
+   */
+  async getDistributorWalletTransactions(
+    distributorId: string,
+    page: number = 1,
+    limit: number = 20,
+    type?: string,
+  ) {
+    const distributor = await this.prisma.distributor.findFirst({
+      where: {
+        OR: [{ id: distributorId }, { distributorCode: distributorId }],
+      },
+      include: {
+        user: {
+          include: {
+            wallet: true,
+          },
+        },
+      },
+    });
+
+    if (!distributor) {
+      throw new NotFoundException(`Distributor '${distributorId}' not found`);
+    }
+
+    let userId = distributor.userId;
+    if (!userId && distributor.user?.id) {
+      userId = distributor.user.id;
+    }
+
+    if (!userId && (distributor.email || distributor.mobile)) {
+      const u = await this.prisma.user.findFirst({
+        where: {
+          OR: [
+            ...(distributor.email ? [{ email: distributor.email }] : []),
+            ...(distributor.mobile ? [{ mobile: distributor.mobile }] : []),
+          ],
+        },
+        include: { wallet: true },
+      });
+      if (u) userId = u.id;
+    }
+
+    const wallet = distributor.user?.wallet;
+    const availableBalance = wallet ? Number(wallet.availableBalance) : 0;
+    const reservedBalance = wallet ? Number(wallet.reservedBalance) : 0;
+
+    if (!userId) {
+      return {
+        distributor: {
+          id: distributor.id,
+          distributorCode: distributor.distributorCode,
+          name: distributor.name,
+          businessName: distributor.businessName,
+          district: distributor.district,
+          taluk: distributor.taluk,
+          availableBalance,
+          reservedBalance,
+        },
+        transactions: [],
+        pagination: { page, limit, total: 0, totalPages: 0 },
+      };
+    }
+
+    const where: any = { userId };
+    if (type && type !== 'ALL') {
+      where.type = type;
+    }
+
+    const [transactions, total] = await Promise.all([
+      this.prisma.walletTransaction.findMany({
+        where,
+        skip: (page - 1) * limit,
+        take: limit,
+        orderBy: { createdAt: 'desc' },
+        include: {
+          booking: {
+            select: {
+              id: true,
+              bookingCode: true,
+              requestedDateStr: true,
+              status: true,
+            },
+          },
+        },
+      }),
+      this.prisma.walletTransaction.count({ where }),
+    ]);
+
+    return {
+      distributor: {
+        id: distributor.id,
+        distributorCode: distributor.distributorCode,
+        name: distributor.name,
+        businessName: distributor.businessName,
+        district: distributor.district,
+        taluk: distributor.taluk,
+        availableBalance,
+        reservedBalance,
+      },
+      transactions: transactions.map((t) => ({
+        id: t.id,
+        type: t.type,
+        amount: Number(t.amount),
+        status: t.status,
+        reference: t.reference,
+        metadata: t.metadata,
+        createdAt: t.createdAt,
+        booking: t.booking,
+      })),
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    };
+  }
 }
 

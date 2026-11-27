@@ -154,6 +154,24 @@ export class AdminDistributorsController {
   }
 
   /**
+   * Super Admin views paginated wallet transactions for a distributor
+   */
+  @Get(':id/wallet-transactions')
+  async getDistributorWalletTransactions(
+    @Param('id') id: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+    @Query('type') type?: string,
+  ) {
+    return this.distributorService.getDistributorWalletTransactions(
+      id,
+      page ? parseInt(page, 10) : 1,
+      limit ? parseInt(limit, 10) : 20,
+      type,
+    );
+  }
+
+  /**
    * Super Admin permanently deletes a distributor
    */
   @Delete(':id')

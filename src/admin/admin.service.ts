@@ -1157,11 +1157,31 @@ export class AdminService {
     search?: string;
     dateFrom?: string;
     dateTo?: string;
+    centreId?: string;
+    onlyCentres?: boolean;
+    partnerId?: string;
+    onlyPartners?: boolean;
+    distributorId?: string;
+    onlyDistributors?: boolean;
   }) {
     const page = Math.max(1, Number(query.page) || 1);
     const limit = Math.min(100, Math.max(1, Number(query.limit) || 25));
 
     const where: Prisma.WalletTransactionWhereInput = {};
+
+    if (query.centreId) {
+      where.user = { centre: { id: query.centreId } };
+    } else if (query.onlyCentres) {
+      where.user = { centre: { isNot: null } };
+    } else if (query.partnerId) {
+      where.user = { partnerProfile: { id: query.partnerId } };
+    } else if (query.onlyPartners) {
+      where.user = { partnerProfile: { isNot: null } };
+    } else if (query.distributorId) {
+      where.user = { distributorProfile: { id: query.distributorId } };
+    } else if (query.onlyDistributors) {
+      where.user = { distributorProfile: { isNot: null } };
+    }
 
     if (query.status && query.status !== 'ALL') {
       where.status = query.status as TransactionStatus;
@@ -1191,6 +1211,10 @@ export class AdminService {
         { user: { email: { contains: s, mode: 'insensitive' } } },
         { user: { centre: { centreName: { contains: s, mode: 'insensitive' } } } },
         { user: { centre: { centreCode: { contains: s, mode: 'insensitive' } } } },
+        { user: { partnerProfile: { name: { contains: s, mode: 'insensitive' } } } },
+        { user: { partnerProfile: { partnerCode: { contains: s, mode: 'insensitive' } } } },
+        { user: { distributorProfile: { name: { contains: s, mode: 'insensitive' } } } },
+        { user: { distributorProfile: { distributorCode: { contains: s, mode: 'insensitive' } } } },
       ];
     }
 
@@ -1222,6 +1246,25 @@ export class AdminService {
                   id: true,
                   centreName: true,
                   centreCode: true,
+                  district: true,
+                  taluk: true,
+                },
+              },
+              partnerProfile: {
+                select: {
+                  id: true,
+                  partnerCode: true,
+                  name: true,
+                  district: true,
+                  taluk: true,
+                },
+              },
+              distributorProfile: {
+                select: {
+                  id: true,
+                  distributorCode: true,
+                  name: true,
+                  businessName: true,
                   district: true,
                   taluk: true,
                 },

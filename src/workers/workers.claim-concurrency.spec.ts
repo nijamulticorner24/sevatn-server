@@ -274,7 +274,7 @@ describe('WorkersService Concurrency & Financial Quarantine Invariants', () => {
   });
 
   describe('FIND-002: Unknown Outcome & Wallet Hold Quarantine', () => {
-    it('does NOT release wallet hold on UNKNOWN_RESULT and quarantines booking in REQUIRES_HUMAN', async () => {
+    it('does NOT release wallet hold on UNKNOWN_RESULT and returns booking to WATCHING', async () => {
       // Claim job
       await workersService.claimJob('w-1');
 
@@ -289,8 +289,8 @@ describe('WorkersService Concurrency & Financial Quarantine Invariants', () => {
       const result = await workersService.failJob('job-1', 'w-1', failDto);
 
       expect(result.success).toBe(true);
-      // Booking must be quarantined in REQUIRES_HUMAN
-      expect(mockBookingRequests[0].status).toBe(BookingStatus.REQUIRES_HUMAN);
+      // Booking returns to WATCHING without human block
+      expect(mockBookingRequests[0].status).toBe(BookingStatus.WATCHING);
 
       // Wallet hold MUST NOT be released!
       expect(walletService.release).not.toHaveBeenCalled();
