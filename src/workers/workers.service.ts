@@ -1722,8 +1722,19 @@ export class WorkersService {
     // Multi-devotee sequential booking guard: if pending devotees remain, request is PARTIALLY_COMPLETED and must be claimable
     const totalRequested = Math.max(1, br.pilgrimCount || 1);
     const pilgrims = Array.isArray(br.pilgrims) ? br.pilgrims : [];
-    const confirmedCount = pilgrims.filter((p: any) => (p.metadata as any)?.taskStatus === 'CONFIRMED').length;
-    const hasPendingDevotees = totalRequested > 1 && confirmedCount < totalRequested && (br.status === BookingStatus.WATCHING || (br as any).reconciliationStatus === 'PARTIALLY_COMPLETED');
+    const confirmedCount = pilgrims.filter((p: any) => {
+      const meta = typeof p.metadata === 'string' ? (() => { try { return JSON.parse(p.metadata); } catch { return {}; } })() : (p.metadata || {});
+      return (
+        meta.taskStatus === 'CONFIRMED' ||
+        meta.taskStatus === 'ADMIN_COMPLETED' ||
+        meta.status === 'CONFIRMED' ||
+        meta.status === 'ADMIN_COMPLETED' ||
+        !!meta.officialBookingReference ||
+        !!meta.portalTransactionReference ||
+        !!meta.transactionId
+      );
+    }).length;
+    const hasPendingDevotees = totalRequested > 1 && confirmedCount < totalRequested && (br.status === BookingStatus.WATCHING || (br as any).reconciliationStatus === 'PARTIALLY_COMPLETED' || (br as any).reconciliationStatus === 'PARTIALLY_CONFIRMED');
 
     if (hasPendingDevotees) {
       return { alreadyCompleted: false };
@@ -4665,9 +4676,21 @@ export class WorkersService {
             })).catch(() => []);
             confirmedPilgrimsCount = allPilgrimTasks.filter((p: any) => {
               const meta = typeof p.metadata === 'string' ? JSON.parse(p.metadata) : (p.metadata || {});
-              return meta.taskStatus === 'CONFIRMED' || meta.status === 'CONFIRMED' || meta.officialBookingReference || p.id === (dto as any).pilgrimTaskId;
+              return (
+                meta.taskStatus === 'CONFIRMED' ||
+                meta.taskStatus === 'ADMIN_COMPLETED' ||
+                meta.status === 'CONFIRMED' ||
+                meta.status === 'ADMIN_COMPLETED' ||
+                !!meta.officialBookingReference ||
+                p.id === (dto as any).pilgrimTaskId
+              );
             }).length;
-            isAllConfirmed = (dto as any).isFinalPilgrim || confirmedPilgrimsCount >= totalRequested || allPilgrimTasks.length === 0;
+            const hasValidPilgrimRecords = allPilgrimTasks.length > 0;
+            if (totalRequested > 1) {
+              isAllConfirmed = hasValidPilgrimRecords && confirmedPilgrimsCount >= totalRequested;
+            } else {
+              isAllConfirmed = true;
+            }
           }
 
           if (isAllConfirmed) {
@@ -4748,8 +4771,6 @@ export class WorkersService {
                   isWatching: true,
                   reconciliationStatus: 'PARTIALLY_CONFIRMED',
                   lastMilestone: `PARTIALLY_CONFIRMED (${confirmedPilgrimsCount}/${totalRequested} Confirmed, ${remainingCount} Pending)`,
-                  officialReference: officialBookingRef,
-                  officialBookingReference: officialBookingRef,
                   portalTransactionReference: portalTxnRef || null,
                   confirmedAt: dto.confirmedAt ? new Date(dto.confirmedAt) : now,
                   selectedTime: selectedSlot,
@@ -5091,16 +5112,30 @@ export class WorkersService {
         // Realtime WebSocket broadcast to Admin Dashboard and user
         if (this.eventsGateway) {
           try {
-            this.eventsGateway.notifyBookingConfirmed({
-              bookingId: br.id,
-              userId: br.userId,
-              bookingCode: br.bookingCode,
-              officialBookingReference: officialBookingRef,
-              officialReference: officialBookingRef,
-              status: BookingStatus.SUCCESS,
-              route: br.route,
-              requestedDate: br.requestedDate,
-            });
+            if (isAllConfirmed) {
+              this.eventsGateway.notifyBookingConfirmed({
+                bookingId: br.id,
+                userId: br.userId,
+                bookingCode: br.bookingCode,
+                officialBookingReference: officialBookingRef,
+                officialReference: officialBookingRef,
+                status: BookingStatus.SUCCESS,
+                route: br.route,
+                requestedDate: br.requestedDate,
+              });
+            } else {
+              this.eventsGateway.notifyBookingUpdated(br.id, br.userId, {
+                bookingId: br.id,
+                userId: br.userId,
+                bookingCode: br.bookingCode,
+                status: BookingStatus.WATCHING,
+                reconciliationStatus: 'PARTIALLY_CONFIRMED',
+                lastMilestone: `PARTIALLY_CONFIRMED (${confirmedCount}/${totalRequested} Confirmed, ${remainingCount} Pending)`,
+                confirmedCount,
+                totalRequested,
+                remainingCount,
+              });
+            }
           } catch (wsErr: any) {
             this.logger.warn(`WebSocket notification failed: ${wsErr.message}`);
           }
@@ -5230,17 +5265,81 @@ export class WorkersService {
             },
           }).catch(() => null);
         }
-        if (targetBp && ((targetBp.metadata as any)?.taskStatus === 'CONFIRMED' || (targetBp.metadata as any)?.officialBookingReference)) {
-          this.logger.warn(`[CONFIRMATION-GUARD] Devotee #${dto.taskIndex || targetBp.fullName} is already CONFIRMED. Refusing to downgrade to ${dto.status}.`);
-          return { success: true, message: 'Devotee already confirmed; protected from failure downgrade' };
+        const isTargetCompleted =
+          (targetBp.metadata as any)?.taskStatus === 'CONFIRMED' ||
+          (targetBp.metadata as any)?.taskStatus === 'ADMIN_COMPLETED' ||
+          (targetBp.metadata as any)?.status === 'CONFIRMED' ||
+          (targetBp.metadata as any)?.status === 'ADMIN_COMPLETED' ||
+          (targetBp.metadata as any)?.officialBookingReference;
+        if (targetBp && isTargetCompleted) {
+          this.logger.warn(`[CONFIRMATION-GUARD] Devotee #${dto.taskIndex || targetBp.fullName} is already CONFIRMED/ADMIN_COMPLETED. Refusing to downgrade to ${dto.status}.`);
+          return { success: true, message: 'Devotee already confirmed or completed; protected from failure downgrade' };
+        }
+
+        if (targetBp && !isTargetCompleted) {
+          const prevMeta = typeof targetBp.metadata === 'string' ? (() => { try { return JSON.parse(targetBp.metadata); } catch { return {}; } })() : (targetBp.metadata || {});
+          const nowIso = new Date().toISOString();
+          const deferralCount = Number(prevMeta.deferralCount || 0) + 1;
+          const attemptCount = Number(prevMeta.attemptCount || 0) + 1;
+
+          await (this.prisma as any).bookingPilgrim?.update?.({
+            where: { id: targetBp.id },
+            data: {
+              metadata: {
+                ...prevMeta,
+                taskIndex: prevMeta.taskIndex || dto.taskIndex || 1,
+                lastAttemptedAt: nowIso,
+                deferredAt: nowIso,
+                deferralCount,
+                attemptCount,
+                lastFailureReason: dto.errorMessage || 'Wishlist stage failure',
+                lastErrorCode: dto.errorCode || 'WISHLIST_DEFERRED',
+                taskStatus: 'PENDING',
+              },
+            },
+          }).catch((bpErr: any) => {
+            this.logger.warn(`[PILGRIM-ROTATION] Failed to update pilgrim metadata: ${bpErr?.message || bpErr}`);
+          });
+
+          this.logger.log(`[PILGRIM-ROTATION] Devotee #${dto.taskIndex || prevMeta.taskIndex} (${targetBp.fullName}) deferred and moved to end of rotation queue. Deferrals: ${deferralCount}`);
         }
       }
 
       // 2. If parent booking has confirmed devotees, preserve PARTIALLY_CONFIRMED and WATCHING state
       const allPilgrims = await (this.prisma as any).bookingPilgrim?.findMany({ where: { bookingRequestId: br.id } }).catch(() => []);
-      const confirmedPilgrims = (allPilgrims || []).filter((p: any) => (p.metadata as any)?.taskStatus === 'CONFIRMED' || (p.metadata as any)?.officialBookingReference);
+      const confirmedPilgrims = (allPilgrims || []).filter((p: any) => {
+        const meta = typeof p.metadata === 'string' ? (() => { try { return JSON.parse(p.metadata); } catch { return {}; } })() : (p.metadata || {});
+        return (
+          meta.taskStatus === 'CONFIRMED' ||
+          meta.taskStatus === 'ADMIN_COMPLETED' ||
+          meta.status === 'CONFIRMED' ||
+          meta.status === 'ADMIN_COMPLETED' ||
+          !!meta.officialBookingReference ||
+          !!meta.portalTransactionReference ||
+          !!meta.transactionId
+        );
+      });
       if (confirmedPilgrims.length > 0) {
-        this.logger.warn(`[CONFIRMATION-GUARD] Booking #${br.bookingCode} has ${confirmedPilgrims.length} confirmed devotee(s). Preserving PARTIALLY_CONFIRMED / WATCHING status despite failure: ${dto.errorMessage || dto.status}`);
+        const totalDevotees = Math.max(1, br.pilgrimCount || (allPilgrims || []).length || 1);
+        if (confirmedPilgrims.length >= totalDevotees) {
+          this.logger.log(`[CONFIRMATION-GUARD] All ${totalDevotees} devotees already confirmed/completed on #${br.bookingCode}. Preserving SUCCESS state.`);
+          await this.prisma.bookingRequest.update({
+            where: { id: br.id },
+            data: {
+              status: BookingStatus.SUCCESS,
+              executionStatus: 'COMPLETED',
+              financialStatus: FinancialStatus.CAPTURED,
+              isWatching: false,
+              reconciliationStatus: null,
+              lastMilestone: `COMPLETED (${totalDevotees}/${totalDevotees} Devotees)`,
+              assignedMachineId: null,
+              leaseExpiresAt: null,
+            } as any,
+          }).catch(() => { });
+          return { success: true, message: 'All devotees confirmed/completed; preserved SUCCESS status' };
+        }
+
+        this.logger.warn(`[CONFIRMATION-GUARD] Booking #${br.bookingCode} has ${confirmedPilgrims.length}/${totalDevotees} confirmed devotee(s). Preserving PARTIALLY_CONFIRMED / WATCHING status despite failure: ${dto.errorMessage || dto.status}`);
         await this.prisma.bookingRequest.update({
           where: { id: br.id },
           data: {
@@ -5248,7 +5347,7 @@ export class WorkersService {
             isWatching: true,
             executionStatus: 'IDLE',
             reconciliationStatus: 'PARTIALLY_CONFIRMED',
-            lastMilestone: `PARTIALLY_CONFIRMED (${confirmedPilgrims.length}/${br.pilgrimCount || allPilgrims.length} Confirmed)`,
+            lastMilestone: `PARTIALLY_CONFIRMED (${confirmedPilgrims.length}/${totalDevotees} Confirmed, ${totalDevotees - confirmedPilgrims.length} Pending)`,
             assignedMachineId: null,
             leaseExpiresAt: null,
           } as any,
@@ -5861,6 +5960,81 @@ export class WorkersService {
     }
 
     return { success: true };
+  }
+
+  async notifyDateAvailable(
+    machineId: string,
+    dto: {
+      bookingId?: string;
+      bookingCode?: string;
+      date: string;
+      route?: string;
+      slot?: string;
+      timeSlot?: string;
+    },
+  ) {
+    let bookingId = dto.bookingId;
+    let bookingCode = dto.bookingCode;
+    let route = dto.route;
+    let slot = dto.slot || dto.timeSlot;
+    let requestedDate: Date | string = dto.date;
+
+    // If bookingId is provided, look up the booking to enrich details
+    if (bookingId) {
+      const br = await this.prisma.bookingRequest.findUnique({
+        where: { id: bookingId },
+        select: { id: true, bookingCode: true, route: true, requestedDate: true, timeSlot: true, selectedTime: true },
+      });
+      if (br) {
+        bookingCode = bookingCode || br.bookingCode;
+        route = route || br.route;
+        slot = slot || (br as any).selectedTime || br.timeSlot;
+        requestedDate = br.requestedDate || requestedDate;
+      }
+    } else if (dto.date) {
+      // Find the oldest active watching booking for that date & route
+      const canonicalDate = dto.date.trim();
+      let targetStart: Date | undefined;
+      let targetEnd: Date | undefined;
+      if (/^\d{4}-\d{2}-\d{2}$/.test(canonicalDate)) {
+        const [year, month, day] = canonicalDate.split('-').map(Number);
+        targetStart = new Date(Date.UTC(year, month - 1, day, 0, 0, 0));
+        targetEnd = new Date(Date.UTC(year, month - 1, day, 23, 59, 59, 999));
+      }
+
+      const candidate = await this.prisma.bookingRequest.findFirst({
+        where: {
+          ...(targetStart && targetEnd ? { requestedDate: { gte: targetStart, lte: targetEnd } } : {}),
+          status: { in: [BookingStatus.WATCHING, BookingStatus.PENDING, BookingStatus.FAST_BOOKING_QUEUED, BookingStatus.WAITING_FOR_DATE_AVAILABILITY] },
+        },
+        orderBy: { createdAt: 'asc' },
+        select: { id: true, bookingCode: true, route: true, requestedDate: true, timeSlot: true, selectedTime: true },
+      });
+      if (candidate) {
+        bookingId = candidate.id;
+        bookingCode = candidate.bookingCode;
+        route = route || candidate.route;
+        slot = slot || (candidate as any).selectedTime || candidate.timeSlot;
+        requestedDate = candidate.requestedDate || requestedDate;
+      }
+    }
+
+    if (!bookingId) {
+      this.logger.warn(`[TELEGRAM] notifyDateAvailable: No active booking found for date ${dto.date}`);
+      return { skipped: true, reason: 'No active booking found for date' };
+    }
+
+    this.logger.log(`[TELEGRAM] Dispatching DATE_AVAILABLE alert for Booking #${bookingCode || bookingId} on ${dto.date}`);
+    return this.notifications.sendTelegramBookingNotification({
+      bookingId,
+      bookingCode,
+      status: 'DATE_AVAILABLE',
+      requestedDate,
+      route: route || 'Pamba (Regular Footpath Route)',
+      selectedTime: slot || 'Candidate Open Slot',
+      timeSlot: slot,
+      machineCode: machineId,
+    });
   }
 
   // Q4/F3/ITEM 6: Pre-payment lease check & atomic transition to PAYMENT_SUBMITTED — see Audit 3

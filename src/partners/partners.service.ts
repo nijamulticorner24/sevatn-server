@@ -217,6 +217,20 @@ export class PartnersService {
             take: 5,
             orderBy: { createdAt: 'desc' },
           },
+          user: {
+            select: {
+              id: true,
+              email: true,
+              mobile: true,
+              wallet: {
+                select: {
+                  id: true,
+                  availableBalance: true,
+                  reservedBalance: true,
+                },
+              },
+            },
+          },
           _count: {
             select: {
               registeredUsers: {
@@ -243,8 +257,15 @@ export class PartnersService {
           ? Number((p as any).commissionRate)
           : (systemServiceFee * commissionPercentage) / 100;
 
+        const availableBalance = Number(p.user?.wallet?.availableBalance ?? (p as any).balance ?? 0);
+        const reservedBalance = Number(p.user?.wallet?.reservedBalance ?? 0);
+
         return {
           ...p,
+          availableBalance,
+          walletBalance: availableBalance,
+          reservedBalance,
+          balance: availableBalance,
           commissionPercentage,
           commissionRate,
           commissionSlab: (p as any).commissionSlab || `${commissionPercentage}%`,
@@ -278,6 +299,20 @@ export class PartnersService {
         invitations: {
           orderBy: { createdAt: 'desc' },
         },
+        user: {
+          select: {
+            id: true,
+            email: true,
+            mobile: true,
+            wallet: {
+              select: {
+                id: true,
+                availableBalance: true,
+                reservedBalance: true,
+              },
+            },
+          },
+        },
         registeredUsers: {
           where: {
             role: Role.CENTRE,
@@ -307,8 +342,15 @@ export class PartnersService {
       ? Number((partner as any).commissionRate)
       : (systemServiceFee * commissionPercentage) / 100;
 
+    const availableBalance = Number(partner.user?.wallet?.availableBalance ?? (partner as any).balance ?? 0);
+    const reservedBalance = Number(partner.user?.wallet?.reservedBalance ?? 0);
+
     return {
       ...partner,
+      availableBalance,
+      walletBalance: availableBalance,
+      reservedBalance,
+      balance: availableBalance,
       commissionPercentage,
       commissionRate,
       commissionSlab: (partner as any).commissionSlab || `${commissionPercentage}%`,
@@ -2012,5 +2054,199 @@ export class PartnersService {
       maxWait: 15000,
       timeout: 30000,
     });
+  }
+
+  /**
+   * Super Admin adjusts a partner's wallet balance (CREDIT or DEBIT)
+   */
+  async adjustPartnerWallet(
+    adminUser: any,
+    partnerId: string,
+    dto: { amount: number; action: 'CREDIT' | 'DEBIT'; reason?: string },
+  ) {
+    const amount = Number(dto.amount);
+    if (!amount || isNaN(amount) || amount <= 0) {
+      throw new BadRequestException('Adjustment amount must be a positive number greater than 0.');
+    }
+
+    if (dto.action !== 'CREDIT' && dto.action !== 'DEBIT') {
+      throw new BadRequestException("Action must be either 'CREDIT' or 'DEBIT'.");
+    }
+
+    const partner = await this.prisma.partner.findFirst({
+      where: {
+        OR: [{ id: partnerId }, { partnerCode: partnerId }],
+      },
+      include: {
+        user: {
+          include: {
+            wallet: true,
+          },
+        },
+      },
+    });
+
+    if (!partner) {
+      throw new NotFoundException(`Partner with ID '${partnerId}' not found`);
+    }
+
+    // Resolve partner user
+    let userId = partner.userId;
+    if (!userId && partner.user?.id) {
+      userId = partner.user.id;
+    }
+
+    if (!userId) {
+      // Find user by mobile or email if unlinked
+      const existingUser = await this.prisma.user.findFirst({
+        where: {
+          OR: [
+            { mobile: partner.mobile },
+            ...(partner.email ? [{ email: partner.email }] : []),
+          ],
+        },
+      });
+
+      if (existingUser) {
+        userId = existingUser.id;
+        await this.prisma.partner.update({
+          where: { id: partner.id },
+          data: { userId },
+        });
+      } else {
+        const defaultPassword = `Partner@${partner.mobile.slice(-4)}`;
+        const passwordHash = await bcrypt.hash(defaultPassword, 10);
+        const newUser = await this.prisma.user.create({
+          data: {
+            name: partner.name.trim(),
+            email: partner.email.toLowerCase().trim(),
+            mobile: partner.mobile.trim(),
+            passwordHash,
+            role: Role.PARTNER,
+            status: partner.status === 'ACTIVE' ? UserStatus.ACTIVE : UserStatus.PAYMENT_PENDING,
+          },
+        });
+        userId = newUser.id;
+        await this.prisma.partner.update({
+          where: { id: partner.id },
+          data: { userId },
+        });
+      }
+    }
+
+    return await this.prisma.$transaction(
+      async (tx) => {
+        // 1. Get or create wallet for the partner user
+        let wallet = partner.user?.wallet;
+        if (!wallet) {
+          wallet = await tx.wallet.findUnique({ where: { userId } });
+        }
+
+        if (!wallet) {
+          wallet = await tx.wallet.create({
+            data: {
+              userId,
+              availableBalance: new Prisma.Decimal(Number(partner.balance || 0)),
+              reservedBalance: new Prisma.Decimal(0),
+            },
+          });
+        }
+
+        const prevAvailable = Number(wallet.availableBalance);
+        let newAvailable: number;
+
+        if (dto.action === 'CREDIT') {
+          newAvailable = prevAvailable + amount;
+        } else {
+          if (prevAvailable < amount) {
+            throw new BadRequestException(
+              `Cannot deduct ₹ ${amount.toFixed(2)}: Insufficient available balance (Current balance: ₹ ${prevAvailable.toFixed(2)}).`,
+            );
+          }
+          newAvailable = prevAvailable - amount;
+        }
+
+        // 2. Update wallet
+        const updatedWallet = await tx.wallet.update({
+          where: { id: wallet.id },
+          data: {
+            availableBalance: new Prisma.Decimal(newAvailable),
+          },
+        });
+
+        // 3. Keep partner.balance synchronized
+        await (tx as any).partner.update({
+          where: { id: partner.id },
+          data: {
+            balance: new Prisma.Decimal(newAvailable),
+          },
+        });
+
+        // 4. Create audit transaction record
+        const transaction = await tx.walletTransaction.create({
+          data: {
+            walletId: wallet.id,
+            userId,
+            type: TransactionType.ADJUSTMENT,
+            amount: new Prisma.Decimal(dto.action === 'CREDIT' ? amount : -amount),
+            status: TransactionStatus.COMPLETED,
+            reference: `ADMIN-PT-${dto.action}-${Date.now()}`,
+            metadata: {
+              adminId: adminUser.id,
+              adminEmail: adminUser.email,
+              action: dto.action,
+              amount,
+              reason: dto.reason?.trim() || `Manual Admin ${dto.action === 'CREDIT' ? 'Credit' : 'Deduction'}`,
+              previousBalance: prevAvailable,
+              newBalance: newAvailable,
+              partnerCode: partner.partnerCode,
+              partnerName: partner.name,
+            },
+          },
+        });
+
+        // 5. Audit log
+        await this.audit.log({
+          actorId: adminUser.id,
+          actorType: 'ADMIN',
+          action: dto.action === 'CREDIT' ? 'PARTNER_WALLET_CREDIT' : 'PARTNER_WALLET_DEBIT',
+          entity: 'Wallet',
+          entityId: wallet.id,
+          metadata: {
+            partnerId: partner.id,
+            partnerCode: partner.partnerCode,
+            partnerName: partner.name,
+            action: dto.action,
+            amount,
+            previousBalance: prevAvailable,
+            newBalance: newAvailable,
+            reason: dto.reason || null,
+          },
+        });
+
+        if (this.eventsGateway) {
+          try {
+            this.eventsGateway.notifyWalletUpdated(userId, {
+              availableBalance: newAvailable,
+              reservedBalance: Number(wallet.reservedBalance),
+            });
+          } catch (wsErr) {
+            this.logger.warn(`Failed to dispatch websocket wallet updates: ${(wsErr as any).message}`);
+          }
+        }
+
+        return {
+          success: true,
+          message: `Successfully ${dto.action === 'CREDIT' ? 'credited' : 'deducted'} ₹ ${amount.toFixed(2)} ${dto.action === 'CREDIT' ? 'to' : 'from'} ${partner.name}'s wallet. New balance: ₹ ${newAvailable.toFixed(2)}.`,
+          availableBalance: newAvailable,
+          wallet: updatedWallet,
+          transaction,
+        };
+      },
+      {
+        maxWait: 15000,
+        timeout: 30000,
+      },
+    );
   }
 }

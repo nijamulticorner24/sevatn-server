@@ -1474,12 +1474,32 @@ export class SmartAllocatorService {
           officialBookingReference: { not: null },
           status: { notIn: [BookingStatus.SUCCESS, BookingStatus.COMPLETED, BookingStatus.CANCELLED] },
         },
-        include: { jobs: true },
+        include: { jobs: true, pilgrims: true },
       });
       uncompletedPassesQuerySucceeded = true;
 
       for (const br of pendingConfirmedBookings) {
         try {
+          const totalRequested = Math.max(1, br.pilgrimCount || 1);
+          if (totalRequested > 1 && (br as any).pilgrims && (br as any).pilgrims.length > 0) {
+            const completedCount = (br as any).pilgrims.filter((p: any) => {
+              const meta = typeof p.metadata === 'string' ? JSON.parse(p.metadata) : (p.metadata || {});
+              return (
+                meta.taskStatus === 'CONFIRMED' ||
+                meta.taskStatus === 'ADMIN_COMPLETED' ||
+                meta.status === 'CONFIRMED' ||
+                meta.status === 'ADMIN_COMPLETED' ||
+                !!meta.officialBookingReference ||
+                !!meta.portalTransactionReference ||
+                !!meta.transactionId
+              );
+            }).length;
+            if (completedCount < totalRequested) {
+              this.logger.log(`[SmartAllocator] Preserving PARTIALLY_CONFIRMED for booking #${br.bookingCode} (${completedCount}/${totalRequested} devotees completed). Skipping premature auto-completion.`);
+              continue;
+            }
+          }
+
           const passRef = extractAuthoritativeReference(br);
           if (passRef) {
             const brJob = br.jobs && br.jobs.length > 0 ? br.jobs[0] : null;

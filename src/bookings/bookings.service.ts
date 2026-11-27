@@ -65,40 +65,40 @@ export class BookingsService {
     }
     const validatedOfficialRoute = getOfficialSabarimalaRouteLabel(canonicalRouteEnum);
 
-    // 1. Business Logic: One BookingRequest = 1 Account + 1 Date + 1 Route + 1 to 5 Selected Saved Pilgrims + Nominee details
+    // 1. Business Logic: One BookingRequest = 1 Account + 1 Date + 1 Route + 1 to 10 Selected Saved Pilgrims + Nominee details
     let requestedPilgrimCount = 1;
     if (dto.pilgrimCount !== undefined && dto.pilgrimCount !== null) {
       const parsedCount = Number(dto.pilgrimCount);
-      if (!Number.isInteger(parsedCount) || parsedCount < 1 || parsedCount > 5) {
+      if (!Number.isInteger(parsedCount) || parsedCount < 1 || parsedCount > 10) {
         throw new BadRequestException(
-          'Sabarimala portal allows 1 to 5 pilgrims per booking (pilgrimCount must be an integer between 1 and 5).',
+          'Sabarimala portal allows 1 to 10 pilgrims per booking (pilgrimCount must be an integer between 1 and 10).',
         );
       }
       requestedPilgrimCount = parsedCount;
     } else if (dto.pilgrims && Array.isArray(dto.pilgrims) && dto.pilgrims.length > 0) {
-      if (dto.pilgrims.length > 5) {
+      if (dto.pilgrims.length > 10) {
         throw new BadRequestException(
-          'Sabarimala portal allows a maximum of 5 pilgrims per booking.',
+          'Sabarimala portal allows a maximum of 10 pilgrims per booking.',
         );
       }
       requestedPilgrimCount = dto.pilgrims.length;
     } else if (dto.nominees && Array.isArray(dto.nominees) && dto.nominees.length > 1) {
-      if (dto.nominees.length > 5) {
+      if (dto.nominees.length > 10) {
         throw new BadRequestException(
-          'Sabarimala portal allows a maximum of 5 nominee entries per booking.',
+          'Sabarimala portal allows a maximum of 10 nominee entries per booking.',
         );
       }
       requestedPilgrimCount = dto.nominees.length;
     }
 
-    if (dto.pilgrims && Array.isArray(dto.pilgrims) && dto.pilgrims.length > 5) {
+    if (dto.pilgrims && Array.isArray(dto.pilgrims) && dto.pilgrims.length > 10) {
       throw new BadRequestException(
-        'Sabarimala portal allows a maximum of 5 pilgrims per booking.',
+        'Sabarimala portal allows a maximum of 10 pilgrims per booking.',
       );
     }
-    if (dto.nominees && Array.isArray(dto.nominees) && dto.nominees.length > 5) {
+    if (dto.nominees && Array.isArray(dto.nominees) && dto.nominees.length > 10) {
       throw new BadRequestException(
-        'Sabarimala portal allows a maximum of 5 nominee entries per booking.',
+        'Sabarimala portal allows a maximum of 10 nominee entries per booking.',
       );
     }
     if (dto.pilgrims && Array.isArray(dto.pilgrims) && dto.pilgrims.length > 0) {
@@ -1902,6 +1902,334 @@ export class BookingsService {
       registrationFee: Number(config?.registrationFee || 249),
       accountValidityDays: config?.accountValidityDays || 365,
       checkingIntervalSeconds: config?.checkingIntervalSeconds || 300,
+    };
+  }
+
+  /**
+   * Super Admin action: Manually complete an individual devotee.
+   * Devotee is assigned status ADMIN_COMPLETED.
+   * If all requested devotees are completed/confirmed, the parent booking transitions to completed.
+   * Otherwise, the parent booking remains active in WATCHING with PARTIALLY_CONFIRMED.
+   */
+  async completePilgrimManually(
+    adminUser: any,
+    bookingId: string,
+    pilgrimId: string,
+    dto: { reason: string },
+  ) {
+    if (adminUser.role !== Role.SUPER_ADMIN) {
+      throw new ForbiddenException('Only Super Admin is permitted to manually mark devotees as completed.');
+    }
+
+    const reason = dto?.reason?.trim();
+    if (!reason) {
+      throw new BadRequestException('A valid administrative reason is required for manual devotee completion.');
+    }
+
+    const booking = await this.prisma.bookingRequest.findUnique({
+      where: { id: bookingId },
+      include: {
+        pilgrims: true,
+        jobs: true,
+      },
+    });
+
+    if (!booking) {
+      throw new NotFoundException(`Booking with ID ${bookingId} not found.`);
+    }
+
+    const pilgrim = booking.pilgrims.find((p) => p.id === pilgrimId);
+    if (!pilgrim) {
+      throw new NotFoundException(`Devotee with ID ${pilgrimId} not found on booking #${booking.bookingCode}.`);
+    }
+
+    const currentMeta = typeof pilgrim.metadata === 'string'
+      ? JSON.parse(pilgrim.metadata)
+      : (pilgrim.metadata || {});
+
+    if (
+      currentMeta.taskStatus === 'CONFIRMED' ||
+      currentMeta.taskStatus === 'ADMIN_COMPLETED' ||
+      currentMeta.status === 'CONFIRMED' ||
+      currentMeta.status === 'ADMIN_COMPLETED' ||
+      currentMeta.officialBookingReference
+    ) {
+      throw new BadRequestException(`Devotee ${pilgrim.fullName} is already marked as confirmed or completed.`);
+    }
+
+    const now = new Date();
+    const updatedMeta = {
+      ...currentMeta,
+      taskStatus: 'ADMIN_COMPLETED',
+      status: 'ADMIN_COMPLETED',
+      completedByAdminId: adminUser.id,
+      completedByAdminName: adminUser.name || adminUser.email || 'Super Admin',
+      adminReason: reason,
+      completedAt: now.toISOString(),
+    };
+
+    const totalRequested = Math.max(1, booking.pilgrimCount || booking.pilgrims.length || 1);
+
+    const result = await this.prisma.$transaction(async (tx) => {
+      // 1. Update the pilgrim's metadata
+      const updatedPilgrim = await tx.bookingPilgrim.update({
+        where: { id: pilgrimId },
+        data: {
+          metadata: updatedMeta,
+        },
+      });
+
+      // 2. Count completed devotees
+      const allPilgrims = await tx.bookingPilgrim.findMany({
+        where: { bookingRequestId: bookingId },
+      });
+
+      const completedDevotees = allPilgrims.filter((p) => {
+        const m = typeof p.metadata === 'string' ? JSON.parse(p.metadata) : (p.metadata || {});
+        return (
+          m.taskStatus === 'CONFIRMED' ||
+          m.taskStatus === 'ADMIN_COMPLETED' ||
+          m.status === 'CONFIRMED' ||
+          m.status === 'ADMIN_COMPLETED' ||
+          !!m.officialBookingReference ||
+          !!m.portalTransactionReference ||
+          !!m.transactionId ||
+          p.id === pilgrimId
+        );
+      });
+
+      const completedCount = completedDevotees.length;
+      const isAllDone = completedCount >= totalRequested;
+      const remainingCount = Math.max(0, totalRequested - completedCount);
+
+      let authoritativeRef: string | null = null;
+      if (isAllDone) {
+        // Find existing authoritative portal reference if any, or retain existing
+        const portalRef = allPilgrims.find((p) => {
+          const m = typeof p.metadata === 'string' ? JSON.parse(p.metadata) : (p.metadata || {});
+          return m.officialBookingReference || m.portalTransactionReference || m.transactionId;
+        });
+        const portalMeta = portalRef ? (typeof portalRef.metadata === 'string' ? JSON.parse(portalRef.metadata) : (portalRef.metadata || {})) : {};
+        authoritativeRef = portalMeta.officialBookingReference ||
+          portalMeta.portalTransactionReference ||
+          portalMeta.transactionId ||
+          booking.portalTransactionReference ||
+          booking.officialBookingReference ||
+          booking.officialReference ||
+          null;
+
+        // Complete any open booking jobs
+        await tx.bookingJob.updateMany({
+          where: { bookingRequestId: bookingId, status: { notIn: [BookingStatus.SUCCESS, BookingStatus.CANCELLED] } },
+          data: { status: BookingStatus.SUCCESS, leaseExpiresAt: null, completedAt: now },
+        });
+
+        // Wallet capture if reserve transaction exists and not yet captured
+        if (this.walletService) {
+          try {
+            const reserveTx = await tx.walletTransaction.findFirst({
+              where: { bookingId: booking.id, type: 'RESERVE', status: 'COMPLETED' },
+            });
+            const feeAmount = reserveTx ? Number(reserveTx.amount) : 10;
+            await this.walletService.capture({
+              userId: booking.userId,
+              bookingId: booking.id,
+              amount: feeAmount,
+              idempotencyKey: `adm_cap_${booking.id}`,
+            }, tx);
+          } catch (e: any) {
+            this.logger.warn(`Wallet capture during admin completion: ${e.message}`);
+          }
+        }
+
+        if (this.stateMachine) {
+          try {
+            await this.stateMachine.transition({
+              bookingId: booking.id,
+              targetStatus: BookingStatus.SUCCESS,
+              targetExecutionStatus: 'COMPLETED',
+              targetFinancialStatus: 'CAPTURED',
+              milestone: 'ALL_DEVOTEES_COMPLETED',
+              officialReference: authoritativeRef,
+              officialBookingReference: authoritativeRef,
+              portalTransactionReference: authoritativeRef,
+              confirmedAt: now,
+              note: `All ${totalRequested} devotees completed (${completedCount - 1} confirmed, 1 admin completed by Super Admin: ${reason})`,
+              force: true,
+            }, tx);
+          } catch (smErr: any) {
+            this.logger.warn(`State machine transition notice during admin completion: ${smErr.message}`);
+          }
+        }
+
+        // Atomically guarantee BookingRequest is marked SUCCESS, isWatching is false, and reconciliationStatus is cleared
+        await tx.bookingRequest.update({
+          where: { id: booking.id },
+          data: {
+            status: BookingStatus.SUCCESS,
+            executionStatus: 'COMPLETED',
+            financialStatus: 'CAPTURED',
+            isWatching: false,
+            reconciliationStatus: null,
+            lastMilestone: `COMPLETED (${totalRequested}/${totalRequested} Devotees)`,
+            completedAt: now,
+            confirmedAt: booking.confirmedAt || now,
+            portalTransactionReference: authoritativeRef || booking.portalTransactionReference,
+            officialBookingReference: authoritativeRef || booking.officialBookingReference,
+            officialReference: authoritativeRef || booking.officialReference,
+            assignedMachineId: null,
+            assignedMonitoringWorkerId: null,
+            monitoringStoppedAt: now,
+            leaseExpiresAt: null,
+          },
+        });
+      } else {
+        // Multi-devotee booking: remains active in WATCHING with PARTIALLY_CONFIRMED
+        await tx.bookingRequest.update({
+          where: { id: booking.id },
+          data: {
+            status: BookingStatus.WATCHING,
+            isWatching: true,
+            reconciliationStatus: 'PARTIALLY_CONFIRMED',
+            lastMilestone: `PARTIALLY_CONFIRMED (${completedCount}/${totalRequested} Completed, ${remainingCount} Pending)`,
+          },
+        });
+
+        // Reset booking job to QUEUED so next devotee can be allocated
+        await tx.bookingJob.updateMany({
+          where: { bookingRequestId: bookingId, status: { notIn: [BookingStatus.SUCCESS, BookingStatus.CANCELLED] } },
+          data: {
+            status: BookingStatus.QUEUED,
+            workerId: null,
+            leaseExpiresAt: null,
+            attempt: 0,
+          },
+        });
+      }
+
+      return {
+        updatedPilgrim,
+        completedCount,
+        totalRequested,
+        remainingCount,
+        isAllDone,
+        authoritativeRef,
+      };
+    });
+
+    // 3. Log audit event
+    await this.audit.log({
+      actorId: adminUser.id,
+      actorType: 'ADMIN',
+      action: 'ADMIN_MANUAL_DEVOTEE_COMPLETED',
+      entity: 'BookingPilgrim',
+      entityId: pilgrimId,
+      metadata: {
+        bookingId,
+        bookingCode: booking.bookingCode,
+        devoteeName: pilgrim.fullName,
+        reason,
+        completedCount: result.completedCount,
+        totalRequested: result.totalRequested,
+        isAllDone: result.isAllDone,
+      },
+    });
+
+    // If remaining devotees still pending, immediately trigger worker allocation/monitoring refresh
+    if (!result.isAllDone && this.smartAllocator) {
+      try {
+        if (typeof this.smartAllocator.assignMonitoringWorkerInstantly === 'function') {
+          await this.smartAllocator.assignMonitoringWorkerInstantly(bookingId).catch(() => {});
+        }
+        await this.smartAllocator.runMonitoringAllocationSweep().catch(() => {});
+      } catch (allocErr: any) {
+        this.logger.warn(`Allocation notice after manual devotee completion: ${allocErr?.message || allocErr}`);
+      }
+    }
+
+    // 4. Broadcast events to both Centre users and Super Admins
+    if (this.eventsGateway) {
+      try {
+        if (result.isAllDone) {
+          this.eventsGateway.notifyBookingConfirmed({
+            bookingId: booking.id,
+            userId: booking.userId,
+            bookingCode: booking.bookingCode,
+            status: BookingStatus.SUCCESS,
+            route: booking.route,
+            requestedDate: booking.requestedDate,
+            officialReference: result.authoritativeRef || booking.officialReference,
+          });
+          this.eventsGateway.notifyBookingUpdated(booking.id, booking.userId, {
+            bookingId: booking.id,
+            userId: booking.userId,
+            bookingCode: booking.bookingCode,
+            status: BookingStatus.SUCCESS,
+            executionStatus: 'COMPLETED',
+            reconciliationStatus: null,
+            officialReference: result.authoritativeRef || booking.officialReference,
+            portalTransactionReference: result.authoritativeRef || booking.portalTransactionReference,
+            lastMilestone: `COMPLETED (${result.totalRequested}/${result.totalRequested} Devotees)`,
+            confirmedCount: result.totalRequested,
+            totalRequested: result.totalRequested,
+            remainingCount: 0,
+            isCompleted: true,
+          });
+          if (typeof (this.eventsGateway as any).emitToAdmins === 'function') {
+            (this.eventsGateway as any).emitToAdmins('admin:booking_updated', {
+              bookingId: booking.id,
+              bookingCode: booking.bookingCode,
+              status: BookingStatus.SUCCESS,
+              executionStatus: 'COMPLETED',
+              reconciliationStatus: null,
+              officialReference: result.authoritativeRef || booking.officialReference,
+              portalTransactionReference: result.authoritativeRef || booking.portalTransactionReference,
+              confirmedCount: result.totalRequested,
+              totalRequested: result.totalRequested,
+              remainingCount: 0,
+              isCompleted: true,
+            });
+          }
+        } else {
+          this.eventsGateway.notifyBookingUpdated(booking.id, booking.userId, {
+            bookingId: booking.id,
+            userId: booking.userId,
+            bookingCode: booking.bookingCode,
+            status: BookingStatus.WATCHING,
+            reconciliationStatus: 'PARTIALLY_CONFIRMED',
+            lastMilestone: `PARTIALLY_CONFIRMED (${result.completedCount}/${result.totalRequested} Completed, ${result.remainingCount} Pending)`,
+            confirmedCount: result.completedCount,
+            totalRequested: result.totalRequested,
+            remainingCount: result.remainingCount,
+          });
+          if (typeof (this.eventsGateway as any).emitToAdmins === 'function') {
+            (this.eventsGateway as any).emitToAdmins('admin:booking_updated', {
+              bookingId: booking.id,
+              bookingCode: booking.bookingCode,
+              status: BookingStatus.WATCHING,
+              reconciliationStatus: 'PARTIALLY_CONFIRMED',
+              confirmedCount: result.completedCount,
+              totalRequested: result.totalRequested,
+              remainingCount: result.remainingCount,
+              isCompleted: false,
+            });
+          }
+        }
+      } catch (wsErr: any) {
+        this.logger.warn(`WebSocket notification failed: ${wsErr.message}`);
+      }
+    }
+
+    return {
+      success: true,
+      message: `Devotee ${pilgrim.fullName} successfully marked as completed.`,
+      pilgrim: result.updatedPilgrim,
+      isAllDone: result.isAllDone,
+      progress: {
+        completedCount: result.completedCount,
+        totalRequested: result.totalRequested,
+        remainingCount: result.remainingCount,
+      },
     };
   }
 }

@@ -968,6 +968,7 @@ export class BookingStateMachineService {
         updateData.isWatching = false;
         updateData.monitoringStoppedAt = now;
         updateData.leaseExpiresAt = null;
+        updateData.reconciliationStatus = null;
       }
 
       const isTerminalCancellationOrFailure =

@@ -412,6 +412,11 @@ export class NotificationsService {
         header = '<b>🆕 NEW BOOKING RECEIVED • Central Booking Queue</b>';
         statusLabel = 'New Booking Queued';
         detailsLine = `📥 <b>Queue Status:</b> Received &amp; queued for Sabarimala slot discovery and auto-dispatch.`;
+      } else if (normalizedStatus === 'DATE_AVAILABLE') {
+        header = '<b>🟢 Date Available!</b>';
+        statusLabel = 'Date Available';
+        const slotText = bookingData.selectedTime || bookingData.timeSlot || 'Any Open Slot';
+        detailsLine = `🎯 <b>Slot:</b> <code>${slotText}</code>\n🚀 <b>Status:</b> Watched booking date is open on official portal. Proceeding with automated booking.`;
       } else if (normalizedStatus === 'EXECUTING' || normalizedStatus === 'BOOKING_STARTED') {
         header = '<b>⚡ BOOKING EXECUTION STARTED • Official Portal Dispatch</b>';
         statusLabel = 'Booking Execution Started';

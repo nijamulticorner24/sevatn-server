@@ -252,9 +252,9 @@ describe('BookingsService - Booking Readiness & Queue Protection', () => {
       expect(mockPrisma.bookingRequest.create).not.toHaveBeenCalled();
     });
 
-    it('TEST 5B: Enforces 1 to 5 pilgrims (pilgrimCount 1..5) with dynamic pricing and wallet reservation, and rejects quantity 0 or 6', async () => {
-      // Quantity 1..5 accepted with dynamic fee (20 * N)
-      for (const qty of [1, 2, 3, 4, 5]) {
+    it('TEST 5B: Enforces 1 to 10 pilgrims (pilgrimCount 1..10) with dynamic pricing and wallet reservation, and rejects quantity 0 or 11', async () => {
+      // Quantity 1..10 accepted with dynamic fee (20 * N)
+      for (const qty of [1, 2, 5, 6, 10]) {
         mockPrisma.wallet.update.mockClear();
         const dtoN: any = {
           ...validDto,
@@ -272,12 +272,12 @@ describe('BookingsService - Booking Readiness & Queue Protection', () => {
         );
       }
 
-      // Quantity 6 rejected
+      // Quantity 11 rejected
       await expect(
-        bookingsService.createBooking('user-1', { ...validDto, pilgrimCount: 6 } as any),
+        bookingsService.createBooking('user-1', { ...validDto, pilgrimCount: 11 } as any),
       ).rejects.toThrow(
         new BadRequestException(
-          'Sabarimala portal allows 1 to 5 pilgrims per booking (pilgrimCount must be an integer between 1 and 5).',
+          'Sabarimala portal allows 1 to 10 pilgrims per booking (pilgrimCount must be an integer between 1 and 10).',
         ),
       );
 
@@ -286,7 +286,7 @@ describe('BookingsService - Booking Readiness & Queue Protection', () => {
         bookingsService.createBooking('user-1', { ...validDto, pilgrimCount: 0 } as any),
       ).rejects.toThrow(
         new BadRequestException(
-          'Sabarimala portal allows 1 to 5 pilgrims per booking (pilgrimCount must be an integer between 1 and 5).',
+          'Sabarimala portal allows 1 to 10 pilgrims per booking (pilgrimCount must be an integer between 1 and 10).',
         ),
       );
     });
@@ -308,7 +308,7 @@ describe('BookingsService - Booking Readiness & Queue Protection', () => {
       expect(mockPrisma.bookingRequest.create).not.toHaveBeenCalled();
     });
 
-    it('TEST 6b: Accepts 1 to 5 nominees in nominees array and rejects > 5 nominees', async () => {
+    it('TEST 6b: Accepts 1 to 10 nominees in nominees array and rejects > 10 nominees', async () => {
       const multiDto: any = {
         ...validDto,
         pilgrimCount: 2,
@@ -333,17 +333,17 @@ describe('BookingsService - Booking Readiness & Queue Protection', () => {
       expect(multiResult.pilgrimCount).toBe(2);
       expect((multiResult.preferences as any).nominees).toHaveLength(2);
 
-      // Reject > 5 nominees
-      const sixNomineesDto: any = {
+      // Reject > 10 nominees
+      const elevenNomineesDto: any = {
         ...validDto,
-        nominees: Array.from({ length: 6 }, (_, i) => ({
+        nominees: Array.from({ length: 11 }, (_, i) => ({
           nomineeName: `Nominee ${i + 1}`,
           nomineeAge: 30 + i,
           nomineeRelationship: 'SPOUSE',
         })),
       };
-      await expect(bookingsService.createBooking('user-1', sixNomineesDto)).rejects.toThrow(
-        new BadRequestException('Sabarimala portal allows a maximum of 5 nominee entries per booking.'),
+      await expect(bookingsService.createBooking('user-1', elevenNomineesDto)).rejects.toThrow(
+        new BadRequestException('Sabarimala portal allows a maximum of 10 nominee entries per booking.'),
       );
 
       const singleDto: any = {

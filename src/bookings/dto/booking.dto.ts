@@ -116,7 +116,7 @@ export class CreateBookingDto {
   @IsOptional()
   @IsInt()
   @Min(1)
-  @Max(5, { message: 'A maximum of 5 pilgrims is permitted per booking' })
+  @Max(10, { message: 'A maximum of 10 pilgrims is permitted per booking' })
   pilgrimCount?: number;
 
   @IsOptional()
@@ -128,7 +128,7 @@ export class CreateBookingDto {
 
   @IsOptional()
   @IsArray()
-  @ArrayMaxSize(5, { message: 'A maximum of 5 pilgrims is permitted per booking' })
+  @ArrayMaxSize(10, { message: 'A maximum of 10 pilgrims is permitted per booking' })
   @ValidateNested({ each: true })
   @Type(() => PilgrimDto)
   pilgrims?: PilgrimDto[];
@@ -140,6 +140,7 @@ export class CreateBookingDto {
 
   @IsOptional()
   @IsArray()
+  @ArrayMaxSize(10, { message: 'A maximum of 10 nominee entries is permitted per booking' })
   @ValidateNested({ each: true })
   @Type(() => NomineeDto)
   nominees?: NomineeDto[];

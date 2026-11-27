@@ -73,6 +73,20 @@ export class PartnersController {
     return this.partnersService.resetPartnerPassword(req.user, id, body?.password);
   }
 
+  /**
+   * Super Admin adjusts a partner's wallet balance (CREDIT or DEBIT)
+   */
+  @Post(':id/wallet-adjust')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.SUPER_ADMIN)
+  async adjustPartnerWallet(
+    @Request() req: any,
+    @Param('id') id: string,
+    @Body() dto: { amount: number; action: 'CREDIT' | 'DEBIT'; reason?: string },
+  ) {
+    return this.partnersService.adjustPartnerWallet(req.user, id, dto);
+  }
+
   @Post(':id/invitations')
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(Role.SUPER_ADMIN)

@@ -404,6 +404,17 @@ export class FailJobDto {
   @IsOptional()
   @IsString()
   protocolVersion?: string;
+
+  @IsOptional()
+  @IsString()
+  pilgrimTaskId?: string;
+
+  @IsOptional()
+  @IsNumber()
+  taskIndex?: number;
+
+  @IsOptional()
+  selectedPilgrim?: any;
 }
 
 export class RecordPollEventDto {

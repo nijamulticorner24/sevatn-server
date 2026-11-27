@@ -80,6 +80,18 @@ export class BookingsController {
     return this.bookingsService.restartBooking(id, user);
   }
 
+  @Post(':id/pilgrims/:pilgrimId/complete')
+  @Roles(Role.SUPER_ADMIN)
+  @UseGuards(RolesGuard)
+  async completePilgrimManually(
+    @Param('id') id: string,
+    @Param('pilgrimId') pilgrimId: string,
+    @Body() dto: { reason: string },
+    @CurrentUser() user: any,
+  ) {
+    return this.bookingsService.completePilgrimManually(user, id, pilgrimId, dto);
+  }
+
   @Post(':id/resolve-human')
   async resolveHumanAction(
     @Param('id') id: string,

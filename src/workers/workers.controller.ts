@@ -513,4 +513,26 @@ export class WorkersController {
   ) {
     return this.workersService.reportJobResult(bookingId, machine.id, dto);
   }
+
+  /**
+   * Worker reports date available detected in portal -> dispatch real-time Telegram notification
+   */
+  @Post('notify-date-available')
+  @UseGuards(MachineAuthGuard)
+  async notifyDateAvailable(
+    @CurrentMachine() machine: any,
+    @Body() dto: { bookingId?: string; bookingCode?: string; date: string; route?: string; slot?: string; timeSlot?: string },
+  ) {
+    return this.workersService.notifyDateAvailable(machine.id, dto);
+  }
+
+  @Post('jobs/:id/notify-date-available')
+  @UseGuards(MachineAuthGuard)
+  async notifyJobDateAvailable(
+    @Param('id') jobId: string,
+    @CurrentMachine() machine: any,
+    @Body() dto: { bookingId?: string; bookingCode?: string; date: string; route?: string; slot?: string; timeSlot?: string },
+  ) {
+    return this.workersService.notifyDateAvailable(machine.id, { ...dto, bookingId: jobId });
+  }
 }
